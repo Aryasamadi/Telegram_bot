@@ -97,25 +97,28 @@ class D1Database:
 
     async def execute_batch(self, queries: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
         async with aiohttp.ClientSession() as session:
+            output = []
             try:
-                async with session.post(self.url, headers=self.headers, json=queries) as resp:
-                    if resp.status != 200:
-                        text = await resp.text()
-                        logger.error(f"D1 Batch API Error (status {resp.status}): {text}")
-                        raise Exception(f"Cloudflare D1 Batch API returned status {resp.status}: {text}")
-                    
-                    data = await resp.json()
-                    if not data.get("success"):
-                        errors = data.get("errors", [])
-                        logger.error(f"D1 Batch Query failed: {errors}")
-                        raise Exception(f"D1 Batch Query failed: {errors}")
-                    
-                    result = data.get("result", [])
-                    output = []
-                    if isinstance(result, list):
-                        for r in result:
-                            output.append(r.get("results", []))
-                    return output
+                # اینجا حلقه‌ای قرار دادیم که کوئری‌ها را یکی‌یکی به کلودفلر بفرستد تا ارور برطرف شود
+                for query in queries:
+                    async with session.post(self.url, headers=self.headers, json=query) as resp:
+                        if resp.status != 200:
+                            text = await resp.text()
+                            logger.error(f"D1 Batch API Error (status {resp.status}): {text}")
+                            raise Exception(f"Cloudflare D1 Batch API returned status {resp.status}: {text}")
+                        
+                        data = await resp.json()
+                        if not data.get("success"):
+                            errors = data.get("errors", [])
+                            logger.error(f"D1 Batch Query failed: {errors}")
+                            raise Exception(f"D1 Batch Query failed: {errors}")
+                        
+                        result = data.get("result", [])
+                        if isinstance(result, list) and len(result) > 0:
+                            output.append(result[0].get("results", []))
+                        elif isinstance(result, dict):
+                            output.append(result.get("results", []))
+                return output
             except Exception as e:
                 logger.error(f"Error executing batch queries. Error: {e}")
                 raise e
