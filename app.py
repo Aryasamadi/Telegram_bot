@@ -6,7 +6,8 @@ import math
 import random
 import logging
 import asyncio
-from datetime import datetime
+import html
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
 import pytz
@@ -14,7 +15,7 @@ import aiohttp
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -67,10 +68,10 @@ class D1Database:
         }
 
     async def execute(self, sql: str, params: List[Any] = None) -> List[Dict[str, Any]]:
-        payload = {
-            "sql": sql,
-            "params": params or []
-        }
+        payload = {"sql": sql}
+        if params:
+            payload["params"] = params
+
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.post(self.url, headers=self.headers, json=payload) as resp:
@@ -99,9 +100,12 @@ class D1Database:
         async with aiohttp.ClientSession() as session:
             output = []
             try:
-                # اینجا حلقه‌ای قرار دادیم که کوئری‌ها را یکی‌یکی به کلودفلر بفرستد تا ارور برطرف شود
                 for query in queries:
-                    async with session.post(self.url, headers=self.headers, json=query) as resp:
+                    payload = {"sql": query["sql"]}
+                    if query.get("params"):
+                        payload["params"] = query["params"]
+
+                    async with session.post(self.url, headers=self.headers, json=payload) as resp:
                         if resp.status != 200:
                             text = await resp.text()
                             logger.error(f"D1 Batch API Error (status {resp.status}): {text}")
@@ -118,21 +122,24 @@ class D1Database:
                             output.append(result[0].get("results", []))
                         elif isinstance(result, dict):
                             output.append(result.get("results", []))
+                        else:
+                            output.append([])
                 return output
             except Exception as e:
                 logger.error(f"Error executing batch queries. Error: {e}")
                 raise e
 
+
 async def initialize_database(db: D1Database):
     queries = [
-        {"sql": "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, joined_at TEXT, role TEXT DEFAULT 'user', tokens_used INTEGER DEFAULT 0, last_reset_date TEXT)", "params": []},
-        {"sql": "CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT, file_id TEXT, media_type TEXT, likes INTEGER DEFAULT 0, dislikes INTEGER DEFAULT 0, views INTEGER DEFAULT 0, deleted INTEGER DEFAULT 0)", "params": []},
-        {"sql": "CREATE INDEX IF NOT EXISTS idx_posts_deleted ON posts(deleted)", "params": []},
-        {"sql": "CREATE INDEX IF NOT EXISTS idx_posts_text ON posts(text)", "params": []},
-        {"sql": "CREATE TABLE IF NOT EXISTS saves(user INTEGER, post INTEGER, folder TEXT, PRIMARY KEY(user, post))", "params": []},
-        {"sql": "CREATE TABLE IF NOT EXISTS votes(user_id INTEGER, post_id INTEGER, vote_type TEXT, PRIMARY KEY(user_id, post_id))", "params": []},
-        {"sql": "CREATE TABLE IF NOT EXISTS user_states(user_id INTEGER PRIMARY KEY, state TEXT, data TEXT)", "params": []},
-        {"sql": "CREATE TABLE IF NOT EXISTS processed_updates(update_id INTEGER PRIMARY KEY, processed_at TEXT)", "params": []}
+        {"sql": "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, joined_at TEXT, role TEXT DEFAULT 'user', tokens_used INTEGER DEFAULT 0, last_reset_date TEXT)"},
+        {"sql": "CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT, file_id TEXT, media_type TEXT, likes INTEGER DEFAULT 0, dislikes INTEGER DEFAULT 0, views INTEGER DEFAULT 0, deleted INTEGER DEFAULT 0)"},
+        {"sql": "CREATE INDEX IF NOT EXISTS idx_posts_deleted ON posts(deleted)"},
+        {"sql": "CREATE INDEX IF NOT EXISTS idx_posts_text ON posts(text)"},
+        {"sql": "CREATE TABLE IF NOT EXISTS saves(user INTEGER, post INTEGER, folder TEXT, PRIMARY KEY(user, post))"},
+        {"sql": "CREATE TABLE IF NOT EXISTS votes(user_id INTEGER, post_id INTEGER, vote_type TEXT, PRIMARY KEY(user_id, post_id))"},
+        {"sql": "CREATE TABLE IF NOT EXISTS user_states(user_id INTEGER PRIMARY KEY, state TEXT, data TEXT)"},
+        {"sql": "CREATE TABLE IF NOT EXISTS processed_updates(update_id INTEGER PRIMARY KEY, processed_at TEXT)"}
     ]
     await db.execute_batch(queries)
     try:
@@ -148,14 +155,15 @@ async def initialize_database(db: D1Database):
     except Exception:
         pass
 
+
 async def reset_database(db: D1Database):
     queries = [
-        {"sql": "DROP TABLE IF EXISTS users", "params": []},
-        {"sql": "DROP TABLE IF EXISTS posts", "params": []},
-        {"sql": "DROP TABLE IF EXISTS saves", "params": []},
-        {"sql": "DROP TABLE IF EXISTS user_states", "params": []},
-        {"sql": "DROP TABLE IF EXISTS votes", "params": []},
-        {"sql": "DROP TABLE IF EXISTS processed_updates", "params": []}
+        {"sql": "DROP TABLE IF EXISTS users"},
+        {"sql": "DROP TABLE IF EXISTS posts"},
+        {"sql": "DROP TABLE IF EXISTS saves"},
+        {"sql": "DROP TABLE IF EXISTS user_states"},
+        {"sql": "DROP TABLE IF EXISTS votes"},
+        {"sql": "DROP TABLE IF EXISTS processed_updates"}
     ]
     await db.execute_batch(queries)
     await initialize_database(db)
@@ -475,27 +483,33 @@ router = Router()
 
 async def register_user_if_not_exists(db: D1Database, user_id: int):
     sql = "INSERT OR IGNORE INTO users(id, joined_at) VALUES(?, ?)"
-    await db.execute(sql, [user_id, datetime.utcnow().isoformat()])
+    await db.execute(sql, [user_id, datetime.now(timezone.utc).isoformat()])
 
-async def send_post_content(chat_id: int, post: dict, reply_markup=None):
-    bot = Bot.get_current()
+async def send_post_content(bot: Bot, chat_id: int, post: dict, reply_markup=None):
     text = post.get("text") or ""
     file_id = post.get("file_id")
     media_type = post.get("media_type")
     
-    if media_type == "photo" and file_id:
-        return await bot.send_photo(chat_id=chat_id, photo=file_id, caption=text, reply_markup=reply_markup)
-    elif media_type == "document" and file_id:
-        return await bot.send_document(chat_id=chat_id, document=file_id, caption=text, reply_markup=reply_markup)
-    elif media_type == "video" and file_id:
-        return await bot.send_video(chat_id=chat_id, video=file_id, caption=text, reply_markup=reply_markup)
-    elif media_type == "audio" and file_id:
-        return await bot.send_audio(chat_id=chat_id, audio=file_id, caption=text, reply_markup=reply_markup)
-    else:
-        return await bot.send_message(chat_id=chat_id, text=text or "محتوای ارسالی", reply_markup=reply_markup)
+    caption = text if len(text) <= 1024 else text[:1020] + "..."
+    
+    try:
+        if media_type == "photo" and file_id:
+            return await bot.send_photo(chat_id=chat_id, photo=file_id, caption=caption, reply_markup=reply_markup)
+        elif media_type == "document" and file_id:
+            return await bot.send_document(chat_id=chat_id, document=file_id, caption=caption, reply_markup=reply_markup)
+        elif media_type == "video" and file_id:
+            return await bot.send_video(chat_id=chat_id, video=file_id, caption=caption, reply_markup=reply_markup)
+        elif media_type == "audio" and file_id:
+            return await bot.send_audio(chat_id=chat_id, audio=file_id, caption=caption, reply_markup=reply_markup)
+        else:
+            safe_text = text if len(text) <= 4096 else text[:4090] + "..."
+            return await bot.send_message(chat_id=chat_id, text=safe_text or "محتوای ارسالی", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Error sending post content: {e}")
+        return None
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext, db: D1Database):
+async def cmd_start(message: Message, state: FSMContext, db: D1Database, bot: Bot):
     user_id = message.from_user.id
     await register_user_if_not_exists(db, user_id)
     await state.set_state(BotStates.idle)
@@ -517,7 +531,7 @@ async def cmd_start(message: Message, state: FSMContext, db: D1Database):
                 is_saved = len(save_rows) > 0
                 
                 kb = get_post_inline_kb(post_id, post.get("likes", 0), post.get("dislikes", 0), is_saved)
-                await send_post_content(message.chat.id, post, kb)
+                await send_post_content(bot, message.chat.id, post, kb)
                 
                 admin_mode = state_data.get("admin_mode", "user")
                 menu = get_admin_menu() if (user_id == ADMIN_ID and admin_mode != "user") else get_main_menu()
@@ -572,9 +586,8 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
     user_id = message.from_user.id
     state_data = await state.get_data()
     
-    await state.set_state(BotStates.idle)
-    
     if text == "🤖 هوش مصنوعی":
+        await state.set_state(BotStates.idle)
         history = [{"role": "system", "content": "You are a helpful assistant. Reply clearly in Persian."}]
         await state.set_state(BotStates.ai_chat)
         await state.update_data(ai_history=history)
@@ -584,10 +597,12 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
         )
         
     elif text == "کاربر":
+        await state.set_state(BotStates.idle)
         await state.update_data(admin_mode="user")
         await message.answer("✅ فاز کاربری فعال شد.", reply_markup=get_main_menu())
         
     elif text == "مدیریت":
+        await state.set_state(BotStates.idle)
         if user_id == ADMIN_ID:
             await state.update_data(admin_mode="admin")
             await message.answer("✅ پنل مدیریت فعال شد.", reply_markup=get_admin_menu())
@@ -595,6 +610,7 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
             await message.answer("⛔ شما دسترسی مدیریت ندارید.")
             
     elif text == "❓ راهنما":
+        await state.set_state(BotStates.idle)
         first_name = message.from_user.first_name or "دوست"
         help_text = f""" خب {first_name} جان ببین 👀
 
@@ -606,6 +622,7 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
         await message.answer(help_text, reply_markup=get_help_more_kb())
         
     elif text == "👤 پروفایل":
+        await state.set_state(BotStates.idle)
         rows = await db.execute("SELECT joined_at, role FROM users WHERE id = ?", [user_id])
         joined_str = rows[0].get("joined_at") if rows else None
         user_role_db = rows[0].get("role") if rows else "user"
@@ -615,14 +632,14 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
         
         if joined_str:
             try:
-                joined_dt = datetime.fromisoformat(joined_str)
-                delta = datetime.utcnow() - joined_dt
+                joined_dt = datetime.fromisoformat(joined_str).replace(tzinfo=timezone.utc)
+                delta = datetime.now(timezone.utc) - joined_dt
                 days = delta.days
                 hours = int(delta.seconds / 3600)
                 time_string = f"⏱️ مدت همراهی: {days} روز و {hours} ساعت ⏳"
                 
                 tehran_tz = pytz.timezone("Asia/Tehran")
-                joined_tehran = joined_dt.replace(tzinfo=pytz.utc).astimezone(tehran_tz)
+                joined_tehran = joined_dt.astimezone(tehran_tz)
                 date_str = joined_tehran.strftime("%Y/%m/%d ساعت %H:%M")
                 join_date_line = f"📅 تاریخ عضویت: {date_str}\n"
             except Exception:
@@ -646,9 +663,11 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
         await message.answer(profile_text)
         
     elif text == "💾 ذخیره‌های من":
+        await state.set_state(BotStates.idle)
         await message.answer("📂 کدوم پوشه رو میخوای باز کنی؟ 👇", reply_markup=get_folder_selection_kb())
         
     elif text == "📞 ارتباط با مدیریت":
+        await state.set_state(BotStates.idle)
         await state.set_state(BotStates.user_chat_admin)
         await message.answer(
             "🛡️ ارتباط امن و ناشناس با مدیریت برقرار شد!\n\nهر پیامی داری همین الان بفرست ...",
@@ -656,6 +675,7 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
         )
         
     elif text == "➕ افزودن پست":
+        await state.set_state(BotStates.idle)
         admin_mode = state_data.get("admin_mode", "user")
         if user_id == ADMIN_ID and admin_mode != "user":
             await state.set_state(BotStates.waiting_post_content)
@@ -664,6 +684,7 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
             await message.answer("⛔ شما دسترسی مدیریت ندارید.")
             
     elif text == "📁 مدیریت محتوا":
+        await state.set_state(BotStates.idle)
         admin_mode = state_data.get("admin_mode", "user")
         if user_id == ADMIN_ID and admin_mode != "user":
             await message.answer("📂 انتخاب کنید:", reply_markup=get_content_management_kb())
@@ -671,6 +692,7 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
             await message.answer("⛔ شما دسترسی مدیریت ندارید.")
             
     elif text == "📊 آمار":
+        await state.set_state(BotStates.idle)
         admin_mode = state_data.get("admin_mode", "user")
         if user_id == ADMIN_ID and admin_mode != "user":
             total_users = (await db.execute("SELECT COUNT(*) as c FROM users"))[0].get("c", 0)
@@ -691,6 +713,7 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
             await message.answer("⛔ شما دسترسی مدیریت ندارید.")
             
     elif text == "📢 ارسال همگانی":
+        await state.set_state(BotStates.idle)
         admin_mode = state_data.get("admin_mode", "user")
         if user_id == ADMIN_ID and admin_mode != "user":
             await state.set_state(BotStates.waiting_broadcast_content)
@@ -717,8 +740,8 @@ async def cmd_exit_session(message: Message, state: FSMContext):
 # ============================================================
 # بخش مدیریت پیام‌ها در هر وضعیت فعال (FSM States Processing)
 # ============================================================
-@router.message(BotStates.ai_chat)
-async def process_ai_chat(message: Message, state: FSMContext, db: D1Database):
+@router.message(StateFilter(BotStates.ai_chat))
+async def process_ai_chat(message: Message, state: FSMContext, db: D1Database, bot: Bot):
     user_id = message.from_user.id
     
     if not AI_API_KEY:
@@ -751,7 +774,7 @@ async def process_ai_chat(message: Message, state: FSMContext, db: D1Database):
     elif message.document:
         await message.answer("⏳ در حال خواندن فایل متنی شما...")
         try:
-            file_content = await download_telegram_file_text(message.bot, message.document.file_id)
+            file_content = await download_telegram_file_text(bot, message.document.file_id)
             caption = f"\nتوضیحات: {message.caption}" if message.caption else ""
             user_prompt = f"لطفاً این فایل را بررسی کن:\n\n```\n{file_content}\n```{caption}"
         except Exception as e:
@@ -761,7 +784,7 @@ async def process_ai_chat(message: Message, state: FSMContext, db: D1Database):
         await message.answer("⚠️ لطفاً یک متن یا فایل متنی معتبر ارسال کنید.")
         return
 
-    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
     state_data = await state.get_data()
     history = state_data.get("ai_history", [
@@ -789,8 +812,8 @@ async def process_ai_chat(message: Message, state: FSMContext, db: D1Database):
     tokens_used += ai_result["tokens"]
     await db.execute("UPDATE users SET tokens_used = ?, last_reset_date = ? WHERE id = ?", [tokens_used, today_tehran, user_id])
 
-@router.message(BotStates.user_chat_admin)
-async def process_user_chat_admin(message: Message, state: FSMContext):
+@router.message(StateFilter(BotStates.user_chat_admin))
+async def process_user_chat_admin(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
     if user_id == ADMIN_ID:
         return
@@ -799,43 +822,43 @@ async def process_user_chat_admin(message: Message, state: FSMContext):
     caption = message.caption or ""
     
     if message.photo:
-        await message.bot.send_photo(chat_id=ADMIN_ID, photo=message.photo[-1].file_id, caption=f"پیام جدید:\n{hashtag}\n\n{caption}")
+        await bot.send_photo(chat_id=ADMIN_ID, photo=message.photo[-1].file_id, caption=f"پیام جدید:\n{hashtag}\n\n{caption}")
     elif message.document:
-        await message.bot.send_document(chat_id=ADMIN_ID, document=message.document.file_id, caption=f"فایل جدید:\n{hashtag}\n\n{caption}")
+        await bot.send_document(chat_id=ADMIN_ID, document=message.document.file_id, caption=f"فایل جدید:\n{hashtag}\n\n{caption}")
     elif message.video:
-        await message.bot.send_video(chat_id=ADMIN_ID, video=message.video.file_id, caption=f"ویدیو جدید:\n{hashtag}\n\n{caption}")
+        await bot.send_video(chat_id=ADMIN_ID, video=message.video.file_id, caption=f"ویدیو جدید:\n{hashtag}\n\n{caption}")
     elif message.audio:
-        await message.bot.send_audio(chat_id=ADMIN_ID, audio=message.audio.file_id, caption=f"صوت جدید:\n{hashtag}\n\n{caption}")
+        await bot.send_audio(chat_id=ADMIN_ID, audio=message.audio.file_id, caption=f"صوت جدید:\n{hashtag}\n\n{caption}")
     elif message.text:
-        await message.bot.send_message(chat_id=ADMIN_ID, text=f"پیام جدید:\n{hashtag}\n\n{message.text}")
+        await bot.send_message(chat_id=ADMIN_ID, text=f"پیام جدید:\n{hashtag}\n\n{message.text}")
 
-@router.message(F.chat.id == ADMIN_ID)
-async def process_admin_replies(message: Message, state: FSMContext):
-    if message.reply_to_message:
-        reply_text = message.reply_to_message.text or message.reply_to_message.caption or ""
-        match = re.search(r"#User_(\d+)", reply_text)
-        if match:
-            target_user = int(match.group(1))
-            prefix = "پاسخ مدیریت:\n\n"
-            caption = message.caption or ""
-            
-            try:
-                if message.photo:
-                    await message.bot.send_photo(chat_id=target_user, photo=message.photo[-1].file_id, caption=f"{prefix}{caption}")
-                elif message.document:
-                    await message.bot.send_document(chat_id=target_user, document=message.document.file_id, caption=f"{prefix}{caption}")
-                elif message.video:
-                    await message.bot.send_video(chat_id=target_user, video=message.video.file_id, caption=f"{prefix}{caption}")
-                elif message.audio:
-                    await message.bot.send_audio(chat_id=target_user, audio=message.audio.file_id, caption=f"{prefix}{caption}")
-                elif message.text:
-                    await message.bot.send_message(chat_id=target_user, text=f"{prefix}{message.text}")
-                await message.answer("✅ پاسخ شما با موفقیت ارسال شد.")
-            except Exception as e:
-                await message.answer(f"❌ خطا در ارسال پیام به کاربر: {e}")
+# پاسخ ادمین فقط در حالتی که روی پیام ریپلای کند و در وضعیت خاص دیگری نباشد، فعال می‌شود
+@router.message(F.chat.id == ADMIN_ID, F.reply_to_message, StateFilter(None, BotStates.idle))
+async def process_admin_replies(message: Message, state: FSMContext, bot: Bot):
+    reply_text = message.reply_to_message.text or message.reply_to_message.caption or ""
+    match = re.search(r"#User_(\d+)", reply_text)
+    if match:
+        target_user = int(match.group(1))
+        prefix = "پاسخ مدیریت:\n\n"
+        caption = message.caption or ""
+        
+        try:
+            if message.photo:
+                await bot.send_photo(chat_id=target_user, photo=message.photo[-1].file_id, caption=f"{prefix}{caption}")
+            elif message.document:
+                await bot.send_document(chat_id=target_user, document=message.document.file_id, caption=f"{prefix}{caption}")
+            elif message.video:
+                await bot.send_video(chat_id=target_user, video=message.video.file_id, caption=f"{prefix}{caption}")
+            elif message.audio:
+                await bot.send_audio(chat_id=target_user, audio=message.audio.file_id, caption=f"{prefix}{caption}")
+            elif message.text:
+                await bot.send_message(chat_id=target_user, text=f"{prefix}{message.text}")
+            await message.answer("✅ پاسخ شما با موفقیت ارسال شد.")
+        except Exception as e:
+            await message.answer(f"❌ خطا در ارسال پیام به کاربر: {e}")
 
-@router.message(BotStates.waiting_post_content)
-async def process_add_post_content(message: Message, state: FSMContext):
+@router.message(StateFilter(BotStates.waiting_post_content))
+async def process_add_post_content(message: Message, state: FSMContext, bot: Bot):
     state_data = await state.get_data()
     admin_mode = state_data.get("admin_mode", "user")
     if message.from_user.id != ADMIN_ID or admin_mode == "user":
@@ -865,11 +888,11 @@ async def process_add_post_content(message: Message, state: FSMContext):
     await state.set_state(BotStates.waiting_post_confirm)
     
     post_mock = {"text": caption, "file_id": file_id, "media_type": media_type}
-    await send_post_content(message.chat.id, post_mock)
+    await send_post_content(bot, message.chat.id, post_mock)
     await message.answer("آیا مایلید این محتوا ذخیره گردد؟", reply_markup=get_confirm_add_post_kb())
 
-@router.message(BotStates.waiting_broadcast_content)
-async def process_broadcast_content(message: Message, state: FSMContext):
+@router.message(StateFilter(BotStates.waiting_broadcast_content))
+async def process_broadcast_content(message: Message, state: FSMContext, bot: Bot):
     state_data = await state.get_data()
     admin_mode = state_data.get("admin_mode", "user")
     if message.from_user.id != ADMIN_ID or admin_mode == "user":
@@ -900,11 +923,11 @@ async def process_broadcast_content(message: Message, state: FSMContext):
     await state.set_state(BotStates.waiting_broadcast_confirm)
     
     post_mock = {"text": broadcast_caption, "file_id": file_id, "media_type": media_type}
-    await send_post_content(message.chat.id, post_mock)
+    await send_post_content(bot, message.chat.id, post_mock)
     await message.answer("از ارسال نهایی این پیام به تمامی اعضا مطمئن هستید؟", reply_markup=get_confirm_broadcast_kb())
 
-@router.message(BotStates.user_search_folder)
-async def process_user_search_folder(message: Message, state: FSMContext, db: D1Database):
+@router.message(StateFilter(BotStates.user_search_folder))
+async def process_user_search_folder(message: Message, state: FSMContext, db: D1Database, bot: Bot):
     query_text = (message.text or "").strip()
     if not query_text:
         return
@@ -961,10 +984,10 @@ async def process_user_search_folder(message: Message, state: FSMContext, db: D1
     post_rows = await db.execute("SELECT text, file_id, media_type FROM posts WHERE id = ?", [first_post_id])
     if post_rows:
         kb = get_saved_folder_search_pagination_kb(first_post_id, folder, 0)
-        await send_post_content(message.chat.id, post_rows[0], kb)
+        await send_post_content(bot, message.chat.id, post_rows[0], kb)
 
-@router.message(BotStates.admin_search_word)
-async def process_admin_search_word(message: Message, state: FSMContext, db: D1Database):
+@router.message(StateFilter(BotStates.admin_search_word))
+async def process_admin_search_word(message: Message, state: FSMContext, db: D1Database, bot: Bot):
     state_data = await state.get_data()
     admin_mode = state_data.get("admin_mode", "user")
     if message.from_user.id != ADMIN_ID or admin_mode == "user":
@@ -995,17 +1018,10 @@ async def process_admin_search_word(message: Message, state: FSMContext, db: D1D
     post_rows = await db.execute("SELECT text, file_id, media_type FROM posts WHERE id = ?", [first_post_id])
     if post_rows:
         kb = get_admin_search_pagination_kb(first_post_id, 0)
-        await send_post_content(message.chat.id, post_rows[0], kb)
+        await send_post_content(bot, message.chat.id, post_rows[0], kb)
 
-@router.message()
+@router.message(StateFilter(None, BotStates.idle))
 async def process_unknown_commands(message: Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state in [
-        BotStates.waiting_post_content, BotStates.waiting_broadcast_content,
-        BotStates.user_chat_admin, BotStates.ai_chat,
-        BotStates.user_search_folder, BotStates.admin_search_word
-    ]:
-        return
     await message.answer("دستور ناشناس ❌\nلطفا از دکمه ها استفاده کنید 👇🏻")
 
 # ============================================================
@@ -1102,7 +1118,7 @@ async def process_unsave_action(call: CallbackQuery, db: D1Database):
         await call.answer("❌ خطا در حذف", show_alert=True)
 
 @router.callback_query(F.data.startswith("f_view_"))
-async def process_view_saved_folder(call: CallbackQuery, state: FSMContext, db: D1Database):
+async def process_view_saved_folder(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
     folder = call.data.split("_")[2]
     user_id = call.from_user.id
     state_data = await state.get_data()
@@ -1114,7 +1130,7 @@ async def process_view_saved_folder(call: CallbackQuery, state: FSMContext, db: 
         p_rows = await db.execute("SELECT text, file_id, media_type FROM posts WHERE id = ?", [cached_list[0]])
         if p_rows:
             kb = get_saved_folder_pagination_kb(cached_list[0], folder, 0)
-            await send_post_content(call.message.chat.id, p_rows[0], kb)
+            await send_post_content(bot, call.message.chat.id, p_rows[0], kb)
         return
         
     rows = await db.execute(
@@ -1135,10 +1151,10 @@ async def process_view_saved_folder(call: CallbackQuery, state: FSMContext, db: 
         p_rows = await db.execute("SELECT text, file_id, media_type FROM posts WHERE id = ?", [post_id])
         if p_rows:
             kb = get_saved_folder_pagination_kb(post_id, folder, 0)
-            await send_post_content(call.message.chat.id, p_rows[0], kb)
+            await send_post_content(bot, call.message.chat.id, p_rows[0], kb)
 
 @router.callback_query(F.data.startswith("fpg_"))
-async def process_folder_pagination(call: CallbackQuery, state: FSMContext, db: D1Database):
+async def process_folder_pagination(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
     parts = call.data.split("_")
     direction = parts[1]
     folder = parts[2]
@@ -1166,7 +1182,7 @@ async def process_folder_pagination(call: CallbackQuery, state: FSMContext, db: 
                         await call.message.delete()
                     except Exception:
                         pass
-                    await send_post_content(call.message.chat.id, post, kb)
+                    await send_post_content(bot, call.message.chat.id, post, kb)
                 else:
                     try:
                         await call.message.edit_text(text=post.get("text") or "", reply_markup=kb)
@@ -1205,7 +1221,7 @@ async def process_f_search_button(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 @router.callback_query(F.data.startswith("fspg_"))
-async def process_folder_search_pagination(call: CallbackQuery, state: FSMContext, db: D1Database):
+async def process_folder_search_pagination(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
     parts = call.data.split("_")
     direction = parts[1]
     folder = parts[2]
@@ -1231,7 +1247,7 @@ async def process_folder_search_pagination(call: CallbackQuery, state: FSMContex
                         await call.message.delete()
                     except Exception:
                         pass
-                    await send_post_content(call.message.chat.id, post, kb)
+                    await send_post_content(bot, call.message.chat.id, post, kb)
                 else:
                     try:
                         await call.message.edit_text(text=post.get("text") or "", reply_markup=kb)
@@ -1253,7 +1269,7 @@ async def process_ask_deletion(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 @router.callback_query(F.data.startswith("cancel_delete_"))
-async def process_cancel_deletion(call: CallbackQuery, state: FSMContext, db: D1Database):
+async def process_cancel_deletion(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
     folder = call.data.split("_")[2]
     await call.answer("✅ عملیات لغو شد.", show_alert=True)
     try:
@@ -1270,7 +1286,7 @@ async def process_cancel_deletion(call: CallbackQuery, state: FSMContext, db: D1
         p_rows = await db.execute("SELECT text, file_id, media_type FROM posts WHERE id = ?", [post_id])
         if p_rows:
             kb = get_saved_folder_pagination_kb(post_id, folder, idx)
-            await send_post_content(call.message.chat.id, p_rows[0], kb)
+            await send_post_content(bot, call.message.chat.id, p_rows[0], kb)
     else:
         user_id = call.from_user.id
         rows = await db.execute(
@@ -1282,12 +1298,12 @@ async def process_cancel_deletion(call: CallbackQuery, state: FSMContext, db: D1
         if rows:
             post_id = rows[0]["id"]
             kb = get_saved_folder_pagination_kb(post_id, folder, 0)
-            await send_post_content(call.message.chat.id, rows[0], kb)
+            await send_post_content(bot, call.message.chat.id, rows[0], kb)
         else:
             await call.message.answer("📭 این پوشه خالی شد.")
 
 @router.callback_query(F.data.startswith("f_del_save_"))
-async def process_f_del_save(call: CallbackQuery, state: FSMContext, db: D1Database):
+async def process_f_del_save(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
     parts = call.data.split("_")
     post_id = int(parts[3])
     folder = parts[4]
@@ -1314,7 +1330,7 @@ async def process_f_del_save(call: CallbackQuery, state: FSMContext, db: D1Datab
             p_rows = await db.execute("SELECT text, file_id, media_type FROM posts WHERE id = ?", [new_post_id])
             if p_rows:
                 kb = get_saved_folder_pagination_kb(new_post_id, folder, 0)
-                await send_post_content(call.message.chat.id, p_rows[0], kb)
+                await send_post_content(bot, call.message.chat.id, p_rows[0], kb)
         else:
             folder_display = FOLDER_NAMES.get(folder, folder)
             await call.message.answer(f"📭 پوشه {folder_display} کاملاً خالی شد.")
@@ -1324,23 +1340,23 @@ async def process_f_del_save(call: CallbackQuery, state: FSMContext, db: D1Datab
 # ============================================================
 # بخش‌های خلاصه لیست و مدیریت پست‌ها برای ادمین
 # ============================================================
-async def send_admin_all_posts_page(chat_id: int, posts: list, page: int, total_pages: int, total_count: int, edit_message_id: int = None):
-    message_text = f"📋 **لیست خلاصه محتواها (صفحه {page + 1} از {total_pages})**\n\n"
+async def send_admin_all_posts_page(bot: Bot, chat_id: int, posts: list, page: int, total_pages: int, total_count: int, edit_message_id: int = None):
+    message_text = f"📋 <b>لیست خلاصه محتواها (صفحه {page + 1} از {total_pages})</b>\n\n"
     for p in posts:
-        preview = (p.get("text") or "")[:10].replace("\n", " ") if p.get("text") else "(بدون متن)"
+        raw_text = (p.get("text") or "")[:20].replace("\n", " ")
+        preview = html.escape(raw_text) if raw_text else "(بدون متن)"
         message_text += f"🔹 #{p['id']} | {preview}...\n"
         message_text += f"   👍 {p.get('likes') or 0} | 👎 {p.get('dislikes') or 0} | 👁️ {p.get('views') or 0}\n\n"
     message_text += f"📊 مجموع: {total_count} پست"
     
     kb = get_admin_all_posts_kb(posts, page, total_pages)
-    bot = Bot.get_current()
     if edit_message_id:
         try:
-            await bot.edit_message_text(chat_id=chat_id, message_id=edit_message_id, text=message_text, reply_markup=kb, parse_mode="Markdown")
+            await bot.edit_message_text(chat_id=chat_id, message_id=edit_message_id, text=message_text, reply_markup=kb, parse_mode="HTML")
         except Exception:
             pass
     else:
-        await bot.send_message(chat_id=chat_id, text=message_text, reply_markup=kb, parse_mode="Markdown")
+        await bot.send_message(chat_id=chat_id, text=message_text, reply_markup=kb, parse_mode="HTML")
 
 @router.callback_query(F.data == "adm_view_all")
 async def callback_admin_view_all(call: CallbackQuery):
@@ -1356,7 +1372,7 @@ async def callback_admin_view_all_cancel(call: CallbackQuery):
     await call.answer("لغو شد")
 
 @router.callback_query(F.data == "adm_view_all_confirm")
-async def callback_admin_view_all_confirm(call: CallbackQuery, state: FSMContext, db: D1Database):
+async def callback_admin_view_all_confirm(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
     try:
         await call.message.delete()
     except Exception:
@@ -1371,15 +1387,15 @@ async def callback_admin_view_all_confirm(call: CallbackQuery, state: FSMContext
         
     counts = await db.execute("SELECT COUNT(*) as c FROM posts WHERE deleted = 0")
     total_count = counts[0].get("c", 0) if counts else 0
-    total_pages = math.ceil(total_count / per_page)
+    total_pages = math.ceil(total_count / per_page) if total_count else 1
     
     await state.set_state(BotStates.admin_view_all)
     await state.update_data(all_posts_page=page, all_per_page=per_page, all_total_pages=total_pages, all_total_count=total_count)
-    await send_admin_all_posts_page(call.message.chat.id, rows, page, total_pages, total_count)
+    await send_admin_all_posts_page(bot, call.message.chat.id, rows, page, total_pages, total_count)
     await call.answer(f"📋 {total_count} پست یافت شد")
 
 @router.callback_query(F.data.startswith("adm_all_page_"))
-async def callback_admin_all_posts_page(call: CallbackQuery, state: FSMContext, db: D1Database):
+async def callback_admin_all_posts_page(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
     parts = call.data.split("_")
     direction = parts[3]
     current_page = int(parts[4])
@@ -1400,7 +1416,7 @@ async def callback_admin_all_posts_page(call: CallbackQuery, state: FSMContext, 
     await state.update_data(all_posts_page=new_page)
     rows = await db.execute("SELECT id, text, likes, dislikes, views FROM posts WHERE deleted = 0 ORDER BY id DESC LIMIT ? OFFSET ?", [per_page, new_page * per_page])
     if rows:
-        await send_admin_all_posts_page(call.message.chat.id, rows, new_page, total_pages, total_count, call.message.message_id)
+        await send_admin_all_posts_page(bot, call.message.chat.id, rows, new_page, total_pages, total_count, call.message.message_id)
 
 @router.callback_query(F.data.startswith("adm_all_stat_"))
 async def callback_admin_all_post_statistics(call: CallbackQuery, db: D1Database):
@@ -1421,7 +1437,7 @@ async def callback_admin_search_text(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 @router.callback_query(F.data.startswith("asearch_"))
-async def callback_admin_search_pagination(call: CallbackQuery, state: FSMContext, db: D1Database):
+async def callback_admin_search_pagination(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
     parts = call.data.split("_")
     direction = parts[1]
     current_index = int(parts[2])
@@ -1448,7 +1464,7 @@ async def callback_admin_search_pagination(call: CallbackQuery, state: FSMContex
                         await call.message.delete()
                     except Exception:
                         pass
-                    await send_post_content(call.message.chat.id, post, kb)
+                    await send_post_content(bot, call.message.chat.id, post, kb)
                 else:
                     try:
                         await call.message.edit_text(text=post.get("text") or "", reply_markup=kb)
@@ -1555,7 +1571,7 @@ async def callback_confirm_add_post_no(call: CallbackQuery, state: FSMContext):
     await call.answer("لغو شد")
 
 @router.callback_query(F.data == "conf_broad_yes")
-async def callback_confirm_broadcast_yes(call: CallbackQuery, state: FSMContext, db: D1Database):
+async def callback_confirm_broadcast_yes(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
     state_data = await state.get_data()
     temp_text = state_data.get("temp_text")
     temp_file_id = state_data.get("temp_file_id")
@@ -1575,25 +1591,27 @@ async def callback_confirm_broadcast_yes(call: CallbackQuery, state: FSMContext,
     success_count, fail_count = 0, 0
     CHUNK_SIZE = 20
     
-    async def send_to_user(bot: Bot, uid: int, text: str, file: str, mtype: str):
+    async def send_to_user(bot_instance: Bot, uid: int, text: str, file: str, mtype: str):
+        caption = text if len(text) <= 1024 else text[:1020] + "..."
         try:
             if mtype == "photo" and file:
-                await bot.send_photo(chat_id=uid, photo=file, caption=text)
+                await bot_instance.send_photo(chat_id=uid, photo=file, caption=caption)
             elif mtype == "document" and file:
-                await bot.send_document(chat_id=uid, document=file, caption=text)
+                await bot_instance.send_document(chat_id=uid, document=file, caption=caption)
             elif mtype == "video" and file:
-                await bot.send_video(chat_id=uid, video=file, caption=text)
+                await bot_instance.send_video(chat_id=uid, video=file, caption=caption)
             elif mtype == "audio" and file:
-                await bot.send_audio(chat_id=uid, audio=file, caption=text)
+                await bot_instance.send_audio(chat_id=uid, audio=file, caption=caption)
             else:
-                await bot.send_message(chat_id=uid, text=text or "پیام همگانی")
+                safe_text = text if len(text) <= 4096 else text[:4090] + "..."
+                await bot_instance_message = await bot_instance.send_message(chat_id=uid, text=safe_text or "پیام همگانی")
             return True
         except Exception:
             return False
 
     for i in range(0, len(users), CHUNK_SIZE):
         chunk = users[i:i+CHUNK_SIZE]
-        tasks = [send_to_user(call.message.bot, u["id"], temp_text, temp_file_id, temp_media_type) for u in chunk]
+        tasks = [send_to_user(bot, u["id"], temp_text, temp_file_id, temp_media_type) for u in chunk]
         results = await asyncio.gather(*tasks)
         success_count += sum(1 for r in results if r)
         fail_count += sum(1 for r in results if not r)
