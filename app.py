@@ -15,7 +15,7 @@ import aiohttp
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -490,6 +490,7 @@ async def send_post_content(bot: Bot, chat_id: int, post: dict, reply_markup=Non
     file_id = post.get("file_id")
     media_type = post.get("media_type")
     
+    # تلگرام برای کپشن‌ها محدودیت ۱۰۲۴ کاراکتری دارد. جهت جلوگیری از کرش:
     caption = text if len(text) <= 1024 else text[:1020] + "..."
     
     try:
@@ -586,8 +587,9 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
     user_id = message.from_user.id
     state_data = await state.get_data()
     
+    await state.set_state(BotStates.idle)
+    
     if text == "🤖 هوش مصنوعی":
-        await state.set_state(BotStates.idle)
         history = [{"role": "system", "content": "You are a helpful assistant. Reply clearly in Persian."}]
         await state.set_state(BotStates.ai_chat)
         await state.update_data(ai_history=history)
@@ -597,12 +599,10 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
         )
         
     elif text == "کاربر":
-        await state.set_state(BotStates.idle)
         await state.update_data(admin_mode="user")
         await message.answer("✅ فاز کاربری فعال شد.", reply_markup=get_main_menu())
         
     elif text == "مدیریت":
-        await state.set_state(BotStates.idle)
         if user_id == ADMIN_ID:
             await state.update_data(admin_mode="admin")
             await message.answer("✅ پنل مدیریت فعال شد.", reply_markup=get_admin_menu())
@@ -610,7 +610,6 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
             await message.answer("⛔ شما دسترسی مدیریت ندارید.")
             
     elif text == "❓ راهنما":
-        await state.set_state(BotStates.idle)
         first_name = message.from_user.first_name or "دوست"
         help_text = f""" خب {first_name} جان ببین 👀
 
@@ -622,7 +621,6 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
         await message.answer(help_text, reply_markup=get_help_more_kb())
         
     elif text == "👤 پروفایل":
-        await state.set_state(BotStates.idle)
         rows = await db.execute("SELECT joined_at, role FROM users WHERE id = ?", [user_id])
         joined_str = rows[0].get("joined_at") if rows else None
         user_role_db = rows[0].get("role") if rows else "user"
@@ -663,11 +661,9 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
         await message.answer(profile_text)
         
     elif text == "💾 ذخیره‌های من":
-        await state.set_state(BotStates.idle)
         await message.answer("📂 کدوم پوشه رو میخوای باز کنی؟ 👇", reply_markup=get_folder_selection_kb())
         
     elif text == "📞 ارتباط با مدیریت":
-        await state.set_state(BotStates.idle)
         await state.set_state(BotStates.user_chat_admin)
         await message.answer(
             "🛡️ ارتباط امن و ناشناس با مدیریت برقرار شد!\n\nهر پیامی داری همین الان بفرست ...",
@@ -675,7 +671,6 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
         )
         
     elif text == "➕ افزودن پست":
-        await state.set_state(BotStates.idle)
         admin_mode = state_data.get("admin_mode", "user")
         if user_id == ADMIN_ID and admin_mode != "user":
             await state.set_state(BotStates.waiting_post_content)
@@ -684,7 +679,6 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
             await message.answer("⛔ شما دسترسی مدیریت ندارید.")
             
     elif text == "📁 مدیریت محتوا":
-        await state.set_state(BotStates.idle)
         admin_mode = state_data.get("admin_mode", "user")
         if user_id == ADMIN_ID and admin_mode != "user":
             await message.answer("📂 انتخاب کنید:", reply_markup=get_content_management_kb())
@@ -692,7 +686,6 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
             await message.answer("⛔ شما دسترسی مدیریت ندارید.")
             
     elif text == "📊 آمار":
-        await state.set_state(BotStates.idle)
         admin_mode = state_data.get("admin_mode", "user")
         if user_id == ADMIN_ID and admin_mode != "user":
             total_users = (await db.execute("SELECT COUNT(*) as c FROM users"))[0].get("c", 0)
@@ -713,7 +706,6 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
             await message.answer("⛔ شما دسترسی مدیریت ندارید.")
             
     elif text == "📢 ارسال همگانی":
-        await state.set_state(BotStates.idle)
         admin_mode = state_data.get("admin_mode", "user")
         if user_id == ADMIN_ID and admin_mode != "user":
             await state.set_state(BotStates.waiting_broadcast_content)
@@ -740,7 +732,7 @@ async def cmd_exit_session(message: Message, state: FSMContext):
 # ============================================================
 # بخش مدیریت پیام‌ها در هر وضعیت فعال (FSM States Processing)
 # ============================================================
-@router.message(StateFilter(BotStates.ai_chat))
+@router.message(BotStates.ai_chat)
 async def process_ai_chat(message: Message, state: FSMContext, db: D1Database, bot: Bot):
     user_id = message.from_user.id
     
@@ -812,7 +804,7 @@ async def process_ai_chat(message: Message, state: FSMContext, db: D1Database, b
     tokens_used += ai_result["tokens"]
     await db.execute("UPDATE users SET tokens_used = ?, last_reset_date = ? WHERE id = ?", [tokens_used, today_tehran, user_id])
 
-@router.message(StateFilter(BotStates.user_chat_admin))
+@router.message(BotStates.user_chat_admin)
 async def process_user_chat_admin(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
     if user_id == ADMIN_ID:
@@ -832,36 +824,35 @@ async def process_user_chat_admin(message: Message, state: FSMContext, bot: Bot)
     elif message.text:
         await bot.send_message(chat_id=ADMIN_ID, text=f"پیام جدید:\n{hashtag}\n\n{message.text}")
 
-# پاسخ ادمین فقط در حالتی که روی پیام ریپلای کند و در وضعیت خاص دیگری نباشد، فعال می‌شود
-@router.message(F.chat.id == ADMIN_ID, F.reply_to_message, StateFilter(None, BotStates.idle))
+@router.message(F.chat.id == ADMIN_ID)
 async def process_admin_replies(message: Message, state: FSMContext, bot: Bot):
-    reply_text = message.reply_to_message.text or message.reply_to_message.caption or ""
-    match = re.search(r"#User_(\d+)", reply_text)
-    if match:
-        target_user = int(match.group(1))
-        prefix = "پاسخ مدیریت:\n\n"
-        caption = message.caption or ""
-        
-        try:
-            if message.photo:
-                await bot.send_photo(chat_id=target_user, photo=message.photo[-1].file_id, caption=f"{prefix}{caption}")
-            elif message.document:
-                await bot.send_document(chat_id=target_user, document=message.document.file_id, caption=f"{prefix}{caption}")
-            elif message.video:
-                await bot.send_video(chat_id=target_user, video=message.video.file_id, caption=f"{prefix}{caption}")
-            elif message.audio:
-                await bot.send_audio(chat_id=target_user, audio=message.audio.file_id, caption=f"{prefix}{caption}")
-            elif message.text:
-                await bot.send_message(chat_id=target_user, text=f"{prefix}{message.text}")
-            await message.answer("✅ پاسخ شما با موفقیت ارسال شد.")
-        except Exception as e:
-            await message.answer(f"❌ خطا در ارسال پیام به کاربر: {e}")
+    if message.reply_to_message:
+        reply_text = message.reply_to_message.text or message.reply_to_message.caption or ""
+        match = re.search(r"#User_(\d+)", reply_text)
+        if match:
+            target_user = int(match.group(1))
+            prefix = "پاسخ مدیریت:\n\n"
+            caption = message.caption or ""
+            
+            try:
+                if message.photo:
+                    await bot.send_photo(chat_id=target_user, photo=message.photo[-1].file_id, caption=f"{prefix}{caption}")
+                elif message.document:
+                    await bot.send_document(chat_id=target_user, document=message.document.file_id, caption=f"{prefix}{caption}")
+                elif message.video:
+                    await bot.send_video(chat_id=target_user, video=message.video.file_id, caption=f"{prefix}{caption}")
+                elif message.audio:
+                    await bot.send_audio(chat_id=target_user, audio=message.audio.file_id, caption=f"{prefix}{caption}")
+                elif message.text:
+                    await bot.send_message(chat_id=target_user, text=f"{prefix}{message.text}")
+                await message.answer("✅ پاسخ شما با موفقیت ارسال شد.")
+            except Exception as e:
+                await message.answer(f"❌ خطا در ارسال پیام به کاربر: {e}")
 
-@router.message(StateFilter(BotStates.waiting_post_content))
+@router.message(BotStates.waiting_post_content)
 async def process_add_post_content(message: Message, state: FSMContext, bot: Bot):
-    state_data = await state.get_data()
-    admin_mode = state_data.get("admin_mode", "user")
-    if message.from_user.id != ADMIN_ID or admin_mode == "user":
+    # برای جلوگیری از silent return های ناشی از حذف شدن متغیر admin_mode، فقط کافی است بررسی کنیم آیا کاربر واقعا ادمین هست یا نه
+    if message.from_user.id != ADMIN_ID:
         return
         
     file_id, media_type = None, None
@@ -891,11 +882,9 @@ async def process_add_post_content(message: Message, state: FSMContext, bot: Bot
     await send_post_content(bot, message.chat.id, post_mock)
     await message.answer("آیا مایلید این محتوا ذخیره گردد؟", reply_markup=get_confirm_add_post_kb())
 
-@router.message(StateFilter(BotStates.waiting_broadcast_content))
+@router.message(BotStates.waiting_broadcast_content)
 async def process_broadcast_content(message: Message, state: FSMContext, bot: Bot):
-    state_data = await state.get_data()
-    admin_mode = state_data.get("admin_mode", "user")
-    if message.from_user.id != ADMIN_ID or admin_mode == "user":
+    if message.from_user.id != ADMIN_ID:
         return
         
     file_id, media_type = None, None
@@ -926,7 +915,7 @@ async def process_broadcast_content(message: Message, state: FSMContext, bot: Bo
     await send_post_content(bot, message.chat.id, post_mock)
     await message.answer("از ارسال نهایی این پیام به تمامی اعضا مطمئن هستید؟", reply_markup=get_confirm_broadcast_kb())
 
-@router.message(StateFilter(BotStates.user_search_folder))
+@router.message(BotStates.user_search_folder)
 async def process_user_search_folder(message: Message, state: FSMContext, db: D1Database, bot: Bot):
     query_text = (message.text or "").strip()
     if not query_text:
@@ -986,15 +975,14 @@ async def process_user_search_folder(message: Message, state: FSMContext, db: D1
         kb = get_saved_folder_search_pagination_kb(first_post_id, folder, 0)
         await send_post_content(bot, message.chat.id, post_rows[0], kb)
 
-@router.message(StateFilter(BotStates.admin_search_word))
+@router.message(BotStates.admin_search_word)
 async def process_admin_search_word(message: Message, state: FSMContext, db: D1Database, bot: Bot):
-    state_data = await state.get_data()
-    admin_mode = state_data.get("admin_mode", "user")
-    if message.from_user.id != ADMIN_ID or admin_mode == "user":
+    if message.from_user.id != ADMIN_ID:
         return
         
     query_text = (message.text or "").strip()
     if not query_text:
+        await message.answer("❌ لطفاً یک کلمه یا کد معتبر ارسال کنید.")
         return
         
     results = []
@@ -1020,8 +1008,19 @@ async def process_admin_search_word(message: Message, state: FSMContext, db: D1D
         kb = get_admin_search_pagination_kb(first_post_id, 0)
         await send_post_content(bot, message.chat.id, post_rows[0], kb)
 
-@router.message(StateFilter(None, BotStates.idle))
+@router.message()
 async def process_unknown_commands(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    # در نسخه ۳ aiogram متد get_state رشته برمی‌گرداند.
+    active_states = [
+        BotStates.waiting_post_content.state, BotStates.waiting_post_confirm.state,
+        BotStates.waiting_broadcast_content.state, BotStates.waiting_broadcast_confirm.state,
+        BotStates.user_chat_admin.state, BotStates.ai_chat.state,
+        BotStates.user_search_folder.state, BotStates.admin_search_word.state,
+        BotStates.admin_view_all.state
+    ]
+    if current_state in active_states:
+        return
     await message.answer("دستور ناشناس ❌\nلطفا از دکمه ها استفاده کنید 👇🏻")
 
 # ============================================================
@@ -1341,6 +1340,7 @@ async def process_f_del_save(call: CallbackQuery, state: FSMContext, db: D1Datab
 # بخش‌های خلاصه لیست و مدیریت پست‌ها برای ادمین
 # ============================================================
 async def send_admin_all_posts_page(bot: Bot, chat_id: int, posts: list, page: int, total_pages: int, total_count: int, edit_message_id: int = None):
+    # برای جلوگیری از کرش مارک‌داون، از پارس‌مود HTML و html.escape استفاده می‌کنیم
     message_text = f"📋 <b>لیست خلاصه محتواها (صفحه {page + 1} از {total_pages})</b>\n\n"
     for p in posts:
         raw_text = (p.get("text") or "")[:20].replace("\n", " ")
@@ -1552,14 +1552,25 @@ async def callback_confirm_add_post_yes(call: CallbackQuery, state: FSMContext, 
                 "INSERT INTO posts(text, file_id, media_type) VALUES(?, ?, ?) RETURNING id",
                 [temp_text, temp_file_id, temp_media_type]
             )
-            post_id = res[0].get("id") if res else None
+            
+            post_id = None
+            if res and isinstance(res, list) and len(res) > 0:
+                post_id = res[0].get("id")
+                
+            if not post_id:
+                # اطمینان از اینکه در صورت عدم پشتیبانی درایور از بازگشت مقادیر در دستور INSERT، آی‌دی گرفته می‌شود
+                max_res = await db.execute("SELECT MAX(id) as id FROM posts")
+                post_id = max_res[0].get("id") if max_res else None
+
             await state.update_data(temp_text=None, temp_file_id=None, temp_media_type=None)
             await state.set_state(BotStates.idle)
             
             await call.message.answer(f"✅ آرشیو شد!\n🔗 لینک:\nhttps://t.me/{BOT_USERNAME}?start={post_id}")
             await call.answer("✅ ثبت شد!")
         except Exception as e:
-            await call.answer(f"❌ خطا در ثبت: {e}", show_alert=True)
+            logger.error(f"Error saving post: {e}")
+            await call.message.answer(f"❌ خطا در ثبت محتوا در دیتابیس:\n{str(e)}")
+            await call.answer()
     else:
         await call.answer("❌ اطلاعات ناقص است", show_alert=True)
 
@@ -1581,47 +1592,52 @@ async def callback_confirm_broadcast_yes(call: CallbackQuery, state: FSMContext,
         await call.answer("❌ اطلاعات ناقص است", show_alert=True)
         return
         
-    users = await db.execute("SELECT id FROM users")
-    if not users:
-        await call.message.answer("⚠️ هیچ کاربری در دیتابیس وجود ندارد.")
-        await call.answer()
-        return
+    try:
+        users = await db.execute("SELECT id FROM users")
+        if not users:
+            await call.message.answer("⚠️ هیچ کاربری در دیتابیس وجود ندارد.")
+            await call.answer()
+            return
+            
+        await call.answer("🚀 ارسال همگانی شروع شد...")
+        success_count, fail_count = 0, 0
+        CHUNK_SIZE = 20
         
-    await call.answer("🚀 ارسال همگانی شروع شد...")
-    success_count, fail_count = 0, 0
-    CHUNK_SIZE = 20
-    
-    async def send_to_user(bot_instance: Bot, uid: int, text: str, file: str, mtype: str):
-        caption = text if len(text) <= 1024 else text[:1020] + "..."
-        try:
-            if mtype == "photo" and file:
-                await bot_instance.send_photo(chat_id=uid, photo=file, caption=caption)
-            elif mtype == "document" and file:
-                await bot_instance.send_document(chat_id=uid, document=file, caption=caption)
-            elif mtype == "video" and file:
-                await bot_instance.send_video(chat_id=uid, video=file, caption=caption)
-            elif mtype == "audio" and file:
-                await bot_instance.send_audio(chat_id=uid, audio=file, caption=caption)
-            else:
-                safe_text = text if len(text) <= 4096 else text[:4090] + "..."
-                await bot_instance_message = await bot_instance.send_message(chat_id=uid, text=safe_text or "پیام همگانی")
-            return True
-        except Exception:
-            return False
+        async def send_to_user(bot_instance: Bot, uid: int, text: str, file: str, mtype: str):
+            safe_text = text or ""
+            caption = safe_text if len(safe_text) <= 1024 else safe_text[:1020] + "..."
+            try:
+                if mtype == "photo" and file:
+                    await bot_instance.send_photo(chat_id=uid, photo=file, caption=caption)
+                elif mtype == "document" and file:
+                    await bot_instance.send_document(chat_id=uid, document=file, caption=caption)
+                elif mtype == "video" and file:
+                    await bot_instance.send_video(chat_id=uid, video=file, caption=caption)
+                elif mtype == "audio" and file:
+                    await bot_instance.send_audio(chat_id=uid, audio=file, caption=caption)
+                else:
+                    safe_msg_text = safe_text if len(safe_text) <= 4096 else safe_text[:4090] + "..."
+                    await bot_instance.send_message(chat_id=uid, text=safe_msg_text or "پیام همگانی")
+                return True
+            except Exception:
+                return False
 
-    for i in range(0, len(users), CHUNK_SIZE):
-        chunk = users[i:i+CHUNK_SIZE]
-        tasks = [send_to_user(bot, u["id"], temp_text, temp_file_id, temp_media_type) for u in chunk]
-        results = await asyncio.gather(*tasks)
-        success_count += sum(1 for r in results if r)
-        fail_count += sum(1 for r in results if not r)
-        await asyncio.sleep(0.1)
+        for i in range(0, len(users), CHUNK_SIZE):
+            chunk = users[i:i+CHUNK_SIZE]
+            tasks = [send_to_user(bot, u["id"], temp_text, temp_file_id, temp_media_type) for u in chunk]
+            results = await asyncio.gather(*tasks)
+            success_count += sum(1 for r in results if r)
+            fail_count += sum(1 for r in results if not r)
+            await asyncio.sleep(0.1)
+            
+        await state.update_data(temp_text=None, temp_file_id=None, temp_media_type=None)
+        await state.set_state(BotStates.idle)
         
-    await state.update_data(temp_text=None, temp_file_id=None, temp_media_type=None)
-    await state.set_state(BotStates.idle)
-    
-    await call.message.answer(f"✅ ارسال همگانی انجام شد.\nموفق: {success_count} نفر\nناموفق: {fail_count} نفر")
-    await call.answer("✅ ارسال همگانی کامل شد!")
+        await call.message.answer(f"✅ ارسال همگانی انجام شد.\nموفق: {success_count} نفر\nناموفق: {fail_count} نفر")
+    except Exception as e:
+        logger.error(f"Error in broadcast: {e}")
+        await call.message.answer(f"❌ خطا در روند ارسال همگانی:\n{str(e)}")
+        await call.answer()
 
 @router.callback_query(F.data == "conf_broad_no")
 async def callback_confirm_broadcast_no(call: CallbackQuery, state: FSMContext):
