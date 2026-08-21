@@ -1,6 +1,5 @@
-aiogram
-python-dotenv
-pytz
-aiohttp
-feedparser
-beautifulsoup4
+aiogram>=3.4,<4
+aiohttp>=3.9
+pytz>=2024.1
+python-dotenv>=1.0
+cryptography>=42.0
