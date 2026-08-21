@@ -2,3 +2,5 @@ aiogram
 python-dotenv
 pytz
 aiohttp
+feedparser
+beautifulsoup4
