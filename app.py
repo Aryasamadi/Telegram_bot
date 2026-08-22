@@ -48,7 +48,7 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "8.0.0-rich-content-deeplink-final"
+BUILD_VERSION = "9.0.0-hybrid-scout-gemini-diagnostics-final"
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_AI_WORKERS = 3
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -274,6 +274,8 @@ async def initialize_automation_database(db: D1Database):
         "publish_end_hour": str(DEFAULT_PUBLISH_END_HOUR),
         "default_source_interval": str(DEFAULT_SOURCE_INTERVAL_MINUTES),
         "ai_verify_mode": "auto",
+        "ai_web_scout_enabled": "1",
+        "ai_web_scout_max_items": "5",
         "last_cleanup_at": "",
         "last_manual_channel_post_at": "",
         "channel_id": CHANNEL_ID,
@@ -783,8 +785,11 @@ class AIProviderManager:
 
     @staticmethod
     def protocol(url:str)->str:
-        u=(url or "").lower()
-        if "generativelanguage.googleapis.com" in u and "/openai/" not in u and "chat/completions" not in u:
+        # Detect wire protocol from URL.
+        u=(url or "").lower().rstrip("/")
+        if "generativelanguage.googleapis.com" in u:
+            if "/openai" in u or "chat/completions" in u:
+                return "openai"
             return "gemini"
         if "api.anthropic.com" in u and "/chat/completions" not in u:
             return "anthropic"
@@ -801,15 +806,65 @@ class AIProviderManager:
             return u if u.endswith("/messages") else u+"/v1/messages" if not u.endswith("/v1") else u+"/messages"
         if u.endswith("/chat/completions"): return u
         if u.endswith("/v1"): return u+"/chat/completions"
+        if u.endswith("/openai"): return u+"/chat/completions"
         return u+"/chat/completions"
 
-    async def _request(self, provider, messages, temperature, max_tokens):
+    @staticmethod
+    def google_openai_endpoint(base_url:str)->str:
+        u=(base_url or "").strip().rstrip("/")
+        if "generativelanguage.googleapis.com" not in u:
+            return ""
+        if "/openai" in u:
+            return u if u.endswith("/chat/completions") else u+"/chat/completions"
+        return "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+
+    @staticmethod
+    def _extract_content(protocol:str, data:dict)->str:
+        if protocol=="anthropic":
+            return "".join((b.get("text","") for b in data.get("content",[]) if isinstance(b,dict) and b.get("type")=="text"))
+        if protocol=="gemini":
+            parts=[]
+            for candidate in data.get("candidates") or []:
+                content=candidate.get("content") or {}
+                for part in content.get("parts") or []:
+                    if isinstance(part,dict) and part.get("text"):
+                        parts.append(str(part.get("text")))
+            return "".join(parts).strip()
+        choice=(data.get("choices") or [{}])[0] or {}
+        message=choice.get("message") or {}
+        content=message.get("content")
+        if isinstance(content,str): return content.strip()
+        if isinstance(content,list):
+            return "".join(str(x.get("text","")) for x in content if isinstance(x,dict)).strip()
+        return str(content or "").strip()
+
+    @staticmethod
+    def _empty_response_reason(protocol:str, data:dict)->str:
+        if not isinstance(data,dict): return "بدنه پاسخ JSON قابل تشخیص نبود."
+        if protocol=="gemini":
+            reasons=[]
+            pf=data.get("promptFeedback") or {}
+            if pf.get("blockReason"): reasons.append(f"promptFeedback.blockReason={pf.get('blockReason')}")
+            for c in data.get("candidates") or []:
+                if c.get("finishReason"): reasons.append(f"finishReason={c.get('finishReason')}")
+                if c.get("finishMessage"): reasons.append(f"finishMessage={c.get('finishMessage')}")
+                if c.get("safetyRatings"): reasons.append("safetyRatings=present")
+            return "؛ ".join(reasons) or "Gemini پاسخ HTTP موفق داد اما متن قابل استخراجی نداشت."
+        if protocol=="anthropic":
+            return str(data.get("stop_reason") or data.get("error") or "Anthropic متن قابل استخراجی نداشت.")
+        choices=data.get("choices") or []
+        if choices:
+            c=choices[0] or {}
+            return f"finish_reason={c.get('finish_reason') or '-'}؛ message.content خالی است."
+        return "پاسخ API فاقد choices بود."
+
+    async def _request(self, provider, messages, temperature, max_tokens, forced_protocol:Optional[str]=None, forced_endpoint:Optional[str]=None):
         await self.start()
         key=decrypt_secret(provider.get("encrypted_api_key") or "")
         model=(provider.get("model_name") or "").strip()
         base=provider.get("base_url") or ""
-        protocol=self.protocol(base)
-        endpoint=self.endpoint(base,protocol,model)
+        protocol=forced_protocol or self.protocol(base)
+        endpoint=forced_endpoint or self.endpoint(base,protocol,model)
         headers={"Content-Type":"application/json","User-Agent":HTTP_USER_AGENT}
         started=time.perf_counter()
 
@@ -820,11 +875,10 @@ class AIProviderManager:
             msgs=[{"role":"assistant" if m.get("role")=="assistant" else "user","content":m.get("content","")} for m in messages if m.get("role")!="system"]
             payload={"model":model,"messages":msgs,"max_tokens":max_tokens,"temperature":temperature}
             if system: payload["system"]=system
-        elif protocol=="gemini" and "chat/completions" not in endpoint:
-            endpoint=endpoint+("" if "?" in endpoint else "?")+"key="+urllib.parse.quote(key)
+        elif protocol=="gemini":
+            headers["x-goog-api-key"]=key
             parts=[{"text":m.get("content","")} for m in messages if m.get("role")!="system"]
-            payload={"contents":[{"role":"user","parts":parts or [{"text":""}]}],
-                     "generationConfig":{"temperature":temperature,"maxOutputTokens":max_tokens}}
+            payload={"contents":[{"role":"user","parts":parts or [{"text":""}]}],"generationConfig":{"temperature":temperature,"maxOutputTokens":max_tokens}}
             sys="\n".join(m.get("content","") for m in messages if m.get("role")=="system").strip()
             if sys: payload["systemInstruction"]={"parts":[{"text":sys}]}
         else:
@@ -835,27 +889,98 @@ class AIProviderManager:
             raw=await resp.text()
             latency=int((time.perf_counter()-started)*1000)
             if resp.status!=200:
-                raise RuntimeError(f"HTTP {resp.status}: {raw[:1000]}")
-            data=json.loads(raw)
-            if protocol=="anthropic":
-                content="".join((b.get("text","") for b in data.get("content",[]) if isinstance(b,dict) and b.get("type")=="text"))
-                usage=data.get("usage") or {}
-            elif protocol=="gemini" and "candidates" in data:
-                content="".join((p.get("text","") for c in data.get("candidates",[]) for p in ((c.get("content") or {}).get("parts") or [])))
-                usage=data.get("usageMetadata") or {}
-            else:
-                content=((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-                usage=data.get("usage") or {}
-            if not content: raise RuntimeError("پاسخ مدل خالی بود")
-            return content,data,latency,usage
+                raise RuntimeError(f"HTTP {resp.status} | endpoint={endpoint} | body={raw[:1400]}")
+            try: data=json.loads(raw)
+            except Exception as e: raise RuntimeError(f"HTTP 200 ولی JSON نامعتبر بود: {e} | body={raw[:900]}")
+            content=self._extract_content(protocol,data)
+            usage=(data.get("usageMetadata") if protocol=="gemini" else data.get("usage")) or {}
+            if not content:
+                raise RuntimeError(f"پاسخ مدل خالی بود | protocol={protocol} | model={model} | {self._empty_response_reason(protocol,data)} | response={json.dumps(data,ensure_ascii=False)[:1800]}")
+            return content,data,latency,usage,protocol,endpoint
 
     async def test_provider_values(self, base_url, api_key, model):
-        try:
-            provider={"base_url":base_url,"encrypted_api_key":encrypt_secret(api_key),"model_name":model}
-            content,data,latency,usage=await self._request(provider,[{"role":"user","content":"Reply with exactly: OK"}],0,12)
-            return {"ok":True,"latency_ms":latency,"preview":content.strip()[:80],"usage":usage}
-        except Exception as e:
-            return {"ok":False,"error":str(e)[:1000]}
+        await self.start()
+        base=(base_url or "").strip(); key=(api_key or "").strip(); mdl=(model or "").strip()
+        if not base: return {"ok":False,"stage":"validation","error":"Base URL خالی است."}
+        if not key: return {"ok":False,"stage":"validation","error":"API Key/Token خالی است."}
+        if not mdl: return {"ok":False,"stage":"validation","error":"نام دقیق مدل خالی است."}
+        protocol=self.protocol(base)
+        candidates=[(protocol,self.endpoint(base,protocol,mdl))]
+        if "generativelanguage.googleapis.com" in base:
+            compat=self.google_openai_endpoint(base)
+            if compat and all(ep!=compat for _,ep in candidates):
+                candidates.append(("openai",compat))
+        diagnostics=[]
+        for proto,endpoint in candidates:
+            preflight="not_run"
+            try:
+                if "generativelanguage.googleapis.com" in endpoint:
+                    headers={"x-goog-api-key":key,"User-Agent":HTTP_USER_AGENT} if proto=="gemini" else {"Authorization":f"Bearer {key}","User-Agent":HTTP_USER_AGENT}
+                    model_path=(f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(mdl,safe='')}" if proto=="gemini" else f"https://generativelanguage.googleapis.com/v1beta/openai/models/{urllib.parse.quote(mdl,safe='')}")
+                    async with self._session.get(model_path,headers=headers,timeout=aiohttp.ClientTimeout(total=15)) as r:
+                        pre_raw=await r.text()
+                        if r.status==200: preflight="ok"
+                        else:
+                            diagnostics.append(f"{proto} preflight HTTP {r.status}: {pre_raw[:700]}")
+                            preflight=f"HTTP {r.status}"
+                content,data,latency,usage,actual_proto,actual_endpoint=await self._request(
+                    {"base_url":base,"encrypted_api_key":encrypt_secret(key),"model_name":mdl},
+                    [{"role":"system","content":"You are a connectivity test. Do not analyze anything."},{"role":"user","content":"Reply with exactly: TEST_OK"}],
+                    0,32,forced_protocol=proto,forced_endpoint=endpoint)
+                return {"ok":True,"latency_ms":latency,"preview":content.strip()[:120],"usage":usage,"protocol":actual_proto,"endpoint":actual_endpoint,"preflight":preflight,"diagnostics":diagnostics}
+            except Exception as e:
+                diagnostics.append(f"{proto} {endpoint}: {str(e)[:1600]}")
+                continue
+        return {"ok":False,"stage":"request","protocol":protocol,"endpoint":candidates[0][1],"error":"\n\n".join(diagnostics)[:5000],"diagnostics":diagnostics}
+
+    async def gemini_web_scout(self, site_url:str, max_items:int=5) -> Dict[str,Any]:
+        await self.start()
+        rows=await self.db.execute("SELECT * FROM ai_providers WHERE enabled=1 ORDER BY priority ASC,id ASC")
+        providers=[p for p in rows if "generativelanguage.googleapis.com" in str(p.get("base_url") or "") and p.get("status") not in {"invalid","cooldown"}]
+        if not providers: return {"ok":False,"error":"هیچ Provider بومی Gemini برای Web Scout فعال نیست."}
+        domain=urllib.parse.urlsplit(site_url).netloc
+        prompt=f'''یک Source Scout کنترل‌شده برای یک کانال فارسی فناوری هستی.
+URL منبع: {site_url}
+دامنه: {domain}
+
+با ابزارهای وب خودت سایت/دامنه را بررسی کن و حداکثر {max_items} مطلب جدید و واقعاً مرتبط پیدا کن. حوزه‌ها: فناوری، هوش مصنوعی، مدل‌ها، ابزارها، امنیت سایبری، آموزش و اخبار مهم جهان. ایران/فارسی‌زبان بودن امتیاز است ولی شرط اجباری نیست. فقط مقاله/خبر مشخص را برگردان، نه صفحه دسته‌بندی یا صفحه اصلی. اگر تاریخ دقیق را نمی‌دانی خالی بگذار؛ حدس نزن.
+
+خروجی فقط JSON معتبر با این ساختار:
+{{"items":[{{"title":"...","url":"https://...","description":"خلاصه factual کوتاه","published_at":"...","image_url":"https://..."}}]}}
+
+محتوا را تحلیل یا قضاوت نکن؛ فقط candidateهای واقعی را پیدا و اطلاعات قابل مشاهده را استخراج کن.'''
+        for p in providers[:4]:
+            key=decrypt_secret(p.get("encrypted_api_key") or ""); model=p.get("model_name") or ""
+            endpoint=self.endpoint(p.get("base_url") or "https://generativelanguage.googleapis.com/v1beta","gemini",model)
+            headers={"x-goog-api-key":key,"Content-Type":"application/json","User-Agent":HTTP_USER_AGENT}
+            payload={"contents":[{"role":"user","parts":[{"text":prompt}]}],"generationConfig":{"temperature":0.1,"maxOutputTokens":1800},"tools":[{"url_context":{}},{"google_search":{}}]}
+            try:
+                async with self._session.post(endpoint,headers=headers,json=payload,timeout=aiohttp.ClientTimeout(total=45)) as resp:
+                    raw=await resp.text()
+                    if resp.status!=200:
+                        if resp.status in {400,404}:
+                            payload["tools"]=[{"url_context":{}}]
+                            async with self._session.post(endpoint,headers=headers,json=payload,timeout=aiohttp.ClientTimeout(total=45)) as r2:
+                                raw2=await r2.text()
+                                if r2.status!=200: raise RuntimeError(f"HTTP {r2.status}: {raw2[:900]}")
+                                data=json.loads(raw2)
+                        else: raise RuntimeError(f"HTTP {resp.status}: {raw[:900]}")
+                    else: data=json.loads(raw)
+                    content=self._extract_content("gemini",data)
+                    if not content: raise RuntimeError(self._empty_response_reason("gemini",data))
+                    obj=parse_json_object(content); items=obj.get("items") if isinstance(obj,dict) else None
+                    if not isinstance(items,list): raise RuntimeError("Scout JSON فاقد items است")
+                    clean=[]
+                    for it in items[:max_items]:
+                        if not isinstance(it,dict): continue
+                        u=normalize_url(str(it.get("url") or "")); t=strip_html_text(str(it.get("title") or ""))[:500]
+                        if not u or not t or not same_domain(u,site_url): continue
+                        clean.append({"title":t,"url":u,"description":strip_html_text(str(it.get("description") or ""))[:2000],"published_at":str(it.get("published_at") or "")[:100],"image_url":normalize_url(str(it.get("image_url") or ""))})
+                    if clean: return {"ok":True,"items":clean,"provider":p.get("name"),"model":model}
+                    raise RuntimeError("Scout پاسخ داد ولی candidate معتبر پیدا نشد")
+            except Exception as e:
+                await log_automation(self.db,"WARN","gemini_web_scout_failed",f"source={site_url} provider={p.get('id')} {str(e)[:1000]}")
+        return {"ok":False,"error":"Gemini Web Scout برای این منبع candidate قابل استفاده برنگرداند."}
 
     async def test_provider(self, provider_id:int):
         rows=await self.db.execute("SELECT * FROM ai_providers WHERE id=?",[provider_id])
@@ -893,7 +1018,7 @@ class AIProviderManager:
                 except Exception: pass
             tried+=1
             try:
-                content,data,latency,usage=await self._request(p,messages,temperature,max_tokens)
+                content,data,latency,usage,_,_=await self._request(p,messages,temperature,max_tokens)
                 t=datetime.now(timezone.utc).isoformat()
                 was_unhealthy=bool(p.get("last_error")) or p.get("status") in {"invalid","cooldown"}
                 await self.db.execute("UPDATE ai_providers SET status='healthy',last_error=NULL,cooldown_until=NULL,last_checked_at=?,last_latency_ms=?,consecutive_failures=0,updated_at=? WHERE id=?",[t,latency,t,p["id"]])
@@ -987,6 +1112,24 @@ def rich_channel_fallback(title: str, text: str) -> str:
     if len(clean)>700: clean=clean[:700].rsplit(" ",1)[0]+"…"
     return f"<b>🔎 {html.escape(title[:180])}</b>\n\n{html.escape(clean)}"
 
+def ensure_rich_channel_format(title: str, value: str, category: str = "tech") -> str:
+    """Guarantee a visually structured Telegram caption even when a model returns plain text."""
+    clean=sanitize_telegram_html(value or "")
+    plain=strip_html_text(clean)
+    if not plain: return rich_channel_fallback(title, "اطلاعات قابل انتشار از منبع دریافت شد.")
+    if not any(tag in clean.lower() for tag in ("<b>","<strong>","<i>","<blockquote>")):
+        emoji={"ai":"🤖","cyber":"🔐","tech":"💻","edu":"📚","general":"🌐"}.get(category,"💻")
+        clean=f"<b>{emoji} {html.escape(title[:180])}</b>\n\n{clean}"
+    return clean
+
+def ensure_rich_article_format(title: str, value: str, source_url: str) -> str:
+    clean=sanitize_telegram_html(value or "")
+    plain=strip_html_text(clean)
+    if not plain: return rich_article_fallback(title, "اطلاعات کافی برای تهیه متن کامل از منبع دریافت شد.", source_url)
+    if not any(tag in clean.lower() for tag in ("<b>","<strong>","<i>","<blockquote>")):
+        clean=f"<b>{html.escape(title[:220])}</b>\n\n{clean}"
+    return clean
+
 def rich_article_fallback(title: str, text: str, source_url: str) -> str:
     clean=strip_html_text(text or "")
     return (f"<b>{html.escape(title[:220])}</b>\n\n"
@@ -1039,8 +1182,8 @@ URL: {item.get('url')}
 اگر اطلاعات کافی برای تولید دقیق وجود ندارد، accept=false بده.
 
 اگر accept=true، همزمان محتوای نهایی را تولید کن:
-1) channel_html: حدود 450 تا 650 کاراکتر متن واقعی خبر؛ نه teaser. جذاب، دوستانه، عامیانه و طبیعی فارسی باشد. می‌تواند از <b>، <i>، <u>، <blockquote> و ایموجی مرتبط استفاده کند.
-2) article_html: حدود 1600 تا 2600 کاراکتر، در صورت نیاز بیشتر؛ محتوایی مستقل‌تر و عمیق‌تر از متن کانال، با زمینه، اتفاق اصلی، جزئیات مهم، اثر احتمالی، کاربرد یا پیامد برای کاربر و ایران در صورت ارتباط. تکرار متن کانال نباشد.
+1) channel_html: حدود 450 تا 650 کاراکتر «خودِ خبر»؛ نه teaser و نه صرفاً معرفی لینک. ساختار بصری داشته باشد: تیتر/شروع با <b>، حداکثر 1 بخش کوتاه با <i> یا <blockquote> فقط وقتی طبیعی است، پاراگراف‌های کوتاه و 1 تا 3 ایموجی دقیق و مرتبط.
+2) article_html: حدود 1600 تا 2600 کاراکتر و در صورت نیاز بیشتر؛ مستقل و غنی‌تر از متن کانال. از تیترهای کوتاه با <b>، پاراگراف‌های کوتاه و در صورت مناسب یک <blockquote> استفاده کن. متن باید برای خواندن در موبایل خوش‌خوان باشد و صرفاً کپی/تکرار channel_html نباشد.
 3) title: کوتاه، جذاب و غیرکلیک‌بیتی.
 4) category و facts.
 
@@ -1064,11 +1207,10 @@ URL: {item.get('url')}
         obj=parse_json_object(retry.get("content","")); result=retry
     if not obj: return {"error":"پاسخ AI JSON معتبر نبود","ai":result}
     # اگر مدل فیلدهای HTML را نساخته بود، از متن معمولی fallback می‌سازیم.
-    ch=sanitize_telegram_html(obj.get("channel_html") or obj.get("channel_text") or "")
-    ar=sanitize_telegram_html(obj.get("article_html") or obj.get("article_text") or "")
     title=strip_html_text(obj.get("title") or item.get("title") or "")[:240]
-    if not ch: ch=rich_channel_fallback(title, obj.get("channel_text") or obj.get("article_text") or body)
-    if not ar: ar=rich_article_fallback(title, body, item.get("url") or "")
+    category=str(obj.get("category") or source.get("category") or "tech")
+    ch=ensure_rich_channel_format(title, obj.get("channel_html") or obj.get("channel_text") or "", category)
+    ar=ensure_rich_article_format(title, obj.get("article_html") or obj.get("article_text") or "", item.get("url") or "")
     obj["title"]=title; obj["channel_html"]=ch; obj["article_html"]=ar
     # امتیاز نهایی را خود ربات از وزن‌های مدیر محاسبه می‌کند؛ بنابراین تغییر وزن واقعاً اثر دارد.
     dims={
@@ -1106,7 +1248,16 @@ async def add_source(db: D1Database, url: str, category: str = "tech", interval_
 async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProviderManager):
     source_id=source["id"]; now=datetime.now(timezone.utc)
     try:
-        items=await discover_source_items(source)
+        discovery=await discover_source_items(source, return_diagnostics=True)
+        items=discovery.get("items") or []
+        if not items and await get_setting(db,"ai_web_scout_enabled","1") == "1":
+            try:
+                scout=await ai.gemini_web_scout(source.get("url") or "", int(await get_setting(db,"ai_web_scout_max_items","5")))
+                if scout.get("ok"):
+                    items=scout.get("items") or []
+                    await log_automation(db,"INFO","gemini_web_scout_used",f"source={source.get('id')} provider={scout.get('provider')} items={len(items)}")
+            except Exception as scout_error:
+                await log_automation(db,"WARN","gemini_web_scout_error",f"source={source.get('id')} {scout_error}")
         next_check=(now+timedelta(minutes=int(source.get("interval_minutes") or DEFAULT_SOURCE_INTERVAL_MINUTES))).isoformat()
         await db.execute("UPDATE sources SET last_checked_at=?,next_check_at=?,last_error=NULL WHERE id=?",[now.isoformat(),next_check,source_id])
         recent_rows=await db.execute("SELECT title FROM articles WHERE status='published' ORDER BY id DESC LIMIT 30")
@@ -1147,12 +1298,12 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                     verify=await ai_verify_content(ai,item,out)
                     if not verify.get("ok") or float(verify.get("confidence",0) or 0)<80:
                         await db.execute("UPDATE source_items SET status='rejected',score=?,last_error=? WHERE id=?",[score,json.dumps(verify,ensure_ascii=False)[:1000],item_id]); return 1
-                article_text=sanitize_telegram_html(out.get("article_html") or out.get("article_text") or "")
-                channel_text=sanitize_telegram_html(out.get("channel_html") or out.get("channel_text") or "")
                 title_out=strip_html_text(out.get("title") or title)[:500]
+                article_text=ensure_rich_article_format(title_out, out.get("article_html") or out.get("article_text") or "", url)
+                channel_text=ensure_rich_channel_format(title_out, out.get("channel_html") or out.get("channel_text") or "", str(out.get("category") or source.get("category") or "tech"))
                 if plain_len(channel_text)>780: channel_text=rich_channel_fallback(title_out, channel_text)
                 if plain_len(article_text)<1200: article_text=rich_article_fallback(title_out, article_text, url)
-                if plain_len(article_text)>4200: article_text=html.escape(strip_html_text(article_text)[:4200])
+                if plain_len(article_text)>4200: article_text=ensure_rich_article_format(title_out, strip_html_text(article_text)[:4200], url)
                 if plain_len(article_text)<900:
                     await db.execute("UPDATE source_items SET status='rejected',last_error='article too short' WHERE id=?",[item_id]); return 1
                 art=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at) VALUES(?,?,?,?,?,?,?,?, 'ready',?) RETURNING id",
@@ -2860,9 +3011,9 @@ async def provider_model_input(message: Message, state: FSMContext, db: D1Databa
     panel_id = data.get('panel_message_id')
     if panel_id:
         try:
-            await bot.edit_message_text(chat_id=message.chat.id, message_id=panel_id, text="🧪 در حال تست اتصال و نام دقیق مدل...\nاین مرحله فقط یک درخواست بسیار کوچک می‌فرستد.")
+            await bot.edit_message_text(chat_id=message.chat.id, message_id=panel_id, text="🔎 مرحله ۱: بررسی endpoint و نام مدل...\n🧪 مرحله ۲: ارسال یک درخواست واقعی TEST_OK به خود مدل...\n⏳ نتیجه بعد از دریافت پاسخ نمایش داده می‌شود.")
         except Exception:
-            await message.answer("🧪 در حال تست اتصال و نام دقیق مدل...")
+            await message.answer("🔎 در حال بررسی endpoint و نام مدل...\n🧪 سپس یک درخواست واقعی TEST_OK به مدل ارسال می‌شود...")
     else:
         await message.answer("🧪 در حال تست اتصال و نام دقیق مدل...")
     tester = AIProviderManager(db)
@@ -2877,7 +3028,10 @@ async def provider_model_input(message: Message, state: FSMContext, db: D1Databa
         await state.update_data(provider_base_url=None, provider_token=None, provider_edit_id=None)
         error_text=("❌ این مدل در تست اولیه قبول نشد.\n\n"
             f"HTTP/API: {html.escape(str(result.get('error','unknown'))[:1000])}\n\n"
-            "هیچ چیزی ذخیره نشد. Base URL یا نام دقیق مدل را بررسی کن.")
+            "هیچ چیزی ذخیره نشد. این بار واقعاً یک POST آزمایشی به مدل ارسال شد.\n\n"
+            "اگر Gemini است، Base URL رسمی OpenAI-compatible: https://generativelanguage.googleapis.com/v1beta/openai/\n"
+            "یا Base URL بومی: https://generativelanguage.googleapis.com/v1beta\n"
+            "نام مدل باید دقیقاً مطابق مدل در Google AI Studio باشد.")
         kb = provider_list_kb(await db.execute("SELECT id,name,base_url,model_name,priority,enabled,status,last_error,last_latency_ms FROM ai_providers ORDER BY priority ASC,id ASC")) if parent=="auto_providers" else get_admin_back_kb(parent)
         if panel_id:
             try:
@@ -2909,7 +3063,7 @@ async def provider_model_input(message: Message, state: FSMContext, db: D1Databa
     rows = await db.execute("SELECT id,name,base_url,model_name,priority,enabled,status,last_error,last_latency_ms FROM ai_providers ORDER BY priority ASC, id ASC")
     parent=data.get("parent_callback","auto_providers")
     panel_id=data.get("panel_message_id")
-    text=f"✅ {action_text}\n\n🤖 Model: <code>{html.escape(model)}</code>\n⚡ زمان پاسخ تست: {result.get('latency_ms',0)}ms\n🔢 اولویت: {priority}"
+    text=f"✅ {action_text}\n\n🤖 Model: <code>{html.escape(model)}</code>\n🔌 Protocol: <code>{html.escape(str(result.get('protocol','auto')))}</code>\n⚡ زمان پاسخ تست واقعی: {result.get('latency_ms',0)}ms\n🧪 پاسخ مدل: <code>{html.escape(str(result.get('preview','TEST_OK'))[:120])}</code>\n🔢 اولویت: {priority}"
     if panel_id:
         try:
             await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text=text,parse_mode='HTML',reply_markup=provider_list_kb(rows) if parent=="auto_providers" else get_admin_back_kb(parent))
@@ -2952,7 +3106,12 @@ async def provider_help(call: CallbackQuery):
             "🔢 عدد اولویت کمتر = اولویت بالاتر\n"
             "🟡 خطاهای موقت مثل 429/503 باعث cooldown می‌شوند.\n"
             "🔴 خطاهایی مثل 404/401/403 به‌عنوان مشکل تنظیمات علامت‌گذاری می‌شوند.\n\n"
-            "از صفحه هر مدل می‌توانی آن را ویرایش، تست، فعال/غیرفعال، اولویت‌بندی یا حذف کنی.")
+            "از صفحه هر مدل می‌توانی آن را ویرایش، تست، فعال/غیرفعال، اولویت‌بندی یا حذف کنی.\n\n"
+            "🟦 Gemini / Google AI Studio:\n"
+            "OpenAI-compatible Base URL: https://generativelanguage.googleapis.com/v1beta/openai/\n"
+            "یا Native Base URL: https://generativelanguage.googleapis.com/v1beta\n"
+            "Token همان Gemini API Key است و Model باید دقیقاً نام مدل باشد؛ مثلاً gemini-3.6-flash.\n\n"
+            "ربات در افزودن مدل، اول endpoint را بررسی می‌کند و بعد واقعاً TEST_OK را به مدل می‌فرستد؛ اگر Google باشد هر دو مسیر Native و OpenAI-compatible را در صورت نیاز امتحان می‌کند.")
     await call.message.edit_text(text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 فهرست مدل‌ها", callback_data="auto_providers")]]))
     await call.answer()
 
@@ -3182,6 +3341,9 @@ async def health_dry_run(call:CallbackQuery,db:D1Database):
                 diag=await discover_source_items(src,return_diagnostics=True)
                 if diag.get("items"):
                     chosen=diag["items"][0]; chosen_src=src; break
+                scout=await m.gemini_web_scout(src.get("url") or "", int(await get_setting(db,"ai_web_scout_max_items","5")))
+                if scout.get("ok") and scout.get("items"):
+                    chosen=scout["items"][0]; chosen_src=src; break
                 diagnostics.append(f"{src.get('name')}: {diag.get('error','بدون آیتم')[:180]}")
             except Exception as e:
                 diagnostics.append(f"{src.get('name')}: {str(e)[:180]}")
@@ -3302,18 +3464,55 @@ async def set_ai_workers(call: CallbackQuery, state: FSMContext):
 async def set_ai_verify(call:CallbackQuery,state:FSMContext):
     await prompt_for_setting(call,state,"ai_verify_mode","🛡 حالت راستی‌آزمایی را بفرست:\nauto = فقط موارد حساس\nalways = همیشه\noff = خاموش","auto_schedule")
 
+async def next_publication_estimate(db:D1Database)->Dict[str,Any]:
+    now=datetime.now(timezone.utc)
+    last_manual=await get_setting(db,"last_manual_channel_post_at","")
+    last_pub=await db.execute("SELECT published_at FROM publication_queue WHERE status='published' AND published_at IS NOT NULL ORDER BY id DESC LIMIT 1")
+    candidates=[x for x in [last_manual, last_pub[0].get("published_at") if last_pub else ""] if x]
+    latest=None
+    for raw in candidates:
+        try:
+            dt=datetime.fromisoformat(str(raw).replace("Z","+00:00"))
+            if latest is None or dt>latest: latest=dt
+        except Exception: pass
+    interval_hours=float(await get_setting(db,"min_hours_between_posts",str(DEFAULT_MIN_HOURS_BETWEEN_POSTS)))
+    target=max(now, latest+timedelta(hours=interval_hours) if latest else now)
+    queued=await db.execute("SELECT COUNT(*) c FROM publication_queue WHERE status='queued'")
+    return {"target":target,"minutes":max(0,int((target-now).total_seconds()/60)) if target>now else 0,"latest":latest,"interval_minutes":int(interval_hours*60),"queued":int(queued[0].get('c',0)) if queued else 0}
+
+@router.callback_query(F.data == "auto_publish_now")
+async def auto_publish_now(call:CallbackQuery,db:D1Database,bot:Bot):
+    if call.from_user.id!=ADMIN_ID: return
+    try:
+        ok=await publish_next_article(db,bot,force=True)
+        msg="✅ اولین محتوای صف همین حالا منتشر شد." if ok else "⚠️ محتوای آماده‌ای برای انتشار فوری پیدا نشد یا سقف روزانه تکمیل شده است."
+    except Exception as e:
+        msg="❌ انتشار فوری شکست خورد:\n"+html.escape(str(e)[:1200])
+    await call.message.edit_text(msg,parse_mode="HTML",reply_markup=get_admin_back_kb("auto_queue")); await call.answer()
+
 @router.callback_query(F.data == "auto_queue")
 async def auto_queue(call: CallbackQuery, db: D1Database):
+    est=await next_publication_estimate(db)
     rows = await db.execute("SELECT q.id, q.article_id, q.status, q.attempts, a.title, a.score, a.category FROM publication_queue q JOIN articles a ON a.id=q.article_id WHERE q.status='queued' ORDER BY a.score DESC LIMIT 20")
-    text = "📥 صف انتشار\n\n"
-    if not rows:
-        text += "صف خالی است."
+    last_txt=est["latest"].astimezone(pytz.timezone("Asia/Tehran")).strftime("%H:%M") if est["latest"] else "هنوز منتشر نشده"
+    if est["minutes"]<=0: next_txt="آماده انتشار طبق فاصله زمانی"
+    elif est["minutes"]<60: next_txt=f"حدود {est['minutes']} دقیقه دیگر"
+    else: next_txt=f"حدود {est['minutes']//60} ساعت و {est['minutes']%60} دقیقه دیگر"
+    text=("📢 <b>صف و صفحه انتشار</b>\n\n"
+          f"📦 آماده در صف: <b>{est['queued']}</b>\n"
+          f"🕘 آخرین انتشار: <b>{last_txt}</b>\n"
+          f"⏱ فاصله مدیریت‌شده: <b>{est['interval_minutes']} دقیقه</b>\n"
+          f"🕐 نوبت بعدی: <b>{next_txt}</b>\n\n")
+    if not rows: text+="صف فعلاً خالی است."
     else:
         for r in rows:
-            text += f"#{r['article_id']} | {r['score']:.0f} | {r['category']} | {r['title'][:70]}\n"
-    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 بازگشت", callback_data="auto_back")]]))
-    await call.answer()
-
+            text += f"#{r['article_id']} | {float(r['score'] or 0):.0f} | {r['category']} | {str(r['title'])[:65]}\n"
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 همین حالا منتشر کن",callback_data="auto_publish_now")],
+        [InlineKeyboardButton(text="🔄 بروزرسانی",callback_data="auto_queue")],
+        [InlineKeyboardButton(text="🔙 اتوماسیون",callback_data="auto_back")]
+    ])
+    await call.message.edit_text(text,parse_mode="HTML",reply_markup=kb); await call.answer()
 
 @router.channel_post()
 async def on_channel_post(message: Message, db: D1Database):
