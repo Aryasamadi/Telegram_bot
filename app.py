@@ -1482,6 +1482,35 @@ def ensure_rich_article_format(title: str, value: str, source_url: str) -> str:
         return rich_article_fallback(title, "اطلاعات کافی برای تهیه متن کامل از منبع دریافت شد.", source_url)
     return _visualize_plain_paragraphs(title, clean, "tech", article=True)
 
+def rich_article_fallback(title: str, text: str, source_url: str = "") -> str:
+    """Safe fallback for article formatting when AI output is too short or empty.
+    Keeps the article readable and adds only the single primary source link.
+    """
+    clean = sanitize_telegram_html(_normalize_text_blocks(text or ""))
+    plain = strip_html_text(clean).strip()
+    if not plain:
+        plain = "اطلاعات کافی برای تهیه متن کامل از منبع دریافت شد."
+    if len(plain) > 3600:
+        plain = plain[:3600].rsplit(" ", 1)[0] + "…"
+    body = html.escape(plain, quote=False)
+    # Restore simple paragraph spacing after escaping; never duplicate adjacent emoji.
+    paragraphs = [x.strip() for x in re.split(r"\n\s*\n+", plain) if x.strip()]
+    if paragraphs:
+        chunks = [f"<b>📰 {html.escape(title[:220], quote=False)}</b>"]
+        for i, paragraph in enumerate(paragraphs[:8]):
+            safe = html.escape(paragraph, quote=False)
+            if i == 0:
+                chunks.append(f"🔎 {safe}")
+            elif i in (2, 5) and len(paragraph) >= 80:
+                chunks.append(f"<blockquote>💡 {safe}</blockquote>")
+            else:
+                chunks.append(f"📌 {safe}")
+        body = "\n\n".join(chunks)
+    main = normalize_url(source_url or "")
+    if main:
+        body = body.rstrip() + f'\n\n<a href="{html.escape(main, quote=True)}">منبع اصلی</a>'
+    return dedupe_adjacent_emojis(body)
+
 def rich_channel_fallback(title: str, text: str) -> str:
     clean=strip_html_text(text or "")
     if len(clean)>700: clean=clean[:700].rsplit(" ",1)[0]+"…"
