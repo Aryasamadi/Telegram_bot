@@ -48,7 +48,7 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "10.6.0-rich-publish-fast-ui-minute-schedule-final"
+BUILD_VERSION = "10.8.0-fresh-news-managed-metrics-ai-fallback-final"
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_AI_WORKERS = 3
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -75,7 +75,11 @@ DEFAULT_MIN_HOURS_BETWEEN_POSTS = float(os.getenv("MIN_HOURS_BETWEEN_POSTS", "2"
 DEFAULT_MIN_POST_GAP_MINUTES = max(1, int(round(DEFAULT_MIN_HOURS_BETWEEN_POSTS * 60)))
 DEFAULT_PUBLISH_START_HOUR = int(os.getenv("PUBLISH_START_HOUR", "8"))
 DEFAULT_PUBLISH_END_HOUR = int(os.getenv("PUBLISH_END_HOUR", "23"))
-CONTENT_RETENTION_DAYS = int(os.getenv("CONTENT_RETENTION_DAYS", "30"))
+CONTENT_RETENTION_DAYS = int(os.getenv("CONTENT_RETENTION_DAYS", "1"))
+# News freshness policy: automation accepts only items with a verifiable publication
+# timestamp within this window. Tests may opt into archived items explicitly.
+NEWS_FRESHNESS_MAX_HOURS = float(os.getenv("NEWS_FRESHNESS_MAX_HOURS", "24"))
+NEWS_FRESHNESS_STRICT = os.getenv("NEWS_FRESHNESS_STRICT", "true").lower() in {"1", "true", "yes", "on"}
 LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "14"))
 AI_PROVIDER_ENCRYPTION_KEY = os.getenv("AI_PROVIDER_ENCRYPTION_KEY", "")
 HTTP_USER_AGENT = os.getenv("HTTP_USER_AGENT", "TechNowAI/2.0 (+content automation)")
@@ -237,12 +241,12 @@ async def initialize_database(db: D1Database):
 
 async def initialize_automation_database(db: D1Database):
     queries = [
-        {"sql": "CREATE TABLE IF NOT EXISTS sources(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, url TEXT UNIQUE, feed_url TEXT, category TEXT DEFAULT 'tech', enabled INTEGER DEFAULT 1, interval_minutes INTEGER DEFAULT 15, priority INTEGER DEFAULT 5, last_checked_at TEXT, next_check_at TEXT, last_error TEXT, trust_score REAL DEFAULT 80, created_at TEXT)"},
+        {"sql": "CREATE TABLE IF NOT EXISTS sources(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, url TEXT UNIQUE, feed_url TEXT, category TEXT DEFAULT 'tech', enabled INTEGER DEFAULT 1, interval_minutes INTEGER DEFAULT 15, priority INTEGER DEFAULT 5, last_checked_at TEXT, next_check_at TEXT, last_error TEXT, trust_score REAL DEFAULT 80, created_at TEXT, last_seen_published_at TEXT, last_seen_url TEXT)"},
         {"sql": "CREATE INDEX IF NOT EXISTS idx_sources_due ON sources(enabled, next_check_at)"},
         {"sql": "CREATE TABLE IF NOT EXISTS source_items(id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER NOT NULL, canonical_url TEXT NOT NULL, title TEXT, description TEXT, content TEXT, image_url TEXT, published_at TEXT, discovered_at TEXT, content_hash TEXT, status TEXT DEFAULT 'new', score REAL DEFAULT 0, category TEXT, article_id INTEGER, last_error TEXT, UNIQUE(source_id, canonical_url))"},
         {"sql": "CREATE INDEX IF NOT EXISTS idx_source_items_status ON source_items(status)"},
         {"sql": "CREATE INDEX IF NOT EXISTS idx_source_items_hash ON source_items(content_hash)"},
-        {"sql": "CREATE TABLE IF NOT EXISTS articles(id INTEGER PRIMARY KEY AUTOINCREMENT, source_item_id INTEGER UNIQUE, title TEXT, channel_text TEXT, body TEXT, source_url TEXT, image_url TEXT, category TEXT, score REAL, status TEXT DEFAULT 'ready', deep_token TEXT UNIQUE, created_at TEXT, verified_at TEXT, published_message_id INTEGER)"},
+        {"sql": "CREATE TABLE IF NOT EXISTS articles(id INTEGER PRIMARY KEY AUTOINCREMENT, source_item_id INTEGER UNIQUE, title TEXT, channel_text TEXT, body TEXT, source_url TEXT, image_url TEXT, category TEXT, score REAL, status TEXT DEFAULT 'ready', deep_token TEXT UNIQUE, created_at TEXT, verified_at TEXT, published_message_id INTEGER, source_published_at TEXT)"},
         {"sql": "CREATE TABLE IF NOT EXISTS publication_queue(id INTEGER PRIMARY KEY AUTOINCREMENT, article_id INTEGER UNIQUE, scheduled_at TEXT, status TEXT DEFAULT 'queued', attempts INTEGER DEFAULT 0, last_error TEXT, created_at TEXT, published_at TEXT)"},
         {"sql": "CREATE INDEX IF NOT EXISTS idx_publication_queue_due ON publication_queue(status, scheduled_at)"},
         {"sql": "CREATE TABLE IF NOT EXISTS ai_providers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, base_url TEXT, encrypted_api_key TEXT, model_name TEXT, priority INTEGER DEFAULT 10, enabled INTEGER DEFAULT 1, web_enabled INTEGER DEFAULT 0, created_at TEXT, updated_at TEXT, status TEXT DEFAULT 'unknown', last_error TEXT, cooldown_until TEXT, last_checked_at TEXT, last_latency_ms INTEGER DEFAULT 0, consecutive_failures INTEGER DEFAULT 0)"},
@@ -266,6 +270,9 @@ async def initialize_automation_database(db: D1Database):
         "ALTER TABLE ai_providers ADD COLUMN web_enabled INTEGER DEFAULT 0",
         "ALTER TABLE articles ADD COLUMN published_at TEXT",
         "ALTER TABLE articles ADD COLUMN deep_views INTEGER DEFAULT 0",
+        "ALTER TABLE articles ADD COLUMN source_published_at TEXT",
+        "ALTER TABLE sources ADD COLUMN last_seen_published_at TEXT",
+        "ALTER TABLE sources ADD COLUMN last_seen_url TEXT",
     ]:
         try:
             await db.execute(sql)
@@ -280,6 +287,7 @@ async def initialize_automation_database(db: D1Database):
         "publish_start_hour": str(DEFAULT_PUBLISH_START_HOUR),
         "publish_end_hour": str(DEFAULT_PUBLISH_END_HOUR),
         "default_source_interval": str(DEFAULT_SOURCE_INTERVAL_MINUTES),
+        "news_freshness_max_hours": str(int(NEWS_FRESHNESS_MAX_HOURS) if NEWS_FRESHNESS_MAX_HOURS.is_integer() else NEWS_FRESHNESS_MAX_HOURS),
         "ai_verify_mode": "auto",
         "ai_web_scout_enabled": "1",
         "ai_web_scout_max_items": "5",
@@ -323,6 +331,14 @@ async def initialize_automation_database(db: D1Database):
     # خودش در پنل تست کرده است وارد اتوماسیون می‌کند.
     try:
         await db.execute("UPDATE ai_providers SET enabled=0, status='invalid', last_error='Environment Default disabled by managed-provider mode' WHERE name='Environment Default'")
+    except Exception:
+        pass
+    # Privacy/storage policy: image URLs are transient and never retained in D1.
+    try:
+        await db.execute("UPDATE source_items SET image_url='' WHERE image_url IS NOT NULL AND image_url!=''")
+        await db.execute("UPDATE articles SET image_url='' WHERE image_url IS NOT NULL AND image_url!=''")
+        cutoff=(datetime.now(timezone.utc)-timedelta(days=CONTENT_RETENTION_DAYS)).isoformat()
+        await db.execute("DELETE FROM source_items WHERE discovered_at < ?", [cutoff])
     except Exception:
         pass
 
@@ -386,7 +402,12 @@ async def cleanup_automation_data(db: D1Database):
     cutoff_content = (now - timedelta(days=CONTENT_RETENTION_DAYS)).isoformat()
     cutoff_logs = (now - timedelta(days=LOG_RETENTION_DAYS)).isoformat()
     await db.execute("DELETE FROM automation_logs WHERE created_at < ?", [cutoff_logs])
-    await db.execute("DELETE FROM source_items WHERE status IN ('rejected','error') AND discovered_at < ?", [cutoff_content])
+    # source_items is the short-lived duplicate-detection cache. Keep it for one day only.
+    # Generated articles remain in `articles` for admin history/editing.
+    await db.execute("DELETE FROM source_items WHERE discovered_at < ?", [cutoff_content])
+    # Images are transient transport data, never persistent content data.
+    await db.execute("UPDATE source_items SET image_url='' WHERE image_url IS NOT NULL AND image_url!=''")
+    await db.execute("UPDATE articles SET image_url='' WHERE image_url IS NOT NULL AND image_url!=''")
     await db.execute("DELETE FROM publication_queue WHERE status IN ('published','failed') AND created_at < ?", [cutoff_content])
     await set_setting(db, "last_cleanup_at", now.isoformat())
 
@@ -412,9 +433,25 @@ def text_hash(text: str) -> str:
     return hashlib.sha256(re.sub(r"\s+", " ", text or "").strip().lower().encode("utf-8", errors="ignore")).hexdigest()
 
 
+def normalize_model_text(value: str) -> str:
+    """Normalize AI output so escaped newlines never leak into Telegram."""
+    if value is None:
+        return ""
+    text = str(value)
+    # Models/gateways sometimes double-escape JSON string content.
+    text = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n").replace("\\t", "\t")
+    # Normalize non-breaking spaces without destroying paragraph boundaries.
+    text = text.replace("\u00a0", " ")
+    # Excessive blank lines make mobile Telegram posts look robotic.
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
 def strip_html_text(value: str) -> str:
     if not value:
         return ""
+    value = normalize_model_text(value)
     value = re.sub(r"<script.*?</script>|<style.*?</style>|<noscript.*?</noscript>", " ", value, flags=re.I | re.S)
     value = re.sub(r"<[^>]+>", " ", value)
     return re.sub(r"\s+", " ", html.unescape(value)).strip()
@@ -585,14 +622,18 @@ def extract_html_page(html_text: str, url: str) -> Dict[str, Any]:
     for item in links:
         if item[0] not in seen:
             seen.add(item[0]); dedup.append(item)
-    return {"canonical_url": normalize_url(canonical), "title": strip_html_text(title), "description": strip_html_text(desc), "body": body, "image_url": urllib.parse.urljoin(url, image) if image else "", "links": dedup}
+    published = (p.meta.get("article:published_time") or p.meta.get("datepublished") or p.meta.get("date") or p.meta.get("pubdate") or "").strip()
+    if not published:
+        m = re.search(r"datePublished\"\s*[:=]\s*\"([^\"]+)\"", html_text, flags=re.I)
+        if m: published = m.group(1).strip()
+    return {"canonical_url": normalize_url(canonical), "title": strip_html_text(title), "description": strip_html_text(desc), "body": body, "image_url": urllib.parse.urljoin(url, image) if image else "", "published_at": published, "links": dedup}
 
 
 def article_candidates_from_html(parsed: Dict[str, Any], source_url: str) -> List[Dict[str, Any]]:
     path = urllib.parse.urlsplit(source_url).path.rstrip('/')
     # صفحه ریشه سایت معمولاً صفحه مقاله نیست؛ از آن فقط لینک‌های داخلی را استخراج می‌کنیم.
     if path and len(parsed.get("body", "")) > 700 and parsed.get("title"):
-        return [{"title": parsed["title"][:300], "url": parsed["canonical_url"] or source_url, "description": parsed["description"][:1000], "body": parsed["body"][:12000], "image_url": parsed.get("image_url", ""), "published_at": ""}]
+        return [{"title": parsed["title"][:300], "url": parsed["canonical_url"] or source_url, "description": parsed["description"][:1000], "body": parsed["body"][:12000], "image_url": parsed.get("image_url", ""), "published_at": parsed.get("published_at", "")}]
     out = []
     for url, title in parsed.get("links", [])[:MAX_SOURCE_ITEMS_PER_CYCLE]:
         if len(title) < 15:
@@ -601,7 +642,65 @@ def article_candidates_from_html(parsed: Dict[str, Any], source_url: str) -> Lis
     return out
 
 
-async def discover_source_items(source: Dict[str, Any], return_diagnostics: bool = False) -> Any:
+def parse_publication_datetime(raw: str) -> Optional[datetime]:
+    """Parse common RSS/Atom/ISO date strings into aware UTC datetime."""
+    raw = normalize_model_text(raw or "").strip()
+    if not raw:
+        return None
+    candidates = [raw, raw.replace("Z", "+00:00")]
+    for value in candidates:
+        try:
+            dt = datetime.fromisoformat(value)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            pass
+    # RFC 2822 / RSS dates
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+    return None
+
+
+def candidate_is_fresh(item: Dict[str, Any], now: Optional[datetime] = None, max_hours: float = NEWS_FRESHNESS_MAX_HOURS) -> Tuple[bool, str, Optional[datetime]]:
+    now = now or datetime.now(timezone.utc)
+    dt = parse_publication_datetime(item.get("published_at") or item.get("source_published_at") or "")
+    if not dt:
+        return (False, "تاریخ انتشار قابل‌اعتماد نیست", None)
+    age_hours = (now - dt).total_seconds() / 3600.0
+    if age_hours < -0.5:
+        return (False, "تاریخ انتشار آینده/نامعتبر است", dt)
+    if age_hours > max_hours:
+        return (False, f"محتوا قدیمی است ({age_hours:.1f} ساعت)", dt)
+    return (True, f"تازه ({max(0.0, age_hours):.1f} ساعت)", dt)
+
+
+def select_latest_fresh_items(items: List[Dict[str, Any]], now: Optional[datetime] = None, max_items: int = MAX_SOURCE_ITEMS_PER_CYCLE) -> Tuple[List[Dict[str, Any]], List[str], Optional[datetime], str]:
+    """Keep only the newest items with verifiable timestamps; no geography/language bias."""
+    now = now or datetime.now(timezone.utc)
+    fresh=[]; diagnostics=[]; newest_dt=None; newest_url=""
+    for item in items or []:
+        ok, reason, dt = candidate_is_fresh(item, now=now)
+        if dt and (newest_dt is None or dt > newest_dt):
+            newest_dt=dt; newest_url=normalize_url(item.get("url") or "")
+        if ok:
+            item=dict(item)
+            item["_parsed_published_dt"]=dt
+            fresh.append(item)
+        else:
+            diagnostics.append(f"⏱️ {strip_html_text(str(item.get('title') or ''))[:90]}: {reason}")
+    fresh.sort(key=lambda x: x.get("_parsed_published_dt") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    for item in fresh:
+        item.pop("_parsed_published_dt", None)
+    return fresh[:max_items], diagnostics[-10:], newest_dt, newest_url
+
+async def discover_source_items(source: Dict[str, Any], return_diagnostics: bool = False, use_sitemap: bool = True) -> Any:
     base = normalize_url(source.get("url", ""))
     session = await get_http_session()
     diagnostics = []
@@ -680,6 +779,12 @@ async def discover_source_items(source: Dict[str, Any], return_diagnostics: bool
     except Exception as e:
         diagnostics.append(f"⚠️ WordPress API: {e}")
 
+    if not use_sitemap:
+        message="؛ ".join(diagnostics[-10:]) or "هیچ روش مستقیم سریع برای دریافت محتوا موفق نشد"
+        if return_diagnostics:
+            return {"items":[],"method":"none","diagnostics":diagnostics,"error":message}
+        raise RuntimeError("source fetch failed: "+message)
+
     sitemap=urllib.parse.urljoin(base+"/","sitemap.xml")
     try:
         sm_text,_=await http_get(sitemap,session)
@@ -715,7 +820,7 @@ async def discover_source_items(source: Dict[str, Any], return_diagnostics: bool
             try:
                 text,_=await http_get(u,session); parsed=extract_html_page(text,u)
                 if parsed.get("title"):
-                    return {"title":parsed["title"],"url":parsed["canonical_url"] or u,"description":parsed["description"],"body":parsed["body"][:12000],"image_url":parsed["image_url"],"published_at":""}
+                    return {"title":parsed["title"],"url":parsed["canonical_url"] or u,"description":parsed["description"],"body":parsed["body"][:12000],"image_url":parsed["image_url"],"published_at":parsed.get("published_at", "")}
             except Exception as e:
                 diagnostics.append(f"⚠️ sitemap URL {u}: {e}")
             return None
@@ -1193,14 +1298,31 @@ def make_deep_token(article_id: int) -> str:
 
 class TelegramHTMLSanitizer(HTMLParser):
     ALLOWED = {"b","strong","i","em","u","s","del","code","pre","blockquote","a","tg-spoiler"}
+    BLOCK = {"p","div","section","article","header","footer","h1","h2","h3","h4","h5","h6","ul","ol","li"}
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.out=[]
+    def _newline(self, count=1):
+        if not self.out:
+            return
+        current="".join(self.out)
+        target="\n"*count
+        if not current.endswith(target):
+            self.out.append(target)
     def handle_data(self, data):
-        self.out.append(html.escape(data, quote=False))
+        data=str(data or "").replace("\\r\\n","\n").replace("\\n","\n").replace("\\r","\n").replace("\\t","\t").replace("\u00a0"," ")
+        data=re.sub(r"\n{3,}","\n\n",data)
+        if data:
+            self.out.append(html.escape(data, quote=False))
     def handle_starttag(self, tag, attrs):
         tag=tag.lower()
-        if tag not in self.ALLOWED: return
+        if tag in self.BLOCK:
+            self._newline(2 if tag in {"p","div","section","article","header","footer","h1","h2","h3","h4","h5","h6"} else 1)
+            if tag=="li":
+                self.out.append("• ")
+            return
+        if tag not in self.ALLOWED:
+            return
         if tag=="a":
             href=dict(attrs).get("href","")
             if href.startswith(("https://","http://","tg://")):
@@ -1208,72 +1330,105 @@ class TelegramHTMLSanitizer(HTMLParser):
         else:
             self.out.append(f"<{tag}>")
     def handle_startendtag(self, tag, attrs):
-        if tag.lower()=="br": self.out.append("\n")
+        if tag.lower()=="br":
+            self._newline(1)
     def handle_endtag(self, tag):
         tag=tag.lower()
-        if tag in self.ALLOWED and tag!="a": self.out.append(f"</{tag}>")
-        elif tag=="a": self.out.append("</a>")
+        if tag in self.BLOCK:
+            self._newline(1)
+            return
+        if tag in self.ALLOWED and tag!="a":
+            self.out.append(f"</{tag}>")
+        elif tag=="a":
+            self.out.append("</a>")
 
 def sanitize_telegram_html(value: str) -> str:
-    value = (value or "").strip()
+    value = normalize_model_text(value)
     if not value: return ""
     try:
-        p=TelegramHTMLSanitizer(); p.feed(value); p.close(); return "".join(p.out).strip()
+        p=TelegramHTMLSanitizer(); p.feed(value); p.close()
+        result="".join(p.out)
+        result=re.sub(r"[ \t]+\n", "\n", result)
+        result=re.sub(r"\n[ \t]+", "\n", result)
+        result=re.sub(r"\n{3,}", "\n\n", result)
+        return result.strip()
     except Exception:
         return html.escape(strip_html_text(value), quote=False)
 
 def plain_len(value: str) -> int:
     return len(strip_html_text(value or ""))
 
-def rich_channel_fallback(title: str, text: str) -> str:
-    clean=strip_html_text(text or "")
-    if len(clean)>700: clean=clean[:700].rsplit(" ",1)[0]+"…"
-    return f"<b>🔎 {html.escape(title[:180])}</b>\n\n{html.escape(clean)}"
+def _format_technical_tokens(text: str) -> str:
+    # Add <code> only to clearly technical tokens; never invent facts.
+    patterns = [
+        r"\b(?:GPT-\d+(?:\.\d+)?|GPT-4o|LLM|API|JSON|Python|JavaScript|TypeScript|HTML|CSS|SQL|HTTP|HTTPS|OAuth|WebSocket|RAG|GPU|CPU|SDK)\b",
+        r"\b(?:Generative AI|Machine Learning|Zero[- ]Day|Phishing|Ransomware)\b",
+    ]
+    out=text
+    for pat in patterns:
+        out=re.sub(pat, lambda m: f"<code>{m.group(0)}</code>", out, flags=re.I)
+    return out
 
 def _visualize_plain_paragraphs(title: str, value: str, category: str, article: bool=False) -> str:
-    """Turn plain AI output into readable Telegram HTML without inventing facts."""
+    """Normalize and enrich Telegram formatting without inventing factual content."""
     clean=sanitize_telegram_html(value or "")
     plain=strip_html_text(clean)
-    if not plain: return ""
-    # Preserve model formatting, but do not allow a post to end up with only one visual style.
-    # We add formatting only around text that already exists; no new factual content is invented.
-    if any(tag in clean.lower() for tag in ("<b>","<strong>","<i>","<em>","<blockquote>","<code>")):
-        # If there is already rich HTML, keep it as the primary source of truth.
-        # A small visual pass below adds missing emphasis/quote only when safe.
-        if "<b>" not in clean.lower() and "<strong>" not in clean.lower():
-            clean=f"<b>{html.escape(title[:220])}</b>\n\n{clean}"
-        if "<i>" not in clean.lower() and "<em>" not in clean.lower():
-            parts=[x.strip() for x in re.split(r"\n\s*\n+", strip_html_text(clean)) if x.strip()]
-            if parts:
-                first=html.escape(parts[0][:650])
-                clean=re.sub(re.escape(parts[0]), f"<i>{first}</i>", clean, count=1)
-        if article and "<blockquote>" not in clean.lower():
-            parts=[x.strip() for x in re.split(r"\n\s*\n+", strip_html_text(clean)) if len(x.strip())>=45]
-            if len(parts)>=2:
-                quote=html.escape(parts[1][:500])
-                clean=re.sub(re.escape(parts[1]), f"<blockquote>{quote}</blockquote>", clean, count=1)
-        return clean
+    if not plain:
+        return ""
     emoji_map={
-        "ai":["🤖","🧠","⚡","🔬"],
-        "cyber":["🛡️","🔐","🚨","🧩"],
-        "tech":["💻","⚙️","🚀","🔎"],
-        "edu":["📚","💡","🧭","📝"],
-        "general":["🌐","✨","📌","🔭"]
+        "ai":["🤖","🧠","⚡","🔬","🧩"],
+        "cyber":["🛡️","🔐","🚨","🧩","⚠️"],
+        "tech":["💻","⚙️","🚀","🔎","🧪"],
+        "edu":["📚","💡","🧭","📝","🎓"],
+        "general":["🌐","✨","📌","🔭","🧭"]
     }
     icons=emoji_map.get(category,emoji_map["tech"])
-    paragraphs=[x.strip() for x in re.split(r"\n\s*\n+", plain) if x.strip()]
-    if not paragraphs: paragraphs=[plain]
-    out=[f"<b>{icons[0]} {html.escape(title[:220])}</b>"]
-    for i,para in enumerate(paragraphs[:8]):
-        icon=icons[i % len(icons)]
-        esc=html.escape(para)
-        if i==0:
-            out.append(f"\n{icon} <i>{esc}</i>")
-        elif i==1 and len(para)>=70:
-            out.append(f"\n{icon} <blockquote>{esc}</blockquote>")
+    # Work paragraph-by-paragraph on the plain structure, while preserving any
+    # meaningful HTML tags already emitted by the model.
+    paragraphs=[x.strip() for x in re.split(r"\n\s*\n+", clean) if strip_html_text(x).strip()]
+    if not paragraphs:
+        paragraphs=[clean]
+
+    out=[]
+    title_clean=html.escape(strip_html_text(title)[:220])
+    out.append(f"<b>{icons[0]} {title_clean}</b>")
+
+    for i,para in enumerate(paragraphs[:10]):
+        pplain=strip_html_text(para)
+        if not pplain:
+            continue
+        # Avoid repeating a model-generated title as the first body paragraph.
+        if i==0 and SequenceMatcher(None, pplain.lower(), strip_html_text(title).lower()).ratio() > 0.86:
+            continue
+        has_rich = any(tag in para.lower() for tag in ("<b>","<strong>","<i>","<em>","<u>","<s>","<del>","<a ","<blockquote>","<pre>","<code>"))
+        if has_rich:
+            formatted=para
+            if article and i in {1,3} and "<blockquote>" not in para.lower() and len(pplain)>=70:
+                formatted=f"<blockquote>{formatted}</blockquote>"
+            elif not formatted.lstrip().startswith(("<b>","<i>","<u>","<s>","<blockquote>","<pre>","<code>")):
+                formatted=f"{icons[i % len(icons)]} {formatted}"
         else:
-            out.append(f"\n{icon} {esc}")
-    return "\n".join(out)
+            formatted=_format_technical_tokens(html.escape(pplain, quote=False))
+            icon=icons[i % len(icons)]
+            if article and i in {1,3} and len(pplain)>=70:
+                formatted=f"<blockquote>{formatted}</blockquote>"
+            elif i==0:
+                formatted=f"{icon} <i>{formatted}</i>"
+            elif i % 4 == 0:
+                formatted=f"{icon} <b>{formatted}</b>"
+            else:
+                formatted=f"{icon} {formatted}"
+        out.append(formatted)
+
+    result="\n\n".join(out)
+    # Give the full article a second quote when the source content has enough material.
+    if article:
+        plain_parts=[x.strip() for x in re.split(r"\n\s*\n+", strip_html_text(result)) if x.strip()]
+        if len(plain_parts)>=5 and "<blockquote>" not in result.lower():
+            idx=3
+            q=html.escape(plain_parts[idx][:420],quote=False)
+            result=result.replace(html.escape(plain_parts[idx],quote=False), f"<blockquote>{q}</blockquote>", 1)
+    return result
 
 def ensure_rich_channel_format(title: str, value: str, category: str = "tech") -> str:
     clean=sanitize_telegram_html(value or "")
@@ -1285,15 +1440,12 @@ def ensure_rich_article_format(title: str, value: str, source_url: str) -> str:
     clean=sanitize_telegram_html(value or "")
     if not strip_html_text(clean):
         return rich_article_fallback(title, "اطلاعات کافی برای تهیه متن کامل از منبع دریافت شد.", source_url)
-    # Use richer tech/general formatting for article body while preserving existing model formatting.
     return _visualize_plain_paragraphs(title, clean, "tech", article=True)
 
-def rich_article_fallback(title: str, text: str, source_url: str) -> str:
+def rich_channel_fallback(title: str, text: str) -> str:
     clean=strip_html_text(text or "")
-    return (f"<b>{html.escape(title[:220])}</b>\n\n"
-            f"{html.escape(clean)}\n\n"
-            f"<blockquote>این مطلب بر پایه اطلاعات منبع تهیه شده؛ جزئیات و زمینه را می‌توانید از متن کامل بخوانید.</blockquote>\n"
-            f"<a href=\"{html.escape(source_url,quote=True)}\">🔗 منبع اصلی</a>")
+    if len(clean)>700: clean=clean[:700].rsplit(" ",1)[0]+"…"
+    return f"<b>🔎 {html.escape(title[:180])}</b>\n\n{html.escape(clean)}"
 
 def sanitize_resource_links(raw_links):
     out=[]; seen=set()
@@ -1308,33 +1460,35 @@ def sanitize_resource_links(raw_links):
 
 def append_resource_links(article_html: str, resource_links, source_url: str = "") -> str:
     links=sanitize_resource_links(resource_links); rendered=[]
+    main=normalize_url(source_url or "")
+    if main:
+        rendered.append(f'<a href="{html.escape(main,quote=True)}">🔗 منبع اصلی</a>')
     for x in links:
+        if x["url"] == main:
+            continue
         rendered.append(f'<a href="{html.escape(x["url"],quote=True)}">🔗 {html.escape(x["label"])}</a>')
-    if not rendered and source_url:
-        u=normalize_url(source_url)
-        if u: rendered.append(f'<a href="{html.escape(u,quote=True)}">🔗 منبع اصلی</a>')
     if not rendered: return article_html
-    return article_html.rstrip()+"\n\n<b>🔗 لینک‌های مرتبط</b>\n"+"\n".join(rendered)
+    return article_html.rstrip()+"\n\n<u>🔗 لینک‌های مرتبط</u>\n"+"\n".join(rendered)
 
 async def resolve_article_image(db: D1Database, article: dict) -> str:
-    existing=normalize_url(article.get("image_url") or "")
-    if existing: return existing
+    # Image URLs are transient transport data. Never persist them in D1.
     source_url=normalize_url(article.get("source_url") or "")
-    if not source_url: return ""
+    if not source_url:
+        return ""
     try:
         session=await get_http_session()
         raw,_=await http_get(source_url,session)
         parsed=extract_html_page(raw,source_url)
-        image=normalize_url(parsed.get("image_url") or "")
-        if image: await db.execute("UPDATE articles SET image_url=? WHERE id=?",[image,int(article.get("id"))])
-        return image
+        return normalize_url(parsed.get("image_url") or "")
     except Exception as exc:
-        try: await log_automation(db,"WARN","article_image_resolution_failed",f"article={article.get('id')} {str(exc)[:220]}")
-        except Exception: pass
+        try:
+            await log_automation(db,"WARN","article_image_resolution_failed",f"article={article.get('id')} {str(exc)[:220]}")
+        except Exception:
+            pass
         return ""
 
 def make_article_png(width=1280,height=720):
-    # کارت تصویری fallback؛ بدون وابستگی به PIL. برای زمانی که منبع عکس قابل دریافت نیست.
+    # Deprecated: placeholder images are intentionally disabled.
     raw=bytearray()
     for y in range(height):
         raw.append(0)
@@ -1364,7 +1518,7 @@ async def universal_web_scout(ai: AIProviderManager, site_url: str, max_items: i
     this keeps the fallback generic for compatible gateways that expose web tools."""
     rows = await ai.db.execute("SELECT * FROM ai_providers WHERE enabled=1 AND (web_enabled=1 OR status='healthy') ORDER BY web_enabled DESC, priority ASC, id ASC")
     domain = urllib.parse.urlsplit(site_url).netloc
-    prompt = f"""You are a controlled web scout for a Persian technology channel.\nSource URL: {site_url}\nDomain: {domain}\n\nFind up to {max_items} concrete recent or otherwise relevant articles on this site about technology, AI, AI models/tools, cybersecurity, education, or important technology news. Iran/Persian relevance is a bonus, not a requirement. Do not return the homepage or category pages. Do not invent dates or URLs. Return only valid JSON: {{\"items\":[{{\"title\":\"...\",\"url\":\"https://...\",\"description\":\"...\",\"published_at\":\"\",\"image_url\":\"\"}}]}}"""
+    prompt = f"""You are a controlled web scout for a Persian technology channel.\nSource URL: {site_url}\nDomain: {domain}\n\nFind up to {max_items} of the NEWEST articles published on this exact site within the last {int(NEWS_FRESHNESS_MAX_HOURS)} hours about technology, AI, AI models/tools, cybersecurity, education, or important technology news. Freshness is mandatory. Prefer articles published in the last few hours. Do not return older articles just because they are relevant. Iran/Persian language or geography must NOT be used as a source priority. Do not return the homepage or category pages. Do not invent dates or URLs. Every returned item MUST include a verifiable published_at timestamp; if the timestamp cannot be established, do not return the item. Return only valid JSON: {{\"items\":[{{\"title\":\"...\",\"url\":\"https://...\",\"description\":\"...\",\"published_at\":\"\",\"image_url\":\"\"}}]}}"""
     attempts=[]
     for p in rows[:8]:
         status=str(p.get('status') or '')
@@ -1457,39 +1611,86 @@ async def universal_web_scout(ai: AIProviderManager, site_url: str, max_items: i
     return {'ok':False,'error':'همه Web Scoutهای موجود نتوانستند برای این سایت candidate معتبر پیدا کنند.','attempts':attempts}
 
 async def discover_for_processing(db: D1Database, source: Dict[str,Any], ai: AIProviderManager, allow_scout=True, include_old=False) -> Dict[str,Any]:
-    """Discover candidates; if direct discovery yields no *new* usable items, use AI Web Scout failover.
-    include_old is for tests only and allows archived items to be used without being inserted as new source_items."""
-    direct = await discover_source_items(source, return_diagnostics=True)
-    items=list(direct.get('items') or [])
+    """Primary discovery is cheap/direct. Only fresh items are eligible for automation.
+    AI Web Scout is a controlled fallback when direct discovery cannot supply a fresh/new item.
+    include_old is reserved for explicit tests and never used by autonomous cycles."""
+    # In autonomous news mode, sitemap crawling is intentionally disabled; it can surface years-old URLs.
+    # Tests may still use sitemap discovery explicitly.
+    direct = await discover_source_items(source, return_diagnostics=True, use_sitemap=False)
+    raw_items=list(direct.get('items') or [])
     diagnostics=list(direct.get('diagnostics') or [])
+    now=datetime.now(timezone.utc)
+    fresh_items, fresh_diag, newest_dt, newest_url = select_latest_fresh_items(raw_items, now=now)
+    diagnostics.extend(fresh_diag)
     source_id=source.get('id')
-    unseen=[]
-    seen_count=0
-    for raw in items:
+    unseen=[]; seen_count=0
+    last_seen=parse_publication_datetime(source.get('last_seen_published_at') or "")
+    for raw in fresh_items:
         u=normalize_url(raw.get('url') or '')
         if not u: continue
+        pub_dt=parse_publication_datetime(raw.get('published_at') or '')
+        # A persistent source cursor prevents reprocessing after the 1-day content cache expires.
+        if not include_old and last_seen and pub_dt:
+            last_url=normalize_url(source.get('last_seen_url') or '')
+            if pub_dt < last_seen or (pub_dt == last_seen and u <= last_url):
+                seen_count += 1
+                continue
         exists=await db.execute('SELECT id FROM source_items WHERE source_id=? AND canonical_url=?',[source_id,u]) if source_id else []
         if exists:
             seen_count+=1
-            if include_old:
-                unseen.append(raw)
+            if include_old: unseen.append(raw)
         else:
             unseen.append(raw)
-    # If direct results are all historical, force a Web Scout to discover something else.
-    if allow_scout and (not unseen) and await get_setting(db,'ai_web_scout_enabled','1')=='1':
+    # Persist cursor only to the newest actually discovered timestamp/url; this is tiny metadata and is not article storage.
+    if newest_dt and newest_url and not include_old:
+        try:
+            await db.execute('UPDATE sources SET last_seen_published_at=?, last_seen_url=? WHERE id=?',[newest_dt.isoformat(),newest_url,source_id])
+        except Exception:
+            pass
+    # If direct source discovery does not produce a usable fresh/new item, use AI Web Scout as controlled fallback.
+    if allow_scout and not unseen and await get_setting(db,'ai_web_scout_enabled','1')=='1':
         scout=await universal_web_scout(ai, source.get('url') or '', int(await get_setting(db,'ai_web_scout_max_items','5')))
         diagnostics.extend([f"🤖 Scout: {x}" for x in (scout.get('attempts') or [])[-5:]])
         if scout.get('ok'):
-            for raw in scout.get('items') or []:
+            scout_items, scout_diag, scout_newest_dt, scout_newest_url=select_latest_fresh_items(scout.get('items') or [], now=now)
+            diagnostics.extend(scout_diag)
+            for raw in scout_items:
                 u=normalize_url(raw.get('url') or '')
                 if not u: continue
+                pub_dt=parse_publication_datetime(raw.get('published_at') or '')
+                if not include_old and last_seen and pub_dt:
+                    last_url=normalize_url(source.get('last_seen_url') or '')
+                    if pub_dt < last_seen or (pub_dt == last_seen and u <= last_url):
+                        continue
                 exists=await db.execute('SELECT id FROM source_items WHERE source_id=? AND canonical_url=?',[source_id,u]) if source_id else []
                 if not exists or include_old:
                     unseen.append(raw)
+            if scout_newest_dt and scout_newest_url and not include_old:
+                try:
+                    await db.execute('UPDATE sources SET last_seen_published_at=?, last_seen_url=? WHERE id=?',[scout_newest_dt.isoformat(),scout_newest_url,source_id])
+                except Exception:
+                    pass
         else:
             diagnostics.append(f"🤖 Scout شکست خورد: {scout.get('error','')}")
-    return {'items':unseen[:MAX_SOURCE_ITEMS_PER_CYCLE],'method':direct.get('method'),'diagnostics':diagnostics,
-            'direct_count':len(items),'seen_count':seen_count,'new_count':len(unseen)}
+    method=direct.get('method') or ''
+    if not unseen and raw_items and not fresh_items:
+        method=(method or 'direct')+'+freshness_gate'
+    return {'items':unseen[:MAX_SOURCE_ITEMS_PER_CYCLE],'method':method,'diagnostics':diagnostics,
+            'direct_count':len(raw_items),'fresh_count':len(fresh_items),'seen_count':seen_count,'new_count':len(unseen)}
+
+
+def format_source_publication_date(raw: str) -> str:
+    raw=normalize_model_text(raw or "").strip()
+    if not raw:
+        return ""
+    try:
+        dt=datetime.fromisoformat(raw.replace("Z","+00:00"))
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        m=re.search(r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})", raw)
+        if m:
+            return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+        return ""
 
 async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:Dict[str,Any],recent_titles:List[str],weights:Dict[str,float],manager_prompts:Optional[Dict[str,str]]=None):
     body=(item.get("body") or item.get("description") or "")[:14000]
@@ -1500,11 +1701,12 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
 وظیفه تو این است که از منبع داده‌شده محتوای فنی، غنی، دقیق، بی‌طرف و قابل‌فهم بسازی. انتخاب نهایی فقط بر اساس معیارهای عددی مدیر انجام می‌شود؛ در متن نهایی قضاوت، توصیه یا ارزش‌گذاری ننویس.
 
 موضوعات کانال: فناوری، هوش مصنوعی، ابزارها و مدل‌ها، امنیت سایبری، آموزش و اخبار مهم جهان.
-مخاطب: فارسی‌زبان‌ها، با توجه بیشتر به ایران؛ اما «ایران‌محور بودن» فقط یک امتیاز است و شرط اجباری نیست.
+مخاطب: فارسی‌زبان‌ها. زبان یا جغرافیای منبع هیچ اولویتی ندارد؛ فقط کیفیت، ارتباط و تازگی محتوا مهم است.
 
 منبع: {source.get('name')}
 عنوان: {item.get('title')}
 URL: {item.get('url')}
+تاریخ انتشار منبع: {item.get('published_at') or "نامشخص"}
 لینک‌های داخل صفحه:
 {json.dumps(item.get('links') or [], ensure_ascii=False)[:5000]}
 متن منبع:
@@ -1522,6 +1724,7 @@ URL: {item.get('url')}
 این دو دستور فقط مشخص می‌کنند چه اطلاعات و چه نوع محتوایی پوشش داده شود؛ به هیچ وجه قوانین Formatting را تغییر نده. قالب‌بندی وظیفه موتور تولید و ربات است.
 
 اول فقط برای تصمیم داخلی، امتیاز 0 تا 100 بده. این تصمیم نباید وارد متن نهایی شود و نباید با عبارت‌هایی مثل «این خبر مهم است»، «این خبر ارزشمند است»، «ما توصیه می‌کنیم» یا قضاوت شخصی نوشته شود.
+اگر تاریخ انتشار منبع مشخص و قابل‌اعتماد نیست، برای اتوماسیون accept=false بده. مطالب قدیمی‌تر از پنجره مجاز باید accept=false شوند. هیچ تاریخ یا تازگی را حدس نزن.
 اگر اطلاعات کافی برای تولید دقیق وجود ندارد، accept=false بده.
 
 اگر accept=true، همزمان محتوای نهایی را تولید کن:
@@ -1535,8 +1738,10 @@ URL: {item.get('url')}
 - اگر اصطلاح فنی لازم است، معادل فارسی + اصطلاح انگلیسی را بیاور.
 - در هر پاراگراف اصلی یک ایموجی دقیق و مرتبط داشته باش؛ تکراری و تزئینی نباشد.
 - نسخه کانال باید 2 تا 4 نشانه بصری متنوع داشته باشد و فاصله‌گذاری طبیعی موبایلی داشته باشد.
-- نسخه کامل باید تیترهای کوتاه Bold و در بخش‌های مهم 2 تا 3 Quote واقعی از منبع داشته باشد، فقط وقتی مناسب است.
-- متن را با تیتر، پاراگراف‌های کوتاه، Bold، Italic و Quote خوش‌خوان کن.
+- نسخه کامل باید تیترهای کوتاه Bold و در بخش‌های مهم 2 تا 3 Quote واقعی و کوتاه از خود منبع داشته باشد؛ اگر نقل‌قول دقیق در منبع وجود ندارد، Quote نساز.
+- متن را با تیتر، پاراگراف‌های کوتاه، Bold، Italic، Underline، Code و Quote در جاهای طبیعی و مفید خوش‌خوان کن؛ از فرمت‌ها برای زیبایی واقعی استفاده کن، نه تزئینی و افراطی.
+- اگر کد، دستور، نام API یا عبارت فنی دقیق وجود دارد از <code>...</code> استفاده کن؛ اگر متن شامل قطعه‌کد واقعی است از <pre>...</pre> استفاده کن.
+- هیچ‌وقت کاراکترهای متنی "\\n" را برای فاصله‌گذاری خروجی نده؛ برای خط جدید از newline واقعی استفاده کن.
 - سؤال‌هایی مثل «هدف چیست؟» یا «چه معنایی دارد؟» را به عنوان سؤال رها نکن؛ پاسخ و اطلاعات موجود در منبع را مستقیم بیان کن.
 - هیچ نتیجه‌گیری شخصی یا قضاوتی به کاربر تحمیل نکن.
 - «طبق منبع»، «گزارش شده» و «این شرکت گفته» را فقط وقتی لازم است برای نسبت‌دادن ادعا استفاده کن.
@@ -1625,6 +1830,10 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
         async def process_one(raw):
             try:
                 raw_title=strip_html_text(raw.get('title',''))[:500]; raw_desc=strip_html_text(raw.get('description',''))[:2000]; raw_url=normalize_url(raw.get('url'))
+                if not allow_old_test:
+                    fresh_ok, fresh_reason, _fresh_dt = candidate_is_fresh(raw, now=now)
+                    if NEWS_FRESHNESS_STRICT and not fresh_ok:
+                        return {'processed':0,'rejected':1,'reason':f'freshness: {fresh_reason}'}
                 if not raw_url or not raw_title or not heuristic_topic_match(raw_title,raw_desc,source.get('category','tech')):
                     return {'processed':0,'rejected':1,'reason':'heuristic'}
                 item=await enrich_candidate_content(dict(raw))
@@ -1639,7 +1848,7 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                     hash_exists=await db.execute('SELECT id FROM source_items WHERE content_hash=? LIMIT 1',[content_hash])
                     if hash_exists and not allow_old_test: return {'processed':0,'rejected':0,'seen':1,'reason':'hash'}
                     ins=await db.execute("INSERT INTO source_items(source_id,canonical_url,title,description,content,image_url,published_at,discovered_at,content_hash,status,category) VALUES(?,?,?,?,?,?,?,?,?,'analyzing',?) RETURNING id",
-                        [source_id,url,title,item.get('description','')[:2000],body[:14000],item.get('image_url','')[:1000],item.get('published_at','')[:100],now.isoformat(),content_hash,source.get('category','tech')])
+                        [source_id,url,title,item.get('description','')[:2000],body[:14000],'',item.get('published_at','')[:100],now.isoformat(),content_hash,source.get('category','tech')])
                     item_id=ins[0].get('id') if ins else 0
                     out=await ai_editorial_process(ai,item,source,recent_titles,weights,await get_manager_editorial_prompts(db))
                     if out.get('error'):
@@ -1659,15 +1868,19 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                             return {'processed':1,'rejected':1,'score':score,'reason':'verification'}
                     title_out=strip_html_text(out.get('title') or title)[:500]
                     article_text=ensure_rich_article_format(title_out,out.get('article_html') or out.get('article_text') or '',url)
+                    article_text=append_resource_links(article_text,out.get('resource_links'),url)
                     channel_text=ensure_rich_channel_format(title_out,out.get('channel_html') or out.get('channel_text') or '',str(out.get('category') or source.get('category') or 'tech'))
                     if plain_len(channel_text)>780: channel_text=rich_channel_fallback(title_out,channel_text)
                     if plain_len(article_text)<1200: article_text=rich_article_fallback(title_out,article_text,url)
                     if plain_len(article_text)>4200: article_text=ensure_rich_article_format(title_out,strip_html_text(article_text)[:4200],url)
+                    source_date=format_source_publication_date(item.get('published_at') or '')
+                    if source_date:
+                        article_text=article_text.rstrip()+f'\n\n<i>تاریخ انتشار: {source_date}</i>'
                     if plain_len(article_text)<900:
                         if item_id: await db.execute("UPDATE source_items SET status='rejected',last_error='article too short' WHERE id=?",[item_id])
                         return {'processed':1,'rejected':1,'reason':'article too short'}
-                    art=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at) VALUES(?,?,?,?,?,?,?,?, 'ready',?) RETURNING id",
-                        [item_id,title_out,channel_text,article_text[:18000],url,item.get('image_url',''),out.get('category') or source.get('category','tech'),score,now.isoformat()])
+                    art=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at,source_published_at) VALUES(?,?,?,?,?,?,?,?,'ready',?,?) RETURNING id",
+                        [item_id,title_out,channel_text,article_text[:18000],url,'',out.get('category') or source.get('category','tech'),score,now.isoformat(),item.get('published_at','')[:100]])
                     aid=art[0].get('id') if art else 0
                     token=make_deep_token(int(aid)); await db.execute('UPDATE articles SET deep_token=? WHERE id=?',[token,aid])
                     if item_id: await db.execute('UPDATE source_items SET status=\'ready\',article_id=?,score=? WHERE id=?',[aid,score,item_id])
@@ -1698,6 +1911,10 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                     scout_results=[]
                     for raw in fresh[:MAX_SOURCE_ITEMS_PER_CYCLE]:
                         try:
+                            if not allow_old_test:
+                                fresh_ok, fresh_reason, _fresh_dt = candidate_is_fresh(raw, now=now)
+                                if NEWS_FRESHNESS_STRICT and not fresh_ok:
+                                    continue
                             body=(raw.get('body') or raw.get('description') or '').strip()
                             if len(body)<120:
                                 enriched=await enrich_candidate_content(dict(raw)); body=(enriched.get('body') or enriched.get('description') or '').strip(); raw=enriched
@@ -1705,7 +1922,7 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                             u=normalize_url(raw.get('url') or '')
                             title=strip_html_text(raw.get('title') or '')[:500]
                             chash=text_hash(title+' '+body)
-                            ins=await db.execute("INSERT OR IGNORE INTO source_items(source_id,canonical_url,title,description,content,image_url,published_at,discovered_at,content_hash,status,category) VALUES(?,?,?,?,?,?,?,?,?,'analyzing',?) RETURNING id",[source_id,u,title,str(raw.get('description') or '')[:2000],body[:14000],str(raw.get('image_url') or '')[:1000],str(raw.get('published_at') or '')[:100],now.isoformat(),chash,source.get('category','tech')])
+                            ins=await db.execute("INSERT OR IGNORE INTO source_items(source_id,canonical_url,title,description,content,image_url,published_at,discovered_at,content_hash,status,category) VALUES(?,?,?,?,?,?,?,?,?,'analyzing',?) RETURNING id",[source_id,u,title,str(raw.get('description') or '')[:2000],body[:14000],'',str(raw.get('published_at') or '')[:100],now.isoformat(),chash,source.get('category','tech')])
                             if not ins: continue
                             item_id=ins[0].get('id')
                             out=await ai_editorial_process(ai,raw,source,recent_titles,weights,await get_manager_editorial_prompts(db))
@@ -1715,8 +1932,12 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                             title_out=strip_html_text(out.get('title') or title)[:500]
                             channel_text=ensure_rich_channel_format(title_out,out.get('channel_html') or out.get('channel_text') or '',str(out.get('category') or source.get('category') or 'tech'))
                             article_text=ensure_rich_article_format(title_out,out.get('article_html') or out.get('article_text') or '',u)
+                            article_text=append_resource_links(article_text,out.get('resource_links'),u)
+                            source_date=format_source_publication_date(raw.get('published_at') or '')
+                            if source_date:
+                                article_text=article_text.rstrip()+f'\n\n<i>تاریخ انتشار: {source_date}</i>'
                             if plain_len(article_text)<900: continue
-                            art=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at) VALUES(?,?,?,?,?,?,?,?, 'ready',?) RETURNING id",[item_id,title_out,channel_text,article_text[:18000],u,str(raw.get('image_url') or ''),out.get('category') or source.get('category','tech'),score,now.isoformat()])
+                            art=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at,source_published_at) VALUES(?,?,?,?,?,?,?,?,'ready',?,?) RETURNING id",[item_id,title_out,channel_text,article_text[:18000],u,'',out.get('category') or source.get('category','tech'),score,now.isoformat(),raw.get('published_at','')[:100]])
                             aid=art[0].get('id') if art else 0
                             if not aid: continue
                             token=make_deep_token(int(aid)); await db.execute('UPDATE articles SET deep_token=? WHERE id=?',[token,aid])
@@ -1821,8 +2042,8 @@ async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> b
         title_out=str(row.get("title") or "مطلب")
         channel_text=ensure_rich_channel_format(title_out,row.get("channel_text") or "",str(row.get("category") or "tech"))
         source_url=normalize_url(row.get("source_url") or "")
-        if source_url and "<a href=" not in channel_text.lower():
-            channel_text += f"\n\n<a href=\"{html.escape(source_url,quote=True)}\">🔗 منبع اصلی</a>"
+        # The channel contains exactly one navigation link: the article Deep Link.
+        # The real source link lives inside the full article behind that Deep Link.
         channel_text += f"\n\n<a href=\"{html.escape(deep_link,quote=True)}\">📖 بیشتر بخوانید</a>"
         image_url=await resolve_article_image(db,row)
         sent=None
@@ -1834,7 +2055,7 @@ async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> b
         if sent is None:
             # Never publish an unrelated placeholder image. If the source has no usable image,
             # publish the real formatted text instead.
-            sent=await bot.send_message(chat_id=channel_id,text=channel_text[:4096],parse_mode="HTML",disable_web_page_preview=False)
+            sent=await bot.send_message(chat_id=channel_id,text=channel_text[:4096],parse_mode="HTML",disable_web_page_preview=True)
         published_at=datetime.now(timezone.utc).isoformat()
         await db.execute("UPDATE articles SET status='published',published_message_id=?,published_at=? WHERE id=?",[getattr(sent,"message_id",0),published_at,article_id])
         await db.execute("UPDATE publication_queue SET status='published',published_at=? WHERE id=?",[published_at,queue_id])
@@ -1938,7 +2159,6 @@ async def get_schedule_panel(db:D1Database):
           f"🔢 سقف روزانه: <b>{max_daily}</b> پست\n"
           f"⏱ فاصله انتشار: <b>{format_duration_minutes(gap)}</b>\n"
           f"🌐 فاصله بررسی منابع: <b>{src_interval} دقیقه</b>\n"
-          f"⚡ Worker منابع: <b>{workers}</b> · 🧠 Worker AI: <b>{ai_workers}</b>\n"
           f"🕐 نوبت تقریبی بعدی: <b>{nxt}</b>")
     return text, schedule_menu_kb()
 
@@ -2065,13 +2285,12 @@ def quality_menu_kb() -> InlineKeyboardMarkup:
 
 
 def schedule_menu_kb() -> InlineKeyboardMarkup:
+    # The canonical schedule screen stays focused on settings the manager actually uses.
+    # Worker/verification internals remain configurable elsewhere and are not mixed into this page.
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔢 سقف تقریبی پست روزانه", callback_data="set_max_daily")],
         [InlineKeyboardButton(text="⏱ حداقل فاصله پست‌ها", callback_data="set_min_gap")],
         [InlineKeyboardButton(text="🌐 فاصله بررسی منابع", callback_data="set_default_interval")],
-        [InlineKeyboardButton(text="⚡ Workerهای بررسی منابع", callback_data="set_workers")],
-        [InlineKeyboardButton(text="🧠 Workerهای AI", callback_data="set_ai_workers")],
-        [InlineKeyboardButton(text="🛡 راستی‌آزمایی AI", callback_data="set_ai_verify")],
         [InlineKeyboardButton(text="🚀 همین حالا منتشر کن", callback_data="publish_now")],
         [InlineKeyboardButton(text="🔙 اتوماسیون محتوا", callback_data="auto_back")]
     ])
@@ -2452,23 +2671,20 @@ async def deliver_article_by_token(message: Message, bot: Bot, db: D1Database, t
     title=html.escape(str(article.get('title') or 'مطلب'))
     body=sanitize_telegram_html(article.get('body') or '')
     source_url=normalize_url(article.get('source_url') or '')
-    if source_url:
-        body=f"{body}\n\n<a href=\"{html.escape(source_url,quote=True)}\">🔗 منبع اصلی</a>"
+    if source_url and "🔗 منبع اصلی" not in strip_html_text(body):
+        body=f"{body}\n\n<b>🔗 لینک منبع</b>\n<a href=\"{html.escape(source_url,quote=True)}\">منبع اصلی</a>"
+    source_date=format_source_publication_date(article.get('source_published_at') or '')
+    if source_date and "تاریخ انتشار:" not in strip_html_text(body):
+        body=body.rstrip()+f"\n\n<i>تاریخ انتشار: {source_date}</i>"
     full=f"<b>📖 {title}</b>\n\n{body}"
-    image=normalize_url(article.get('image_url') or '')
-    try:
-        # Never cut HTML in the middle of a tag. The photo caption is intentionally short;
-        # the complete formatted article is delivered in following messages.
-        photo_caption=f"<b>📖 {title}</b>\n\n✨ ادامه مطلب در پیام‌های بعدی…"
-        if image:
-            try:
-                await bot.send_photo(message.chat.id,photo=image,caption=photo_caption,parse_mode='HTML')
-            except Exception:
-                await bot.send_photo(message.chat.id,photo=BufferedInputFile(make_article_png(),filename='tech-content-card.png'),caption=photo_caption,parse_mode='HTML')
-        else:
-            await bot.send_photo(message.chat.id,photo=BufferedInputFile(make_article_png(),filename='tech-content-card.png'),caption=photo_caption,parse_mode='HTML')
-    except Exception:
-        await message.answer(f"<b>📖 {title}</b>",parse_mode='HTML')
+    image=await resolve_article_image(db,article)
+    # No generated/default/placeholder image is ever sent. Only the real source image may be used.
+    if image:
+        try:
+            photo_caption=f"<b>📖 {title}</b>\n\n✨ مقاله کامل در پیام‌های بعدی…"
+            await bot.send_photo(message.chat.id,photo=image,caption=photo_caption,parse_mode='HTML')
+        except Exception:
+            pass
     for i in range(0,len(full),3800):
         chunk=full[i:i+3800]
         if chunk: await message.answer(chunk,parse_mode='HTML',disable_web_page_preview=True)
@@ -3030,23 +3246,22 @@ async def admin_automation_setting_input(message:Message,state:FSMContext,db:D1D
             if key == "default_source_interval":
                 now_interval=datetime.now(timezone.utc).isoformat()
                 await db.execute("UPDATE sources SET interval_minutes=?, next_check_at=? WHERE enabled=1",[int(value),now_interval])
-            parent="auto_schedule"
         elif key in {"max_workers","max_ai_workers"}:
             value=str(max(1,min(4,int(value)))); await set_setting(db,key,value); parent="auto_schedule"
         elif key=="min_content_score":
-            value=str(max(0,min(100,float(value)))); await set_setting(db,key,value); parent="auto_quality"
+            value=str(max(0,min(100,float(value)))); await set_setting(db,key,value)
         elif key in {"editorial_prompt_channel","editorial_prompt_article"}:
             if not value: raise ValueError("پرامپت نمی‌تواند خالی باشد.")
             if len(value)>5000: value=value[:5000]
-            await set_setting(db,key,value); parent="auto_quality"
-        elif key=="min_hours_between_posts":
+            await set_setting(db,key,value)
+        elif key in {"min_hours_between_posts","min_post_gap_minutes"}:
             minutes=max(1,int(float(value)))
             await set_setting(db,"min_post_gap_minutes",str(minutes))
+            # Keep the legacy key only for backward compatibility; the UI reads minutes.
             await set_setting(db,"min_hours_between_posts",str(minutes/60))
-            parent="auto_schedule"
         elif key=="ai_verify_mode":
             if value not in {"auto","always","off"}: raise ValueError("auto / always / off")
-            await set_setting(db,key,value); parent="auto_schedule"
+            await set_setting(db,key,value)
         elif key=="__publish_delay__":
             delay=max(0,min(10080,int(value)))
             row=await db.execute("SELECT article_id FROM publication_queue WHERE status='queued' ORDER BY score DESC,created_at ASC LIMIT 1")
@@ -3054,7 +3269,6 @@ async def admin_automation_setting_input(message:Message,state:FSMContext,db:D1D
             # برنامه‌ریزی دستی فقط همان اولین آیتم آماده را جابه‌جا می‌کند.
             when=(datetime.now(timezone.utc)+timedelta(minutes=delay)).isoformat()
             await db.execute("UPDATE publication_queue SET scheduled_at=? WHERE article_id=? AND status='queued'",[when,row[0]['article_id']])
-            parent="auto_schedule"
         else:
             raise ValueError("setting not supported")
         await state.set_state(BotStates.idle)
@@ -3262,13 +3476,13 @@ async def publish_now(call: CallbackQuery, db:D1Database, bot:Bot):
         msg="✅ اولین محتوای آماده همین حالا منتشر شد." if ok else "⏸ محتوای آماده‌ای برای انتشار نیست یا سقف روزانه پر شده است."
     except Exception as e:
         msg="❌ انتشار دستی شکست خورد:\n"+html.escape(str(e)[:1200])
-    await call.message.edit_text(msg,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 انتشار و زمان‌بندی",callback_data="auto_schedule")]]))
+    await call.message.edit_text(msg,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 انتشار و زمان‌بندی",callback_data="auto_channel")]]))
 
 @router.callback_query(F.data == "publish_schedule")
 async def publish_schedule(call:CallbackQuery,state:FSMContext):
     if call.from_user.id!=ADMIN_ID:return
     await state.set_state(BotStates.admin_automation_setting)
-    await state.update_data(automation_setting_key="__publish_delay__",panel_message_id=call.message.message_id,parent_callback="auto_schedule")
+    await state.update_data(automation_setting_key="__publish_delay__",panel_message_id=call.message.message_id,parent_callback="auto_channel")
     await call.message.edit_text("⏱ <b>زمان‌بندی انتشار</b>\n\nچند دقیقه دیگر منتشر شود؟\n\n0 = همین حالا\n2 = دو دقیقه دیگر\n10 = ده دقیقه دیگر\nمثلاً 30",parse_mode="HTML",reply_markup=get_exit_menu()); await call.answer()
 
 @router.callback_query(F.data == "channel_test")
@@ -4182,10 +4396,14 @@ async def health_test_publish(call:CallbackQuery,db:D1Database,bot:Bot):
         if not out.get('accept',True): raise RuntimeError(f"محتوای واقعی در مرحله انتخاب رد شد؛ امتیاز {out.get('score','-')} — {out.get('why','')}")
         ch=ensure_rich_channel_format(out.get('title') or item.get('title') or '',sanitize_telegram_html(out.get('channel_html') or ''),str(out.get('category') or 'tech'))
         ar=ensure_rich_article_format(out.get('title') or item.get('title') or '',sanitize_telegram_html(out.get('article_html') or ''),item.get('url') or '')
+        ar=append_resource_links(ar,out.get('resource_links'),item.get('url') or '')
+        source_date=format_source_publication_date(item.get('published_at') or '')
+        if source_date:
+            ar=ar.rstrip()+f"\n\n<i>تاریخ انتشار: {source_date}</i>"
         await edit_health_progress(call.message,health_progress_block(3,6,'محتوا و Formatting آماده شد','در حال ذخیره مقاله تست و ساخت Deep Link…'))
         now=datetime.now(timezone.utc).isoformat()
-        ins=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at) VALUES(NULL,?,?,?,?,?,?,?,'test',?) RETURNING id",
-            [out.get('title') or item.get('title') or 'Test',ch,ar,item.get('url') or '',item.get('image_url') or '','test',float(out.get('score') or 0),now])
+        ins=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at,source_published_at) VALUES(NULL,?,?,?,?,?,?,?,'test',?,?) RETURNING id",
+            [out.get('title') or item.get('title') or 'Test',ch,ar,item.get('url') or '','', 'test',float(out.get('score') or 0),now,item.get('published_at','')[:100]])
         aid=int(ins[0]['id']) if ins else 0
         token=make_deep_token(aid); await db.execute('UPDATE articles SET deep_token=? WHERE id=?',[token,aid])
         username=await get_runtime_bot_username(bot)
@@ -4200,7 +4418,7 @@ async def health_test_publish(call:CallbackQuery,db:D1Database,bot:Bot):
             except Exception: sent=None
         if sent is None:
             # Real test must use the real generated content; never attach a fake placeholder image.
-            sent=await bot.send_message(channel,text=channel_html[:4096],parse_mode='HTML',disable_web_page_preview=False)
+            sent=await bot.send_message(channel,text=channel_html[:4096],parse_mode='HTML',disable_web_page_preview=True)
         await db.execute("UPDATE articles SET published_message_id=?,published_at=? WHERE id=?",[getattr(sent,'message_id',0),now,aid])
         await edit_health_progress(call.message,health_progress_block(5,6,'✅ انتشار انجام شد','در حال نهایی‌کردن نتیجه و لینک تست…'))
         result=("✅ <b>تست انتشار واقعی موفق شد.</b>\n\n"
@@ -4249,17 +4467,21 @@ async def auto_settings_legacy(call: CallbackQuery, db: D1Database):
     # سازگاری با callbackهای قدیمی؛ به برنامه انتشار هدایت می‌شود.
     await auto_schedule(call, db)
 
+def current_automation_parent(call: CallbackQuery, fallback: str = "auto_schedule") -> str:
+    text = str(getattr(call.message, "text", "") or "")
+    return "auto_channel" if "انتشار و زمان‌بندی" in text else fallback
+
 async def prompt_for_setting(call: CallbackQuery, state: FSMContext, key: str, label: str, parent: str = "auto_schedule"):
     await state.set_state(BotStates.admin_automation_setting)
     await state.update_data(automation_setting_key=key, panel_message_id=call.message.message_id, parent_callback=parent)
-    await call.message.edit_text(label, reply_markup=get_exit_menu())
+    await call.message.edit_text(label, parse_mode="HTML", reply_markup=get_exit_menu())
     await call.answer()
 
 
 @router.callback_query(F.data == "set_max_daily")
 async def set_max_daily(call: CallbackQuery, state: FSMContext, db: D1Database):
     current=await get_setting(db,"max_daily_posts",str(DEFAULT_MAX_DAILY_POSTS))
-    await prompt_for_setting(call, state, "max_daily_posts", f"🔢 سقف تقریبی پست روزانه را به عدد بفرست.\nفعلاً روی <b>{html.escape(current)}</b> است.")
+    await prompt_for_setting(call, state, "max_daily_posts", f"🔢 <b>سقف تقریبی پست روزانه</b> را به عدد بفرست.\nفعلاً روی <b>{html.escape(current)}</b> پست است.", current_automation_parent(call))
 @router.callback_query(F.data == "set_min_score")
 async def set_min_score(call: CallbackQuery, state: FSMContext):
     await prompt_for_setting(call, state, "min_content_score", "⭐ حداقل امتیاز انتشار را بین 0 تا 100 بفرست. پیشنهاد: 75", "auto_quality")
@@ -4267,11 +4489,11 @@ async def set_min_score(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "set_min_gap")
 async def set_min_gap(call: CallbackQuery, state: FSMContext, db: D1Database):
     current=await get_setting(db,"min_post_gap_minutes",str(DEFAULT_MIN_POST_GAP_MINUTES))
-    await prompt_for_setting(call, state, "min_hours_between_posts", f"⏱ حداقل فاصله بین دو پست را بر حسب دقیقه بفرست.\nفعلاً روی <b>{format_duration_minutes(current)}</b> است. مثال: 30 یعنی هر ۳۰ دقیقه.")
+    await prompt_for_setting(call, state, "min_post_gap_minutes", f"⏱ <b>حداقل فاصله بین دو پست</b> را بر حسب دقیقه بفرست.\nفعلاً روی <b>{format_duration_minutes(current)}</b> است.\nمثال: <code>30</code> یعنی هر ۳۰ دقیقه و <code>120</code> یعنی هر ۲ ساعت.", current_automation_parent(call))
 @router.callback_query(F.data == "set_default_interval")
 async def set_default_interval(call: CallbackQuery, state: FSMContext, db: D1Database):
     current=await get_setting(db,"default_source_interval",str(DEFAULT_SOURCE_INTERVAL_MINUTES))
-    await prompt_for_setting(call, state, "default_source_interval", f"🌐 فاصله بررسی پیش‌فرض منابع را بر حسب دقیقه بفرست.\nفعلاً روی <b>{html.escape(current)}</b> دقیقه است.")
+    await prompt_for_setting(call, state, "default_source_interval", f"🌐 <b>فاصله بررسی پیش‌فرض منابع</b> را بر حسب دقیقه بفرست.\nفعلاً روی <b>{html.escape(current)}</b> دقیقه است.\nمثال: <code>1</code> یعنی هر دقیقه.", current_automation_parent(call))
 @router.callback_query(F.data == "set_workers")
 async def set_workers(call: CallbackQuery, state: FSMContext, db: D1Database):
     current=await get_setting(db,"max_workers",str(DEFAULT_MAX_WORKERS))
