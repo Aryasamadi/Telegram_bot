@@ -48,7 +48,7 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "10.3.0-rich-editorial-prompts-deeplink-fix-no-placeholder-image"
+BUILD_VERSION = "10.4.0-content-db-queue-editor-deeplink-report-final"
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_AI_WORKERS = 3
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -264,6 +264,7 @@ async def initialize_automation_database(db: D1Database):
         "ALTER TABLE ai_providers ADD COLUMN consecutive_failures INTEGER DEFAULT 0",
         "ALTER TABLE ai_providers ADD COLUMN web_enabled INTEGER DEFAULT 0",
         "ALTER TABLE articles ADD COLUMN published_at TEXT",
+        "ALTER TABLE articles ADD COLUMN deep_views INTEGER DEFAULT 0",
     ]:
         try:
             await db.execute(sql)
@@ -1718,6 +1719,18 @@ async def get_runtime_bot_username(bot: Bot) -> str:
         BOT_USERNAME_RUNTIME=BOT_USERNAME.lstrip("@")
     return BOT_USERNAME_RUNTIME
 
+def publication_caption(title: str, channel_html: str, deep_link: str) -> str:
+    clean=sanitize_telegram_html(channel_html or '')
+    # Reserve space for the deep-link anchor so it can never be truncated out of a photo caption.
+    if plain_len(clean) > 760:
+        clean=rich_channel_fallback(title, clean)
+    link=f'<a href="{html.escape(deep_link,quote=True)}">📖 بیشتر بخوانید</a>'
+    caption=(clean.strip()+"\n\n"+link).strip()
+    if len(caption) <= 1024:
+        return caption
+    clean=rich_channel_fallback(title, clean)
+    return (clean[:700]+"\n\n"+link)[:1024]
+
 async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> bool:
     if force:
         channel_id=await get_channel_id(db)
@@ -1833,27 +1846,65 @@ async def automation_loop(db: D1Database, bot: Bot):
 
 
 async def automation_report(db: D1Database) -> str:
-    settings={'enabled':await get_setting(db,'automation_enabled','0'),'max_daily':await get_setting(db,'max_daily_posts',str(DEFAULT_MAX_DAILY_POSTS)),'min_score':await get_setting(db,'min_content_score',str(DEFAULT_MIN_CONTENT_SCORE))}
+    settings={
+        'enabled':await get_setting(db,'automation_enabled','0'),
+        'max_daily':await get_setting(db,'max_daily_posts',str(DEFAULT_MAX_DAILY_POSTS)),
+        'min_score':await get_setting(db,'min_content_score',str(DEFAULT_MIN_CONTENT_SCORE)),
+        'source_interval':await get_setting(db,'default_source_interval',str(DEFAULT_SOURCE_INTERVAL_MINUTES)),
+        'publish_gap':await get_setting(db,'min_hours_between_posts',str(DEFAULT_MIN_HOURS_BETWEEN_POSTS)),
+    }
     sources=await db.execute("SELECT COUNT(*) c FROM sources WHERE enabled=1")
-    new_items=await db.execute("SELECT COUNT(*) c FROM source_items WHERE discovered_at>=?",[(datetime.now(timezone.utc)-timedelta(days=1)).isoformat()])
+    discovered=await db.execute("SELECT COUNT(*) c FROM source_items WHERE discovered_at>=?",[(datetime.now(timezone.utc)-timedelta(days=1)).isoformat()])
     queued=await db.execute("SELECT COUNT(*) c FROM publication_queue WHERE status='queued'")
     published=await db.execute("SELECT COUNT(*) c FROM articles WHERE status='published' AND COALESCE(published_at,created_at)>=?",[datetime.now(timezone.utc).replace(hour=0,minute=0,second=0,microsecond=0).isoformat()])
+    rejected=await db.execute("SELECT COUNT(*) c FROM source_items WHERE status='rejected' AND discovered_at>=?",[(datetime.now(timezone.utc)-timedelta(days=1)).isoformat()])
     failed=await db.execute("SELECT COUNT(*) c FROM publication_queue WHERE status='failed' AND created_at>=?",[(datetime.now(timezone.utc)-timedelta(days=1)).isoformat()])
-    channel=await get_channel_id(db); channel_label=await get_setting(db,'channel_username','') or ('کانال خصوصی تنظیم شده' if channel else '')
-    hb=await get_setting(db,'worker_heartbeat_at',''); last_cycle=await get_setting(db,'last_cycle_finished_at',''); result=await get_setting(db,'last_cycle_result','')
-    hb_seconds='نامشخص'
+    ready=await db.execute("SELECT COUNT(*) c FROM articles WHERE status='ready'")
+    channel=await get_channel_id(db)
+    channel_label=await get_setting(db,'channel_username','') or ('کانال خصوصی تنظیم شده' if channel else 'تنظیم نشده')
+    hb=await get_setting(db,'worker_heartbeat_at','')
+    last_cycle=await get_setting(db,'last_cycle_finished_at','')
+    last_started=await get_setting(db,'last_cycle_started_at','')
+    result_raw=await get_setting(db,'last_cycle_result','')
+    hb_seconds=None
     if hb:
-        try: hb_seconds=str(int((datetime.now(timezone.utc)-datetime.fromisoformat(hb.replace('Z','+00:00'))).total_seconds()))+' ثانیه قبل'
-        except Exception: pass
-    return (f"📊 گزارش اتوماسیون\n\n🟢 وضعیت: {'فعال' if settings['enabled']=='1' else 'خاموش'}\n"
-            f"📢 کانال: {channel_label or 'تنظیم نشده'}\n🌐 منابع فعال: {sources[0].get('c',0) if sources else 0}\n"
-            f"📰 آیتم‌های کشف‌شده ۲۴ساعت: {new_items[0].get('c',0) if new_items else 0}\n"
-            f"📥 صف فعلی: {queued[0].get('c',0) if queued else 0}\n"
-            f"📢 منتشرشده امروز: {published[0].get('c',0) if published else 0}/{settings['max_daily']}\n"
-            f"⭐ حداقل امتیاز: {settings['min_score']}\n❌ انتشار ناموفق ۲۴ساعت: {failed[0].get('c',0) if failed else 0}\n"
-            f"💓 Heartbeat: {hb_seconds}\n🕐 آخرین چرخه: {last_cycle or 'هنوز اجرا نشده'}\n"
-            f"📋 نتیجه آخرین چرخه: {result[:700] if result else 'هنوز ثبت نشده'}")
-
+        try: hb_seconds=int((datetime.now(timezone.utc)-datetime.fromisoformat(hb.replace('Z','+00:00'))).total_seconds())
+        except Exception: hb_seconds=None
+    result_line='هنوز گزارشی ثبت نشده'
+    if result_raw:
+        try:
+            obj=json.loads(result_raw)
+            result_line=(f"منابع: {obj.get('sources',0)} · پردازش: {obj.get('processed',0)} · "
+                         f"قبول: {obj.get('accepted',0)} · صف: {obj.get('queued',0)} · "
+                         f"انتشار: {'بله ✅' if obj.get('published') else 'خیر ⏸'}")
+            if obj.get('error'): result_line=f"خطا: {obj.get('error')}"
+        except Exception:
+            result_line='آخرین نتیجه قابل نمایش نیست'
+    hb_label='نامشخص'
+    if hb_seconds is not None:
+        hb_label=f'{hb_seconds} ثانیه قبل'
+        if hb_seconds < 180: hb_label += ' 🟢'
+        elif hb_seconds < 600: hb_label += ' 🟡'
+        else: hb_label += ' 🔴'
+    return (
+        "📊 <b>گزارش اتوماسیون</b>\n\n"
+        f"{'🟢' if settings['enabled']=='1' else '🔴'} وضعیت: <b>{'فعال' if settings['enabled']=='1' else 'خاموش'}</b>\n"
+        f"📢 کانال: <b>{html.escape(channel_label)}</b>\n"
+        f"🌐 منابع فعال: <b>{sources[0].get('c',0) if sources else 0}</b>\n"
+        f"📰 کشف/ثبت در ۲۴ ساعت: <b>{discovered[0].get('c',0) if discovered else 0}</b>\n"
+        f"📥 صف فعلی: <b>{queued[0].get('c',0) if queued else 0}</b>\n"
+        f"📝 آماده در آرشیو: <b>{ready[0].get('c',0) if ready else 0}</b>\n"
+        f"📢 منتشرشده امروز: <b>{published[0].get('c',0) if published else 0}/{settings['max_daily']}</b>\n"
+        f"♻️ ردشده در ۲۴ ساعت: <b>{rejected[0].get('c',0) if rejected else 0}</b>\n"
+        f"❌ انتشار ناموفق ۲۴ ساعت: <b>{failed[0].get('c',0) if failed else 0}</b>\n"
+        f"⭐ حداقل امتیاز: <b>{settings['min_score']}</b>\n"
+        f"⏱ فاصله بررسی منابع: <b>{settings['source_interval']} دقیقه</b>\n"
+        f"📢 فاصله انتشار: <b>{settings['publish_gap']} ساعت</b>\n"
+        f"💓 Heartbeat: <b>{hb_label}</b>\n"
+        f"🕐 آخرین شروع چرخه: <b>{html.escape(last_started or 'هنوز اجرا نشده')}</b>\n"
+        f"✅ آخرین پایان چرخه: <b>{html.escape(last_cycle or 'هنوز اجرا نشده')}</b>\n"
+        f"📋 آخرین نتیجه: <b>{html.escape(result_line)}</b>"
+    )
 
 
 def automation_menu_kb(enabled: bool) -> InlineKeyboardMarkup:
@@ -1862,8 +1913,8 @@ def automation_menu_kb(enabled: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=state_text, callback_data=state_cb)],
         [InlineKeyboardButton(text="🌐 منابع خبری", callback_data="auto_sources"), InlineKeyboardButton(text="🤖 مدل‌های AI", callback_data="auto_providers")],
-        [InlineKeyboardButton(text="📢 کانال و انتشار", callback_data="auto_channel"), InlineKeyboardButton(text="🧠 کیفیت محتوا", callback_data="auto_quality")],
-        [InlineKeyboardButton(text="⏱ برنامه انتشار", callback_data="auto_schedule"), InlineKeyboardButton(text="📥 صف انتشار", callback_data="auto_queue")],
+        [InlineKeyboardButton(text="📢 انتشار و زمان‌بندی", callback_data="auto_channel"), InlineKeyboardButton(text="🧠 کیفیت محتوا", callback_data="auto_quality")],
+        [InlineKeyboardButton(text="🗃 محتوا و داده‌ها", callback_data="auto_content_db"), InlineKeyboardButton(text="📥 صف انتشار", callback_data="auto_queue")],
         [InlineKeyboardButton(text="🧪 تست و سلامت", callback_data="auto_health"), InlineKeyboardButton(text="📊 گزارش", callback_data="auto_report")],
         [InlineKeyboardButton(text="🔙 پنل اصلی", callback_data="admin_home")]
     ])
@@ -1955,6 +2006,7 @@ class BotStates(StatesGroup):
     admin_provider_model = State()
     admin_channel_input = State()
     admin_automation_setting = State()
+    automation_article_edit = State()
 
 # ============================================================
 # بخش کیبوردهای ربات (Keyboards)
@@ -2280,6 +2332,8 @@ async def deliver_article_by_token(message: Message, bot: Bot, db: D1Database, t
     rows=await db.execute("SELECT * FROM articles WHERE deep_token=? AND status IN ('ready','published','test')",[token])
     if not rows: return False
     article=rows[0]
+    try: await db.execute("UPDATE articles SET deep_views=COALESCE(deep_views,0)+1 WHERE id=?",[article.get('id')])
+    except Exception: pass
     title=html.escape(str(article.get('title') or 'مطلب'))
     body=sanitize_telegram_html(article.get('body') or '')
     source_url=normalize_url(article.get('source_url') or '')
@@ -2886,8 +2940,12 @@ async def admin_automation_setting_input(message:Message,state:FSMContext,db:D1D
         panel_id=data.get("panel_message_id")
         if panel_id:
             if parent=="auto_schedule":
-                await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,
-                    text=(await automation_report(db))+"\n\n⏱ <b>برنامه انتشار</b>",parse_mode="HTML",reply_markup=schedule_menu_kb())
+                channel_id=await get_channel_id(db); channel_username=await get_setting(db,'channel_username','')
+                enabled=(await get_setting(db,'automation_enabled','0'))=='1'
+                max_daily=await get_setting(db,'max_daily_posts',str(DEFAULT_MAX_DAILY_POSTS)); gap=await get_setting(db,'min_hours_between_posts',str(DEFAULT_MIN_HOURS_BETWEEN_POSTS)); src_interval=await get_setting(db,'default_source_interval',str(DEFAULT_SOURCE_INTERVAL_MINUTES))
+                text=(f"📢 <b>انتشار و زمان‌بندی</b>\n\n📢 کانال: <b>{html.escape(channel_username) if channel_username else ('✅ کانال خصوصی تنظیم شده' if channel_id else '⛔ تنظیم نشده')}</b>\n🤖 اتوماسیون: <b>{'🟢 فعال' if enabled else '🔴 خاموش'}</b>\n\n🔢 سقف روزانه: <b>{max_daily}</b>\n⏱ فاصله انتشار: <b>{gap} ساعت</b>\n🌐 فاصله بررسی: <b>{src_interval} دقیقه</b>")
+                kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📢 تنظیم کانال',callback_data='auto_channel_set')],[InlineKeyboardButton(text='🔢 سقف روزانه',callback_data='set_max_daily'),InlineKeyboardButton(text='⏱ فاصله انتشار',callback_data='set_min_gap')],[InlineKeyboardButton(text='🌐 فاصله بررسی',callback_data='set_default_interval')],[InlineKeyboardButton(text='🚀 همین حالا',callback_data='publish_now'),InlineKeyboardButton(text='📥 صف',callback_data='auto_queue')],[InlineKeyboardButton(text='🔙 اتوماسیون محتوا',callback_data='auto_back')]])
+                await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text=text,parse_mode="HTML",reply_markup=kb)
             elif parent=="auto_quality":
                 score=await get_setting(db,"min_content_score",str(DEFAULT_MIN_CONTENT_SCORE))
                 pch=await get_setting(db,"editorial_prompt_channel","")
@@ -2897,6 +2955,11 @@ async def admin_automation_setting_input(message:Message,state:FSMContext,db:D1D
                           f"✍️ پرامپت کوتاه: <code>{html.escape(pch[:180])}</code>\n"
                           f"📝 پرامپت کامل: <code>{html.escape(par[:180])}</code>"),
                     parse_mode="HTML",reply_markup=quality_menu_kb())
+            elif parent=="editorial_prompts":
+                ch=await get_setting(db,'editorial_prompt_channel',''); ar=await get_setting(db,'editorial_prompt_article','')
+                text=("✍️ <b>دستورهای محتوای تولید</b>\n\n"+f"📌 کوتاه: <code>{html.escape(ch[:260])}</code>\n"+f"📌 کامل: <code>{html.escape(ar[:260])}</code>")
+                kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✍️ ویرایش کوتاه',callback_data='set_editorial_prompt_channel')],[InlineKeyboardButton(text='📝 ویرایش کامل',callback_data='set_editorial_prompt_article')],[InlineKeyboardButton(text='♻️ پیش‌فرض',callback_data='editorial_prompts_reset')],[InlineKeyboardButton(text='🔙 کیفیت محتوا',callback_data='auto_quality')]])
+                await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text=text,parse_mode='HTML',reply_markup=kb)
             elif parent=="quality_weights":
                 labels=[("global","🌍 جهانی"),("technology","💻 فناوری"),("ai","🤖 AI"),("cyber","🔐 سایبری"),("education","📚 آموزش"),("iran","🇮🇷 ایران/فارسی"),("freshness","🆕 تازگی"),("source","✅ منبع"),("novelty","♻️ عدم تکرار")]
                 text="🎯 <b>وزن معیارها</b>\n\n"+ "\n".join([f"{lab}: <b>{await get_setting(db,'weight_'+k,'10')}</b>" for k,lab in labels])
@@ -2972,8 +3035,7 @@ async def admin_monitor(call: CallbackQuery, db: D1Database):
     users = (await db.execute("SELECT COUNT(*) c FROM users"))[0].get('c',0)
     posts = (await db.execute("SELECT COUNT(*) c FROM posts WHERE deleted=0"))[0].get('c',0)
     views = (await db.execute("SELECT COALESCE(SUM(views),0) s FROM posts"))[0].get('s',0)
-    automation = await automation_report(db)
-    text = f"📊 <b>مرکز آمار و سلامت</b>\n\n👥 کاربران: {users}\n📝 محتوای هسته: {posts}\n👁 بازدید: {views}\n\n{automation}"
+    text = f"📊 <b>مرکز آمار هسته</b>\n\n👥 کاربران: {users}\n📝 محتوای هسته: {posts}\n👁 بازدید: {views}"
     await call.message.edit_text(text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔄 بروزرسانی', callback_data='admin_monitor')],[InlineKeyboardButton(text='🔙 پنل اصلی', callback_data='admin_home')]]))
     await call.answer()
 
@@ -3029,21 +3091,30 @@ async def render_channel_panel(call: CallbackQuery, db: D1Database):
     else:
         shown = '⛔ هنوز تنظیم نشده'
     enabled = (await get_setting(db, 'automation_enabled', '0')) == '1'
-    text = (
-        '📢 <b>کانال و انتشار</b>\n\n'
-        f'کانال فعلی: {shown}\n'
-        f'اتوماسیون: {"🟢 فعال" if enabled else "🔴 خاموش"}\n\n'
-        'برای تنظیم، فقط @username کانال یا لینک t.me آن را بفرست. برای کانال خصوصی، شناسه -100… هم قابل قبول است.\n'
-        'ربات باید مدیر کانال باشد و اجازه انتشار پیام داشته باشد.'
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='📢 تنظیم/تغییر کانال', callback_data='auto_channel_set')],
-        [InlineKeyboardButton(text='🚀 همین حالا منتشر کن', callback_data='publish_now')],
-        [InlineKeyboardButton(text='⏱ زمان‌بندی انتشار', callback_data='publish_schedule')],
-        [InlineKeyboardButton(text='🧪 تست کانال', callback_data='channel_test')],
-        [InlineKeyboardButton(text='🔙 اتوماسیون محتوا', callback_data='auto_back')]
+    max_daily=await get_setting(db,'max_daily_posts',str(DEFAULT_MAX_DAILY_POSTS))
+    gap=await get_setting(db,'min_hours_between_posts',str(DEFAULT_MIN_HOURS_BETWEEN_POSTS))
+    src_interval=await get_setting(db,'default_source_interval',str(DEFAULT_SOURCE_INTERVAL_MINUTES))
+    est=await next_publication_estimate(db)
+    if est['minutes']<=0: nxt='آماده انتشار طبق برنامه'
+    elif est['minutes']<60: nxt=f"حدود {est['minutes']} دقیقه دیگر"
+    else: nxt=f"حدود {est['minutes']//60} ساعت و {est['minutes']%60} دقیقه دیگر"
+    text=("📢 <b>انتشار و زمان‌بندی</b>\n\n"
+          f"📢 کانال: <b>{shown}</b>\n"
+          f"🤖 اتوماسیون: <b>{'🟢 فعال' if enabled else '🔴 خاموش'}</b>\n\n"
+          f"🔢 سقف روزانه: <b>{max_daily}</b>\n"
+          f"⏱ فاصله انتشار: <b>{gap} ساعت</b>\n"
+          f"🌐 فاصله بررسی منابع: <b>{src_interval} دقیقه</b>\n"
+          f"🕐 نوبت بعدی: <b>{nxt}</b>\n\n"
+          "مدیر فقط فاصله‌ها را تعیین می‌کند؛ نوبت هر محتوا خودکار محاسبه می‌شود.")
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='📢 تنظیم/تغییر کانال',callback_data='auto_channel_set')],
+        [InlineKeyboardButton(text='🔢 سقف پست روزانه',callback_data='set_max_daily'),InlineKeyboardButton(text='⏱ فاصله انتشار',callback_data='set_min_gap')],
+        [InlineKeyboardButton(text='🌐 فاصله بررسی منابع',callback_data='set_default_interval')],
+        [InlineKeyboardButton(text='🚀 همین حالا منتشر کن',callback_data='publish_now'),InlineKeyboardButton(text='🧪 تست کانال',callback_data='channel_test')],
+        [InlineKeyboardButton(text='📥 صف انتشار',callback_data='auto_queue')],
+        [InlineKeyboardButton(text='🔙 اتوماسیون محتوا',callback_data='auto_back')]
     ])
-    await call.message.edit_text(text, parse_mode='HTML', reply_markup=kb)
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=kb)
 
 @router.callback_query(F.data == "auto_channel")
 async def auto_channel(call: CallbackQuery, db: D1Database):
@@ -3606,6 +3677,66 @@ async def provider_delete_confirm(call: CallbackQuery, db: D1Database):
     await call.answer("حذف شد")
 
 
+def automation_content_db_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='📥 مدیریت صف انتشار',callback_data='auto_queue')],
+        [InlineKeyboardButton(text='📰 محتوای تولیدشده',callback_data='auto_articles')],
+        [InlineKeyboardButton(text='🗄 آمار و پاکسازی دیتای اتوماسیون',callback_data='auto_db')],
+        [InlineKeyboardButton(text='🔙 اتوماسیون محتوا',callback_data='auto_back')]
+    ])
+
+@router.callback_query(F.data == "auto_content_db")
+async def auto_content_db(call: CallbackQuery, db: D1Database):
+    if call.from_user.id != ADMIN_ID: return
+    rows=await db.execute("SELECT (SELECT COUNT(*) FROM articles) articles,(SELECT COUNT(*) FROM publication_queue WHERE status='queued') queued,(SELECT COUNT(*) FROM source_items) source_items,(SELECT COUNT(*) FROM test_history) tests")
+    r=rows[0] if rows else {}
+    text=("🗃 <b>محتوا و داده‌های اتوماسیون</b>\n\n"
+          f"📥 صف: <b>{r.get('queued',0)}</b>\n"
+          f"📰 مقالات تولیدشده: <b>{r.get('articles',0)}</b>\n"
+          f"🔎 آیتم‌های کشف‌شده/حافظه منابع: <b>{r.get('source_items',0)}</b>\n"
+          f"🧪 سوابق تست: <b>{r.get('tests',0)}</b>\n\n"
+          "منابع و مدل‌های AI پاک نمی‌شوند؛ فقط داده‌های محتوایی اتوماسیون مدیریت می‌شوند.")
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=automation_content_db_kb()); await call.answer()
+
+@router.callback_query(F.data == "auto_db")
+async def auto_db(call: CallbackQuery, db: D1Database):
+    if call.from_user.id != ADMIN_ID: return
+    rows=await db.execute("SELECT (SELECT COUNT(*) FROM articles) articles,(SELECT COUNT(*) FROM publication_queue) queue_all,(SELECT COUNT(*) FROM source_items) source_items,(SELECT COUNT(*) FROM automation_logs) logs,(SELECT COUNT(*) FROM test_history) tests")
+    r=rows[0] if rows else {}
+    text=("🗄 <b>دیتای اتوماسیون</b>\n\n"
+          f"📰 مقالات: <b>{r.get('articles',0)}</b>\n📥 رکوردهای صف: <b>{r.get('queue_all',0)}</b>\n"
+          f"🔎 source items: <b>{r.get('source_items',0)}</b>\n🧪 سوابق تست: <b>{r.get('tests',0)}</b>\n📜 لاگ‌ها: <b>{r.get('logs',0)}</b>\n\n"
+          "⚠️ حذف همه داده‌های محتوایی برگشت‌پذیر نیست. منابع، تنظیمات و مدل‌های AI حفظ می‌شوند.")
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='🗑️ حذف کل دیتای محتوایی',callback_data='auto_db_delete_confirm')],
+        [InlineKeyboardButton(text='🔙 محتوا و داده‌ها',callback_data='auto_content_db')]
+    ])
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=kb); await call.answer()
+
+@router.callback_query(F.data == "auto_db_delete_confirm")
+async def auto_db_delete_confirm(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID: return
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='⚠️ بله، همه داده‌ها حذف شود',callback_data='auto_db_delete_yes')],
+        [InlineKeyboardButton(text='↩️ لغو',callback_data='auto_db')]
+    ])
+    await call.message.edit_text("⚠️ <b>تأیید حذف کامل دیتای اتوماسیون</b>\n\nهمه مقالات، صف، آیتم‌های کشف‌شده، سوابق تست و لاگ‌های اتوماسیون حذف می‌شوند. منابع و مدل‌ها باقی می‌مانند.\n\nادامه می‌دهی؟",parse_mode='HTML',reply_markup=kb); await call.answer()
+
+@router.callback_query(F.data == "auto_db_delete_yes")
+async def auto_db_delete_yes(call: CallbackQuery, db: D1Database):
+    if call.from_user.id != ADMIN_ID: return
+    await db.execute_batch([
+        {"sql":"DELETE FROM publication_queue"},
+        {"sql":"DELETE FROM articles"},
+        {"sql":"DELETE FROM source_items"},
+        {"sql":"DELETE FROM test_history"},
+        {"sql":"DELETE FROM manual_channel_events"},
+        {"sql":"DELETE FROM automation_logs"},
+    ])
+    now=datetime.now(timezone.utc).isoformat()
+    await db.execute("UPDATE sources SET last_checked_at=NULL,next_check_at=?",[now])
+    await call.message.edit_text("✅ <b>داده‌های محتوایی اتوماسیون پاک شد.</b>\n\nمنابع، تنظیمات و مدل‌های AI حفظ شدند و چرخه از نو قابل شروع است.",parse_mode='HTML',reply_markup=automation_content_db_kb()); await call.answer("پاکسازی انجام شد")
+
 @router.callback_query(F.data == "auto_quality")
 async def auto_quality(call: CallbackQuery, db: D1Database):
     if call.from_user.id != ADMIN_ID: return
@@ -3615,8 +3746,7 @@ async def auto_quality(call: CallbackQuery, db: D1Database):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='⭐ تغییر حداقل امتیاز', callback_data='set_min_score')],
         [InlineKeyboardButton(text='🎯 وزن معیارهای محتوا', callback_data='quality_weights')],
-        [InlineKeyboardButton(text='✍️ پرامپت محتوای کوتاه (~500)', callback_data='set_editorial_prompt_channel')],
-        [InlineKeyboardButton(text='📝 پرامپت محتوای کامل (~2000)', callback_data='set_editorial_prompt_article')],
+        [InlineKeyboardButton(text='✍️ دستورهای محتوای تولید', callback_data='editorial_prompts')],
         [InlineKeyboardButton(text='📖 معیارها', callback_data='quality_about')],
         [InlineKeyboardButton(text='🔙 اتوماسیون محتوا', callback_data='auto_back')]
     ])
@@ -3637,6 +3767,31 @@ async def quality_about(call: CallbackQuery):
     await call.message.edit_text(text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔙 کیفیت محتوا', callback_data='auto_quality')]]))
     await call.answer()
 
+@router.callback_query(F.data == "editorial_prompts")
+async def editorial_prompts_panel(call: CallbackQuery, db: D1Database):
+    if call.from_user.id != ADMIN_ID: return
+    ch=await get_setting(db,"editorial_prompt_channel","")
+    ar=await get_setting(db,"editorial_prompt_article","")
+    text=("✍️ <b>دستورهای محتوای تولید</b>\n\n"
+          "این دو دستور فقط تعیین می‌کنند چه اطلاعاتی پوشش داده شود.\n"
+          "Formatting، ایموجی، Bold، Italic، Quote و زیباسازی را خود ربات انجام می‌دهد.\n\n"
+          f"📌 کوتاه (~500): <code>{html.escape(ch[:260])}</code>\n"
+          f"📌 کامل (~2000): <code>{html.escape(ar[:260])}</code>")
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='✍️ ویرایش دستور کوتاه',callback_data='set_editorial_prompt_channel')],
+        [InlineKeyboardButton(text='📝 ویرایش دستور کامل',callback_data='set_editorial_prompt_article')],
+        [InlineKeyboardButton(text='♻️ بازگردانی دستور پیش‌فرض',callback_data='editorial_prompts_reset')],
+        [InlineKeyboardButton(text='🔙 کیفیت محتوا',callback_data='auto_quality')]
+    ])
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=kb); await call.answer()
+
+@router.callback_query(F.data == "editorial_prompts_reset")
+async def editorial_prompts_reset(call: CallbackQuery, db: D1Database):
+    if call.from_user.id != ADMIN_ID: return
+    await set_setting(db,'editorial_prompt_channel',"فقط محتوای فنی، دقیق و واقعاً ارزشمند برای مخاطب فناوری و هوش مصنوعی را پوشش بده؛ مطالب سطحی، عمومی، کلیشه‌ای و پیش‌پاافتاده را کنار بگذار. خودِ خبر و جزئیات واقعی را بیان کن.")
+    await set_setting(db,'editorial_prompt_article',"مقاله کامل باید فنی، غنی و مبتنی بر اطلاعات واقعی منبع باشد؛ جزئیات، زمینه، نحوه کار، اعداد و اثرات قابل اتکا را توضیح بده. سؤال نساز؛ پاسخ و اطلاعات موجود را مستقیم بیان کن. از کلی‌گویی و قضاوت شخصی پرهیز کن.")
+    await editorial_prompts_panel(call,db)
+
 @router.callback_query(F.data == "set_editorial_prompt_channel")
 async def set_editorial_prompt_channel(call: CallbackQuery, state: FSMContext, db: D1Database):
     if call.from_user.id != ADMIN_ID: return
@@ -3644,7 +3799,7 @@ async def set_editorial_prompt_channel(call: CallbackQuery, state: FSMContext, d
     await prompt_for_setting(
         call,state,"editorial_prompt_channel",
         "✍️ <b>پرامپت محتوای کوتاه کانال</b>\n\nاین متن فقط مشخص می‌کند چه چیزهایی در نسخه حدود 500 کاراکتری پوشش داده شود؛ Formatting را تغییر نمی‌دهد.\n\nپرامپت جدید را بفرست.\n\nفعلی:\n<code>"+html.escape(current[:1800])+"</code>",
-        "auto_quality"
+        "editorial_prompts"
     )
 
 @router.callback_query(F.data == "set_editorial_prompt_article")
@@ -3654,7 +3809,7 @@ async def set_editorial_prompt_article(call: CallbackQuery, state: FSMContext, d
     await prompt_for_setting(
         call,state,"editorial_prompt_article",
         "📝 <b>پرامپت محتوای کامل داخل ربات</b>\n\nاین متن فقط مشخص می‌کند چه اطلاعاتی در نسخه حدود 2000 کاراکتری پوشش داده شود؛ Formatting و زیبایی متن وظیفه ربات است.\n\nپرامپت جدید را بفرست.\n\nفعلی:\n<code>"+html.escape(current[:1800])+"</code>",
-        "auto_quality"
+        "editorial_prompts"
     )
 
 @router.callback_query(F.data == "weight_global")
@@ -3705,9 +3860,9 @@ async def quality_weights(call:CallbackQuery,db:D1Database):
 @router.callback_query(F.data == "auto_schedule")
 async def auto_schedule(call: CallbackQuery, db: D1Database):
     if call.from_user.id != ADMIN_ID: return
-    text = (await automation_report(db)) + '\n\n⏱ <b>برنامه انتشار</b>\nتعداد پست، فاصله انتشار، فاصله بررسی منابع و Workerها را از اینجا تنظیم کن.'
-    await call.message.edit_text(text, parse_mode='HTML', reply_markup=schedule_menu_kb())
+    await render_channel_panel(call, db)
     await call.answer()
+
 
 @router.callback_query(F.data == "auto_health")
 async def auto_health(call:CallbackQuery,db:D1Database,bot:Bot):
@@ -3732,7 +3887,7 @@ async def auto_health(call:CallbackQuery,db:D1Database,bot:Bot):
 
 @router.callback_query(F.data == "health_test_ai")
 async def health_test_ai(call:CallbackQuery,db:D1Database):
-    rows=await db.execute("SELECT id,name,model_name,priority FROM ai_providers WHERE enabled=1 ORDER BY priority ASC,id ASC LIMIT 8")
+    rows=await db.execute("SELECT id,name,model_name,priority,status FROM ai_providers WHERE enabled=1 AND status NOT IN ('cooldown') ORDER BY priority ASC,id ASC LIMIT 8")
     if not rows:
         await call.message.edit_text("❌ هیچ مدل فعالی نیست.",reply_markup=get_admin_back_kb("auto_health")); return
     await call.answer("تست مدل‌ها شروع شد…")
@@ -4039,26 +4194,156 @@ async def auto_publish_now(call:CallbackQuery,db:D1Database,bot:Bot):
 @router.callback_query(F.data == "auto_queue")
 async def auto_queue(call: CallbackQuery, db: D1Database):
     est=await next_publication_estimate(db)
-    rows = await db.execute("SELECT q.id, q.article_id, q.status, q.attempts, a.title, a.score, a.category FROM publication_queue q JOIN articles a ON a.id=q.article_id WHERE q.status='queued' ORDER BY a.score DESC LIMIT 20")
-    last_txt=est["latest"].astimezone(pytz.timezone("Asia/Tehran")).strftime("%H:%M") if est["latest"] else "هنوز منتشر نشده"
-    if est["minutes"]<=0: next_txt="آماده انتشار طبق فاصله زمانی"
-    elif est["minutes"]<60: next_txt=f"حدود {est['minutes']} دقیقه دیگر"
+    rows=await db.execute("SELECT q.id,q.article_id,q.status,q.attempts,a.title,a.score,a.category,a.deep_views FROM publication_queue q JOIN articles a ON a.id=q.article_id WHERE q.status='queued' ORDER BY a.score DESC,q.created_at ASC LIMIT 20")
+    last_txt=est['latest'].astimezone(pytz.timezone('Asia/Tehran')).strftime('%H:%M') if est['latest'] else 'هنوز منتشر نشده'
+    if est['minutes']<=0: next_txt='آماده انتشار طبق برنامه'
+    elif est['minutes']<60: next_txt=f"حدود {est['minutes']} دقیقه دیگر"
     else: next_txt=f"حدود {est['minutes']//60} ساعت و {est['minutes']%60} دقیقه دیگر"
-    text=("📢 <b>صف و صفحه انتشار</b>\n\n"
-          f"📦 آماده در صف: <b>{est['queued']}</b>\n"
+    text=("📥 <b>صف انتشار</b>\n\n"
+          f"📦 تعداد در صف: <b>{est['queued']}</b>\n"
           f"🕘 آخرین انتشار: <b>{last_txt}</b>\n"
           f"⏱ فاصله مدیریت‌شده: <b>{est['interval_minutes']} دقیقه</b>\n"
           f"🕐 نوبت بعدی: <b>{next_txt}</b>\n\n")
     if not rows: text+="صف فعلاً خالی است."
-    else:
-        for r in rows:
-            text += f"#{r['article_id']} | {float(r['score'] or 0):.0f} | {r['category']} | {str(r['title'])[:65]}\n"
+    kb_rows=[]
+    for r in rows:
+        text+=f"#{r['article_id']} · ⭐ {float(r['score'] or 0):.0f} · {str(r['title'])[:70]}\n"
+        kb_rows.append([InlineKeyboardButton(text=f"📄 #{r['article_id']} · {str(r['title'])[:22]}",callback_data=f'auto_art_{r["article_id"]}')])
+    kb_rows += [[InlineKeyboardButton(text='🚀 همین حالا منتشر کن',callback_data='auto_publish_now'),InlineKeyboardButton(text='🔄 بروزرسانی',callback_data='auto_queue')],
+                [InlineKeyboardButton(text='📰 محتوای تولیدشده',callback_data='auto_articles')],
+                [InlineKeyboardButton(text='🔙 محتوا و داده‌ها',callback_data='auto_content_db')]]
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows)); await call.answer()
+
+@router.callback_query(F.data == "auto_articles")
+async def auto_articles(call: CallbackQuery, db: D1Database):
+    if call.from_user.id != ADMIN_ID: return
+    rows=await db.execute("SELECT id,title,score,status,category,created_at,published_at,deep_views FROM articles ORDER BY id DESC LIMIT 20")
+    text="📰 <b>محتوای تولیدشده</b>\n\n"
+    kb=[]
+    if not rows: text+='هنوز محتوایی تولید نشده.'
+    for r in rows:
+        text+=f"#{r['id']} · {'✅' if r.get('status')=='published' else '📝'} · ⭐{float(r.get('score') or 0):.0f} · {str(r.get('title') or '')[:70]}\n"
+        kb.append([InlineKeyboardButton(text=f"📄 مشاهده #{r['id']}",callback_data=f"auto_art_{r['id']}")])
+    kb += [[InlineKeyboardButton(text='🔙 محتوا و داده‌ها',callback_data='auto_content_db')]]
+    await call.message.edit_text(text[:4000],parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)); await call.answer()
+
+async def render_automation_article(call: CallbackQuery, db: D1Database, article_id:int):
+    rows=await db.execute("SELECT a.*,q.status q_status,q.scheduled_at FROM articles a LEFT JOIN publication_queue q ON q.article_id=a.id WHERE a.id=?",[article_id])
+    if not rows:
+        await call.answer('محتوا پیدا نشد',show_alert=True); return
+    a=rows[0]
+    ch=plain_len(a.get('channel_text') or '')
+    ar=plain_len(a.get('body') or '')
+    text=(f"📰 <b>محتوا #{article_id}</b>\n\n"
+          f"<b>{html.escape(str(a.get('title') or 'بدون عنوان'))}</b>\n\n"
+          f"📌 وضعیت: <b>{html.escape(str(a.get('status') or '-'))}</b>\n"
+          f"⭐ امتیاز: <b>{float(a.get('score') or 0):.1f}</b>\n"
+          f"📥 وضعیت صف: <b>{html.escape(str(a.get('q_status') or 'ندارد'))}</b>\n"
+          f"📏 کانال: <b>{ch}</b> کاراکتر · مقاله: <b>{ar}</b> کاراکتر\n"
+          f"👁 بازشدن Deep Link: <b>{int(a.get('deep_views') or 0)}</b>\n"
+          f"🌐 منبع: <code>{html.escape(str(a.get('source_url') or '-'))}</code>\n\n"
+          "از اینجا می‌توانی محتوای تولیدشده را ببینی، ویرایش یا حذف کنی.")
     kb=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 همین حالا منتشر کن",callback_data="auto_publish_now")],
-        [InlineKeyboardButton(text="🔄 بروزرسانی",callback_data="auto_queue")],
-        [InlineKeyboardButton(text="🔙 اتوماسیون",callback_data="auto_back")]
+        [InlineKeyboardButton(text='👁 مشاهده متن',callback_data=f'auto_art_view_{article_id}')],
+        [InlineKeyboardButton(text='✏️ عنوان',callback_data=f'auto_art_edit_title_{article_id}'),InlineKeyboardButton(text='✏️ متن کانال',callback_data=f'auto_art_edit_channel_{article_id}')],
+        [InlineKeyboardButton(text='✏️ متن کامل',callback_data=f'auto_art_edit_body_{article_id}'),InlineKeyboardButton(text='📊 آمار',callback_data=f'auto_art_stats_{article_id}')],
+        [InlineKeyboardButton(text='🗑 حذف',callback_data=f'auto_art_delete_{article_id}')],
+        [InlineKeyboardButton(text='🔙 '+('صف انتشار' if a.get('q_status')=='queued' else 'محتوای تولیدشده'),callback_data='auto_queue' if a.get('q_status')=='queued' else 'auto_articles')]
     ])
-    await call.message.edit_text(text,parse_mode="HTML",reply_markup=kb); await call.answer()
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=kb); await call.answer()
+
+@router.callback_query(F.data.regexp(r'^auto_art_(\d+)$'))
+async def auto_art_view_callback(call:CallbackQuery,db:D1Database):
+    await render_automation_article(call,db,int(call.data.split('_')[-1]))
+
+@router.callback_query(F.data.regexp(r'^auto_art_view_(\d+)$'))
+async def auto_art_view_text(call:CallbackQuery,db:D1Database,bot:Bot):
+    aid=int(call.data.split('_')[-1]); rows=await db.execute("SELECT title,channel_text,body,status FROM articles WHERE id=?",[aid])
+    if not rows: await call.answer('محتوا پیدا نشد',show_alert=True); return
+    a=rows[0]
+    head=f"📄 <b>{html.escape(str(a.get('title') or ''))}</b>\n\n📢 <b>نسخه کانال:</b>\n{sanitize_telegram_html(a.get('channel_text') or '')}\n\n📖 <b>نسخه کامل:</b>\n"
+    body=sanitize_telegram_html(a.get('body') or '')
+    paragraphs=[x for x in body.split('\n\n') if x.strip()]
+    chunks=[]; cur=head
+    for para in paragraphs:
+        candidate=cur+para+'\n\n'
+        if len(candidate)>3800 and cur.strip()!=head.strip():
+            chunks.append(cur.rstrip()); cur=para+'\n\n'
+        else:
+            cur=candidate
+    if cur.strip(): chunks.append(cur.rstrip())
+    if not chunks: chunks=[head+'(متن کامل خالی است.)']
+    await call.message.edit_text(chunks[0][:4000],parse_mode='HTML',reply_markup=get_admin_back_kb(f'auto_art_{aid}'))
+    for chunk in chunks[1:]:
+        try: await bot.send_message(call.message.chat.id,chunk[:4000],parse_mode='HTML')
+        except Exception: pass
+    await call.answer()
+
+@router.callback_query(F.data.regexp(r'^auto_art_stats_(\d+)$'))
+async def auto_art_stats(call:CallbackQuery,db:D1Database):
+    aid=int(call.data.split('_')[-1]); rows=await db.execute("SELECT a.*,q.status q_status FROM articles a LEFT JOIN publication_queue q ON q.article_id=a.id WHERE a.id=?",[aid])
+    if not rows: await call.answer('محتوا پیدا نشد',show_alert=True); return
+    a=rows[0]
+    text=(f"📊 <b>آمار محتوا #{aid}</b>\n\nعنوان: <b>{html.escape(str(a.get('title') or ''))}</b>\n"
+          f"امتیاز: <b>{float(a.get('score') or 0):.1f}</b>\nوضعیت: <b>{html.escape(str(a.get('status') or '-'))}</b>\n"
+          f"صف: <b>{html.escape(str(a.get('q_status') or 'ندارد'))}</b>\nDeep Link: <b>{int(a.get('deep_views') or 0)} بار</b>\n"
+          f"تولید: <b>{html.escape(str(a.get('created_at') or '-'))}</b>\nانتشار: <b>{html.escape(str(a.get('published_at') or '-'))}</b>")
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=get_admin_back_kb(f'auto_art_{aid}')); await call.answer()
+
+@router.callback_query(F.data.regexp(r'^auto_art_edit_(title|channel|body)_(\d+)$'))
+async def auto_art_edit_start(call:CallbackQuery,state:FSMContext,db:D1Database):
+    if call.from_user.id!=ADMIN_ID:return
+    parts=call.data.split('_'); field=parts[2]; aid=int(parts[3])
+    rows=await db.execute("SELECT title,channel_text,body FROM articles WHERE id=?",[aid])
+    if not rows: await call.answer('محتوا پیدا نشد',show_alert=True); return
+    labels={'title':'عنوان','channel':'متن کانال','body':'متن کامل'}
+    await state.set_state(BotStates.automation_article_edit)
+    await state.update_data(article_edit_id=aid,article_edit_field=field,parent_message_id=call.message.message_id)
+    await call.message.edit_text(f"✏️ <b>ویرایش {labels[field]} #{aid}</b>\n\nمقدار جدید را بفرست.\n\nپیام قبلی پاک نمی‌شود.",parse_mode='HTML',reply_markup=get_exit_menu()); await call.answer()
+
+@router.message(F.chat.id==ADMIN_ID,StateFilter(BotStates.automation_article_edit))
+async def auto_art_edit_input(message:Message,state:FSMContext,db:D1Database,bot:Bot):
+    data=await state.get_data(); aid=int(data['article_edit_id']); field=data['article_edit_field']; value=(message.text or message.caption or '').strip()
+    if not value:
+        await message.answer('❌ مقدار خالی است؛ دوباره بفرست.',reply_markup=get_exit_menu()); return
+    col={'title':'title','channel':'channel_text','body':'body'}[field]
+    if field=='title': value=strip_html_text(value)[:500]
+    elif field=='channel': value=sanitize_telegram_html(value)[:5000]
+    else: value=sanitize_telegram_html(value)[:18000]
+    await db.execute(f"UPDATE articles SET {col}=? WHERE id=?",[value,aid])
+    # اگر پست قبلاً در کانال منتشر شده، تلاش می‌کنیم همان پیام هم اصلاح شود.
+    rows=await db.execute("SELECT published_message_id,status,deep_token,title,channel_text FROM articles WHERE id=?",[aid])
+    if rows and rows[0].get('status')=='published' and rows[0].get('published_message_id'):
+        try:
+            channel_id=await get_channel_id(db); token=rows[0].get('deep_token'); username=await get_runtime_bot_username(bot)
+            deep=f"https://t.me/{username}?start=auto_{token}" if token and username else ''
+            if field in {'title','channel'} and deep:
+                latest=await db.execute("SELECT title,channel_text FROM articles WHERE id=?",[aid])
+                cap=publication_caption(latest[0].get('title') or '',latest[0].get('channel_text') or '',deep)
+                try: await bot.edit_message_caption(chat_id=channel_id,message_id=int(rows[0]['published_message_id']),caption=cap,parse_mode='HTML')
+                except Exception:
+                    try: await bot.edit_message_text(chat_id=channel_id,message_id=int(rows[0]['published_message_id']),text=cap,parse_mode='HTML')
+                    except Exception: pass
+        except Exception: pass
+    await state.set_state(BotStates.idle)
+    # Return to article panel via a fresh bot message to avoid losing the parent navigation.
+    cb=type('C',(),{})(); cb.message=type('M',(),{})(); cb.message.chat=message.chat; cb.message.message_id=data.get('parent_message_id',0)
+    await message.answer(f"✅ {field} محتوای #{aid} ویرایش شد.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📄 مدیریت همین محتوا',callback_data=f'auto_art_{aid}')],[InlineKeyboardButton(text='🔙 محتوا و داده‌ها',callback_data='auto_content_db')]]))
+
+@router.callback_query(F.data.regexp(r'^auto_art_delete_(\d+)$'))
+async def auto_art_delete(call:CallbackQuery):
+    aid=int(call.data.split('_')[-1])
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🗑️ بله، حذف شود',callback_data=f'auto_art_delete_yes_{aid}')],[InlineKeyboardButton(text='↩️ لغو',callback_data=f'auto_art_{aid}')]])
+    await call.message.edit_text(f'⚠️ <b>حذف محتوای #{aid}</b>\n\nاین عمل مقاله، صف و ارتباط آن با منبع را از چرخه دوباره‌کاری خارج می‌کند. ادامه می‌دهی؟',parse_mode='HTML',reply_markup=kb); await call.answer()
+
+@router.callback_query(F.data.regexp(r'^auto_art_delete_yes_(\d+)$'))
+async def auto_art_delete_yes(call:CallbackQuery,db:D1Database):
+    aid=int(call.data.split('_')[-1])
+    await db.execute("UPDATE source_items SET status='discarded',article_id=NULL WHERE article_id=?",[aid])
+    await db.execute("DELETE FROM publication_queue WHERE article_id=?",[aid])
+    await db.execute("DELETE FROM articles WHERE id=?",[aid])
+    await call.message.edit_text('🗑️ <b>محتوا حذف شد.</b>',parse_mode='HTML',reply_markup=automation_content_db_kb()); await call.answer('حذف شد')
+
 
 @router.channel_post()
 async def on_channel_post(message: Message, db: D1Database):
