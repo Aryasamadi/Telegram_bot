@@ -48,10 +48,12 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "7.0.0-operational-speed-final"
+BUILD_VERSION = "8.0.0-rich-content-deeplink-final"
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_AI_WORKERS = 3
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
+AI_PROVIDER_RECHECK_MINUTES = int(os.getenv("AI_PROVIDER_RECHECK_MINUTES", "10"))
+BOT_USERNAME_RUNTIME = ""
 
 # تنظیمات اتصال به Cloudflare D1 REST API
 CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID")
@@ -257,6 +259,7 @@ async def initialize_automation_database(db: D1Database):
         "ALTER TABLE ai_providers ADD COLUMN last_checked_at TEXT",
         "ALTER TABLE ai_providers ADD COLUMN last_latency_ms INTEGER DEFAULT 0",
         "ALTER TABLE ai_providers ADD COLUMN consecutive_failures INTEGER DEFAULT 0",
+        "ALTER TABLE articles ADD COLUMN published_at TEXT",
     ]:
         try:
             await db.execute(sql)
@@ -466,17 +469,27 @@ class SimpleHTMLParser(HTMLParser):
 
 
 async def http_get(url: str, session: aiohttp.ClientSession) -> Tuple[str, str]:
-    headers = {"User-Agent": HTTP_USER_AGENT, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "fa-IR,fa;q=0.9,en-US;q=0.8,en;q=0.7", "Cache-Control": "no-cache"}
-    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
-    async with session.get(url, headers=headers, timeout=timeout, allow_redirects=True) as resp:
-        if resp.status >= 400:
-            raise RuntimeError(f"HTTP {resp.status}")
-        data = await resp.content.read(MAX_HTTP_BYTES + 1)
-        if len(data) > MAX_HTTP_BYTES:
-            raise RuntimeError("response too large")
-        ctype = resp.headers.get("Content-Type", "")
-        enc = resp.charset or "utf-8"
-        return data.decode(enc, errors="ignore"), ctype
+    headers={"User-Agent":HTTP_USER_AGENT,"Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8","Accept-Language":"fa-IR,fa;q=0.9,en-US;q=0.8,en;q=0.7","Cache-Control":"no-cache"}
+    timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
+    last_error=None
+    for attempt in range(3):
+        try:
+            async with session.get(url,headers=headers,timeout=timeout,allow_redirects=True) as resp:
+                if resp.status>=400:
+                    text=await resp.text(errors="ignore")
+                    if resp.status in {429,500,502,503,504} and attempt<2:
+                        await asyncio.sleep(0.5*(attempt+1)); continue
+                    raise RuntimeError(f"HTTP {resp.status}" + (f": {text[:180]}" if resp.status in {429,500,502,503,504} else ""))
+                data=await resp.content.read(MAX_HTTP_BYTES+1)
+                if len(data)>MAX_HTTP_BYTES: raise RuntimeError("response too large")
+                ctype=resp.headers.get("Content-Type",""); enc=resp.charset or "utf-8"
+                return data.decode(enc,errors="ignore"),ctype
+        except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
+            last_error=e
+            if attempt<2:
+                await asyncio.sleep(0.5*(attempt+1)); continue
+            raise RuntimeError(str(e))
+    raise RuntimeError(str(last_error or "request failed"))
 
 
 def local_name(tag: str) -> str:
@@ -643,14 +656,27 @@ async def discover_source_items(source: Dict[str, Any], return_diagnostics: bool
 
     sitemap=urllib.parse.urljoin(base+"/","sitemap.xml")
     try:
-        sm_text,_=await http_get(sitemap,session); root=ET.fromstring(sm_text)
-        locs=[normalize_url(loc.text.strip()) for loc in root.iter() if local_name(loc.tag)=="loc" and loc.text]
-        if local_name(root.tag)=="sitemapindex" or any(local_name(e.tag)=="sitemap" for e in root):
-            child_urls=locs[:4]; expanded=[]
+        sm_text,_=await http_get(sitemap,session)
+        try:
+            root=ET.fromstring(sm_text)
+            locs=[normalize_url(loc.text.strip()) for loc in root.iter() if local_name(loc.tag)=="loc" and loc.text]
+            is_index=(local_name(root.tag)=="sitemapindex" or any(local_name(e.tag)=="sitemap" for e in root))
+        except Exception as xml_error:
+            locs=extract_xml_locs_resilient(sm_text)
+            is_index=bool(re.search(r"<sitemap(?:index)?\b",sm_text,re.I))
+            diagnostics.append(f"⚠️ XML ناقص بود؛ استخراج مقاوم loc انجام شد: {xml_error}")
+        if is_index:
+            child_urls=locs[:6]; expanded=[]
             for child in child_urls:
                 try:
-                    ctext,_=await http_get(child,session); cr=ET.fromstring(ctext)
-                    expanded.extend(normalize_url(loc.text.strip()) for loc in cr.iter() if local_name(loc.tag)=="loc" and loc.text)
+                    ctext,_=await http_get(child,session)
+                    try:
+                        cr=ET.fromstring(ctext)
+                        expanded.extend(normalize_url(loc.text.strip()) for loc in cr.iter() if local_name(loc.tag)=="loc" and loc.text)
+                    except Exception as child_error:
+                        fallback_locs=extract_xml_locs_resilient(ctext)
+                        expanded.extend(fallback_locs)
+                        diagnostics.append(f"⚠️ child sitemap {child}: XML ناقص؛ fallback فعال شد ({child_error})")
                 except Exception as e:
                     diagnostics.append(f"⚠️ child sitemap {child}: {e}")
             locs=expanded or locs
@@ -750,8 +776,9 @@ class AIProviderManager:
         self._session=None
 
     async def providers(self):
+        now=datetime.now(timezone.utc).isoformat()
         return await self.db.execute(
-            "SELECT * FROM ai_providers WHERE enabled=1 AND (status IS NULL OR status!='invalid') ORDER BY priority ASC,id ASC"
+            "SELECT * FROM ai_providers WHERE enabled=1 AND (status IS NULL OR status!='invalid' OR cooldown_until IS NULL OR cooldown_until<=?) ORDER BY priority ASC,id ASC",[now]
         )
 
     @staticmethod
@@ -837,9 +864,14 @@ class AIProviderManager:
         result=await self.test_provider_values(p.get("base_url",""),decrypt_secret(p.get("encrypted_api_key","")),p.get("model_name",""))
         now=datetime.now(timezone.utc).isoformat()
         if result["ok"]:
+            was_unhealthy=bool(p.get("last_error")) or p.get("status") in {"invalid","cooldown"}
             await self.db.execute("UPDATE ai_providers SET status='healthy',last_error=NULL,cooldown_until=NULL,last_checked_at=?,last_latency_ms=?,consecutive_failures=0,updated_at=? WHERE id=?",[now,result.get("latency_ms",0),now,provider_id])
+            if was_unhealthy and self.bot and ADMIN_ID:
+                try: await self.bot.send_message(ADMIN_ID,f"✅ <b>مدل دوباره فعال شد</b>\n\nModel: <code>{html.escape(str(p.get('model_name')))}</code>\nLatency: {result.get('latency_ms',0)}ms",parse_mode="HTML")
+                except Exception: pass
         else:
-            await self.db.execute("UPDATE ai_providers SET status='invalid',last_error=?,last_checked_at=?,updated_at=? WHERE id=?",[result.get("error","")[:1200],now,now,provider_id])
+            cooldown=(datetime.now(timezone.utc)+timedelta(minutes=AI_PROVIDER_RECHECK_MINUTES)).isoformat()
+            await self.db.execute("UPDATE ai_providers SET status='invalid',last_error=?,cooldown_until=?,last_checked_at=?,updated_at=? WHERE id=?",[result.get("error","")[:1200],cooldown,now,now,provider_id])
         return result
 
     @staticmethod
@@ -863,13 +895,17 @@ class AIProviderManager:
             try:
                 content,data,latency,usage=await self._request(p,messages,temperature,max_tokens)
                 t=datetime.now(timezone.utc).isoformat()
+                was_unhealthy=bool(p.get("last_error")) or p.get("status") in {"invalid","cooldown"}
                 await self.db.execute("UPDATE ai_providers SET status='healthy',last_error=NULL,cooldown_until=NULL,last_checked_at=?,last_latency_ms=?,consecutive_failures=0,updated_at=? WHERE id=?",[t,latency,t,p["id"]])
+                if was_unhealthy and self.bot and ADMIN_ID:
+                    try: await self.bot.send_message(ADMIN_ID,f"✅ <b>مدل دوباره فعال شد</b>\n\nModel: <code>{html.escape(str(p.get('model_name')))}</code>\nLatency: {latency}ms",parse_mode="HTML")
+                    except Exception: pass
                 return {"content":content,"provider":p.get("name"),"model":p.get("model_name"),"tokens":usage.get("total_tokens",0) if isinstance(usage,dict) else 0,"error":None}
             except Exception as e:
                 msg=str(e); errors.append(f"{p.get('name')}: {msg[:220]}")
                 kind=self.classify_error(msg)
                 status="invalid" if kind=="invalid" else "cooldown"
-                cd=None if kind=="invalid" else (datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat()
+                cd=(datetime.now(timezone.utc)+timedelta(minutes=AI_PROVIDER_RECHECK_MINUTES if kind=="invalid" else 5)).isoformat()
                 await self.db.execute("UPDATE ai_providers SET status=?,last_error=?,cooldown_until=?,consecutive_failures=COALESCE(consecutive_failures,0)+1,last_checked_at=?,updated_at=? WHERE id=?",[status,msg[:1200],cd,datetime.now(timezone.utc).isoformat(),datetime.now(timezone.utc).isoformat(),p["id"]])
         final=("همه مدل‌ها در cooldown یا نامعتبر هستند." if tried==0 else "تمام مدل‌های قابل استفاده خطا دادند.")+" | "+" | ".join(errors)
         if purpose!="user_chat" and time.time()-self._last_final_notice>600 and self.bot:
@@ -911,37 +947,145 @@ def make_deep_token(article_id: int) -> str:
     return hashlib.sha256(f"techhow-{article_id}-{time.time_ns()}".encode()).hexdigest()[:18]
 
 
+
+class TelegramHTMLSanitizer(HTMLParser):
+    ALLOWED = {"b","strong","i","em","u","s","del","code","pre","blockquote","a","tg-spoiler"}
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out=[]
+    def handle_data(self, data):
+        self.out.append(html.escape(data, quote=False))
+    def handle_starttag(self, tag, attrs):
+        tag=tag.lower()
+        if tag not in self.ALLOWED: return
+        if tag=="a":
+            href=dict(attrs).get("href","")
+            if href.startswith(("https://","http://","tg://")):
+                self.out.append(f'<a href="{html.escape(href,quote=True)}">')
+        else:
+            self.out.append(f"<{tag}>")
+    def handle_startendtag(self, tag, attrs):
+        if tag.lower()=="br": self.out.append("\n")
+    def handle_endtag(self, tag):
+        tag=tag.lower()
+        if tag in self.ALLOWED and tag!="a": self.out.append(f"</{tag}>")
+        elif tag=="a": self.out.append("</a>")
+
+def sanitize_telegram_html(value: str) -> str:
+    value = (value or "").strip()
+    if not value: return ""
+    try:
+        p=TelegramHTMLSanitizer(); p.feed(value); p.close(); return "".join(p.out).strip()
+    except Exception:
+        return html.escape(strip_html_text(value), quote=False)
+
+def plain_len(value: str) -> int:
+    return len(strip_html_text(value or ""))
+
+def rich_channel_fallback(title: str, text: str) -> str:
+    clean=strip_html_text(text or "")
+    if len(clean)>700: clean=clean[:700].rsplit(" ",1)[0]+"…"
+    return f"<b>🔎 {html.escape(title[:180])}</b>\n\n{html.escape(clean)}"
+
+def rich_article_fallback(title: str, text: str, source_url: str) -> str:
+    clean=strip_html_text(text or "")
+    return (f"<b>{html.escape(title[:220])}</b>\n\n"
+            f"{html.escape(clean)}\n\n"
+            f"<blockquote>این مطلب بر پایه اطلاعات منبع تهیه شده؛ جزئیات و زمینه را می‌توانید از متن کامل بخوانید.</blockquote>\n"
+            f"<a href=\"{html.escape(source_url,quote=True)}\">🔗 منبع اصلی</a>")
+
+def make_article_png(width=1280,height=720):
+    # کارت تصویری fallback؛ بدون وابستگی به PIL. برای زمانی که منبع عکس قابل دریافت نیست.
+    raw=bytearray()
+    for y in range(height):
+        raw.append(0)
+        for x in range(width):
+            t=x/(width-1); u=y/(height-1)
+            r=int(18+38*t); g=int(24+50*u); b=int(55+95*(1-t))
+            # الگوی نرم و جذاب برای جلوگیری از پست بدون تصویر
+            glow=max(0,1-(((x-width*.78)/(width*.35))**2+((y-height*.28)/(height*.45))**2))
+            r=min(255,int(r+45*glow)); g=min(255,int(g+30*glow)); b=min(255,int(b+55*glow))
+            raw.extend((r,g,b))
+    def chunk(tag,data):
+        return struct.pack('>I',len(data))+tag+data+struct.pack('>I',zlib.crc32(tag+data)&0xffffffff)
+    return b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',width,height,8,2,0,0,0))+chunk(b'IDAT',zlib.compress(bytes(raw),6))+chunk(b'IEND',b'')
+
+def extract_xml_locs_resilient(text: str) -> List[str]:
+    # بعض سایت‌ها XML ناقص/بزرگ تحویل می‌دهند؛ در این حالت فقط locها را با regex بیرون می‌کشیم.
+    found=[]
+    for m in re.finditer(r"<loc[^>]*>\\s*(.*?)\\s*</loc>", text or "", flags=re.I|re.S):
+        u=html.unescape(re.sub(r"<[^>]+>","",m.group(1)).strip())
+        if u: found.append(normalize_url(u))
+    return [u for u in dict.fromkeys(found) if u]
+
 async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:Dict[str,Any],recent_titles:List[str],weights:Dict[str,float]):
     body=(item.get("body") or item.get("description") or "")[:14000]
-    prompt=f"""تو سردبیر ارشد یک کانال فارسی تکنولوژی، هوش مصنوعی، ابزارها، مدل‌ها و امنیت سایبری هستی.
+    prompt=f"""تو موتور تحریریه و تولید محتوای یک کانال فارسی حرفه‌ای هستی؛ نه قاضی، نه مفسر سیاسی و نه منتقد.
+وظیفه تو این است که از منبع داده‌شده، اگر واقعاً ارزش انتشار داشت، محتوای غنی، دقیق، بی‌طرف و قابل‌فهم بسازی.
+
+موضوعات کانال: فناوری، هوش مصنوعی، ابزارها و مدل‌ها، امنیت سایبری، آموزش و اخبار مهم جهان.
+مخاطب: فارسی‌زبان‌ها، با توجه بیشتر به ایران؛ اما «ایران‌محور بودن» فقط یک امتیاز است و شرط اجباری نیست.
+
 منبع: {source.get('name')}
 عنوان: {item.get('title')}
 URL: {item.get('url')}
-متن:
+متن منبع:
 {body}
 
-وزن معیارها:
+وزن‌های تعیین‌شده توسط مدیر:
 {json.dumps(weights,ensure_ascii=False)}
 
-در همین یک درخواست، ابتدا ارزش خبر را بسنج و سپس فقط در صورت مناسب بودن، محتوای نهایی را تولید کن. «مرتبط بودن با ایران» یک امتیاز است، نه شرط الزامی؛ خبر مهم جهانی حوزه فناوری/AI/امنیت حتی اگر ایران‌محور نباشد می‌تواند پذیرفته شود.
-JSON معتبر:
-{{"accept":true/false,"score":0-100,"category":"ai|tech|cyber|edu|general",
-"iran_relevance":0-10,"freshness":0-10,"reliability":0-10,"duplicate_risk":0-10,
-"why":"...","title":"...","channel_text":"400-600 کاراکتر غنی",
-"article_text":"مقاله عمیق‌تر، مستقل و کامل برای ربات"}}
+اول فقط برای تصمیم داخلی، امتیاز 0 تا 100 بده. این تصمیم نباید وارد متن نهایی شود و نباید با عبارت‌هایی مثل «این خبر مهم است»، «این خبر ارزشمند است»، «ما توصیه می‌کنیم» یا قضاوت شخصی نوشته شود.
+اگر اطلاعات کافی برای تولید دقیق وجود ندارد، accept=false بده.
 
-محتوای کانال باید خبر را توضیح دهد، نه اینکه فقط teaser باشد.
-مقاله ربات باید دید عمیق‌تر بدهد و تکرار channel_text نباشد.
-شایعه، clickbait، تبلیغ کم‌ارزش و ادعای بی‌پشتوانه را رد کن."""
-    result=await ai.call([{"role":"system","content":"Strict Persian technology editor. JSON only."},{"role":"user","content":prompt}],0.25,4200,"editorial")
+اگر accept=true، همزمان محتوای نهایی را تولید کن:
+1) channel_html: حدود 450 تا 650 کاراکتر متن واقعی خبر؛ نه teaser. جذاب، دوستانه، عامیانه و طبیعی فارسی باشد. می‌تواند از <b>، <i>، <u>، <blockquote> و ایموجی مرتبط استفاده کند.
+2) article_html: حدود 1600 تا 2600 کاراکتر، در صورت نیاز بیشتر؛ محتوایی مستقل‌تر و عمیق‌تر از متن کانال، با زمینه، اتفاق اصلی، جزئیات مهم، اثر احتمالی، کاربرد یا پیامد برای کاربر و ایران در صورت ارتباط. تکرار متن کانال نباشد.
+3) title: کوتاه، جذاب و غیرکلیک‌بیتی.
+4) category و facts.
+
+قواعد نگارش:
+- فارسی روان، دوستانه، عامیانه و خوش‌خوان؛ رسمی و خشک نباش.
+- اگر اصطلاح فنی لازم است، معادل فارسی + اصطلاح انگلیسی را بیاور.
+- از ایموجی کم اما دقیق و مرتبط استفاده کن.
+- هیچ نتیجه‌گیری شخصی یا قضاوتی به کاربر تحمیل نکن.
+- «طبق منبع»، «گزارش شده» و «این شرکت گفته» را فقط وقتی لازم است برای نسبت‌دادن ادعا استفاده کن.
+- چیزی را که در منبع نیست به عنوان واقعیت نساز.
+- channel_html و article_html را با HTML سازگار با Telegram بده؛ Markdown استفاده نکن.
+- لینک منبع را خودت داخل channel_html یا article_html قرار نده؛ برنامه آن را اضافه می‌کند.
+
+فقط JSON معتبر:
+{{"accept":true/false,"score":0-100,"global_relevance":0-10,"technology_relevance":0-10,"ai_relevance":0-10,"cyber_relevance":0-10,"education_relevance":0-10,"iran_relevance":0-10,"freshness":0-10,"reliability":0-10,"duplicate_risk":0-10,"category":"ai|tech|cyber|edu|general","why":"دلیل داخلی کوتاه","title":"...","channel_html":"...","article_html":"...","facts":["..."]}}"""
+    result=await ai.call([{"role":"system","content":"You are a Persian technology content producer. Be neutral and factual. Return JSON only."},{"role":"user","content":prompt}],0.35,5000,"editorial")
     obj=parse_json_object(result.get("content",""))
-    if obj:
-        return {**obj,"ai":result}
-    # یک retry کوتاه فقط برای پاسخ خراب JSON؛ نه برای خطاهای Provider که خود Manager failover کرده است.
-    repair_prompt=("پاسخ زیر را به JSON معتبر تبدیل کن. هیچ توضیحی خارج JSON ننویس. فیلدها: accept,score,category,iran_relevance,freshness,reliability,duplicate_risk,why,title,channel_text,article_text.\n\n"+str(result.get('content',''))[:12000])
-    retry=await ai.call([{"role":"system","content":"Return valid JSON only."},{"role":"user","content":repair_prompt}],0,3200,"editorial_json_repair")
-    obj=parse_json_object(retry.get("content",""))
-    return ({**obj,"ai":retry} if obj else {"error":"پاسخ AI JSON معتبر نبود","ai":retry})
+    if not obj:
+        repair_prompt=("پاسخ زیر را فقط به JSON معتبر تبدیل کن؛ محتوای آن را تغییر نده. فیلدها: accept,score,category,iran_relevance,freshness,reliability,duplicate_risk,why,title,channel_html,article_html,facts.\n\n"+str(result.get("content",""))[:14000])
+        retry=await ai.call([{"role":"system","content":"Return valid JSON only."},{"role":"user","content":repair_prompt}],0,4200,"editorial_json_repair")
+        obj=parse_json_object(retry.get("content","")); result=retry
+    if not obj: return {"error":"پاسخ AI JSON معتبر نبود","ai":result}
+    # اگر مدل فیلدهای HTML را نساخته بود، از متن معمولی fallback می‌سازیم.
+    ch=sanitize_telegram_html(obj.get("channel_html") or obj.get("channel_text") or "")
+    ar=sanitize_telegram_html(obj.get("article_html") or obj.get("article_text") or "")
+    title=strip_html_text(obj.get("title") or item.get("title") or "")[:240]
+    if not ch: ch=rich_channel_fallback(title, obj.get("channel_text") or obj.get("article_text") or body)
+    if not ar: ar=rich_article_fallback(title, body, item.get("url") or "")
+    obj["title"]=title; obj["channel_html"]=ch; obj["article_html"]=ar
+    # امتیاز نهایی را خود ربات از وزن‌های مدیر محاسبه می‌کند؛ بنابراین تغییر وزن واقعاً اثر دارد.
+    dims={
+        "global":float(obj.get("global_relevance",5) or 0),
+        "technology":float(obj.get("technology_relevance",5) or 0),
+        "ai":float(obj.get("ai_relevance",5) or 0),
+        "cyber":float(obj.get("cyber_relevance",5) or 0),
+        "education":float(obj.get("education_relevance",5) or 0),
+        "iran":float(obj.get("iran_relevance",0) or 0),
+        "freshness":float(obj.get("freshness",5) or 0),
+        "source":max(0,min(10,float(source.get("trust_score") or 80)/10)),
+        "novelty":10-max(0,min(10,float(obj.get("duplicate_risk",0) or 0)))
+    }
+    total_weight=sum(max(0,float(weights.get(k,0))) for k in dims)
+    weighted=sum(max(0,min(10,v))*max(0,float(weights.get(k,0))) for k,v in dims)
+    obj["score"]=round((weighted/(total_weight*10))*100,1) if total_weight else round(float(obj.get("score",0) or 0),1)
+    return {**obj,"ai":result}
 
 async def add_source(db: D1Database, url: str, category: str = "tech", interval_minutes: Optional[int] = None, priority: int = 5) -> int:
     clean = normalize_url(url)
@@ -1003,10 +1147,13 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                     verify=await ai_verify_content(ai,item,out)
                     if not verify.get("ok") or float(verify.get("confidence",0) or 0)<80:
                         await db.execute("UPDATE source_items SET status='rejected',score=?,last_error=? WHERE id=?",[score,json.dumps(verify,ensure_ascii=False)[:1000],item_id]); return 1
-                article_text=strip_html_text(out.get("article_text") or "")
-                channel_text=strip_html_text(out.get("channel_text") or "")[:900]
+                article_text=sanitize_telegram_html(out.get("article_html") or out.get("article_text") or "")
+                channel_text=sanitize_telegram_html(out.get("channel_html") or out.get("channel_text") or "")
                 title_out=strip_html_text(out.get("title") or title)[:500]
-                if len(article_text)<500:
+                if plain_len(channel_text)>780: channel_text=rich_channel_fallback(title_out, channel_text)
+                if plain_len(article_text)<1200: article_text=rich_article_fallback(title_out, article_text, url)
+                if plain_len(article_text)>4200: article_text=html.escape(strip_html_text(article_text)[:4200])
+                if plain_len(article_text)<900:
                     await db.execute("UPDATE source_items SET status='rejected',last_error='article too short' WHERE id=?",[item_id]); return 1
                 art=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at) VALUES(?,?,?,?,?,?,?,?, 'ready',?) RETURNING id",
                     [item_id,title_out,channel_text,article_text[:18000],url,item.get("image_url",""),out.get("category") or source.get("category","tech"),score,now.isoformat()])
@@ -1035,7 +1182,7 @@ async def can_publish_now(db: D1Database) -> bool:
     end_h = int(await get_setting(db, "publish_end_hour", str(DEFAULT_PUBLISH_END_HOUR)))
     if not (start_h <= tehran.hour <= end_h):
         return False
-    count_rows = await db.execute("SELECT COUNT(*) as c FROM articles WHERE status='published' AND created_at >= ?", [tehran.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()])
+    count_rows = await db.execute("SELECT COUNT(*) as c FROM articles WHERE status='published' AND COALESCE(published_at,created_at) >= ?", [tehran.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()])
     max_daily = int(await get_setting(db, "max_daily_posts", str(DEFAULT_MAX_DAILY_POSTS)))
     if (count_rows[0].get("c", 0) if count_rows else 0) >= max_daily:
         return False
@@ -1054,51 +1201,85 @@ async def can_publish_now(db: D1Database) -> bool:
     return True
 
 
-async def publish_next_article(db: D1Database, bot: Bot) -> bool:
-    if not await can_publish_now(db):
+async def get_runtime_bot_username(bot: Bot) -> str:
+    global BOT_USERNAME_RUNTIME
+    if BOT_USERNAME_RUNTIME:
+        return BOT_USERNAME_RUNTIME
+    try:
+        me=await bot.get_me()
+        BOT_USERNAME_RUNTIME=me.username or BOT_USERNAME.lstrip("@")
+    except Exception:
+        BOT_USERNAME_RUNTIME=BOT_USERNAME.lstrip("@")
+    return BOT_USERNAME_RUNTIME
+
+async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> bool:
+    if force:
+        channel_id=await get_channel_id(db)
+        if not channel_id: return False
+        max_daily=int(await get_setting(db,"max_daily_posts",str(DEFAULT_MAX_DAILY_POSTS)))
+        tehran=datetime.now(pytz.timezone("Asia/Tehran"))
+        count_rows=await db.execute("SELECT COUNT(*) c FROM articles WHERE status='published' AND COALESCE(published_at,created_at) >= ?",[tehran.replace(hour=0,minute=0,second=0,microsecond=0).astimezone(timezone.utc).isoformat()])
+        if (count_rows[0].get("c",0) if count_rows else 0)>=max_daily: return False
+    elif not await can_publish_now(db):
         return False
-    rows = await db.execute("SELECT q.id as queue_id, q.article_id, a.* FROM publication_queue q JOIN articles a ON a.id=q.article_id WHERE q.status='queued' AND a.status='ready' ORDER BY a.score DESC, q.created_at ASC LIMIT 1")
+    now_iso=datetime.now(timezone.utc).isoformat()
+    schedule_filter="" if force else " AND (q.scheduled_at IS NULL OR q.scheduled_at <= ?)"
+    params=[now_iso] if not force else []
+    rows=await db.execute("SELECT q.id as queue_id,q.article_id,a.* FROM publication_queue q JOIN articles a ON a.id=q.article_id WHERE q.status='queued' AND a.status='ready'"+schedule_filter+" ORDER BY a.score DESC,q.created_at ASC LIMIT 1",params)
     if not rows:
         return False
-    row = rows[0]
-    queue_id = row["queue_id"]
-    article_id = row["article_id"]
-    await db.execute("UPDATE publication_queue SET status='publishing', attempts=attempts+1 WHERE id=?", [queue_id])
+    row=rows[0]; queue_id=row["queue_id"]; article_id=row["article_id"]
+    await db.execute("UPDATE publication_queue SET status='publishing',attempts=attempts+1 WHERE id=?",[queue_id])
     try:
-        token = row.get("deep_token")
-        bot_username = BOT_USERNAME.lstrip("@")
-        deep_link = f"https://t.me/{bot_username}?start=auto_{token}"
-        channel_id = await get_channel_id(db)
-        channel_text = html.escape(row.get("channel_text") or row.get("title") or "")
-        channel_text += f"\n\n<a href=\"{html.escape(deep_link)}\">📖 بیشتر بخوانید</a>"
-        image_url = row.get("image_url") or ""
-        sent = None
+        token=row.get("deep_token")
+        bot_username=await get_runtime_bot_username(bot)
+        if not token or not bot_username: raise RuntimeError("deep link token یا نام کاربری ربات تنظیم نشده است")
+        deep_link=f"https://t.me/{bot_username}?start=auto_{token}"
+        channel_id=await get_channel_id(db)
+        channel_text=sanitize_telegram_html(row.get("channel_text") or row.get("title") or "")
+        channel_text += f"\n\n<a href=\"{html.escape(deep_link,quote=True)}\">📖 بیشتر بخوانید</a>"
+        image_url=row.get("image_url") or ""
+        sent=None
         if image_url:
             try:
-                sent = await bot.send_photo(chat_id=channel_id, photo=image_url, caption=channel_text[:1024], parse_mode="HTML")
-            except Exception:
-                sent = None
+                sent=await bot.send_photo(chat_id=channel_id,photo=image_url,caption=channel_text[:1024],parse_mode="HTML")
+            except Exception as img_error:
+                await log_automation(db,"WARN","source_image_failed",f"article={article_id} {img_error}")
         if sent is None:
-            sent = await bot.send_message(chat_id=channel_id, text=channel_text[:4096], parse_mode="HTML", disable_web_page_preview=False)
-        published_at = datetime.now(timezone.utc).isoformat()
-        await db.execute("UPDATE articles SET status='published', published_message_id=? WHERE id=?", [getattr(sent, "message_id", 0), article_id])
-        await db.execute("UPDATE publication_queue SET status='published', published_at=? WHERE id=?", [published_at, queue_id])
-        await log_automation(db, "INFO", "published", f"article={article_id} message={getattr(sent,'message_id',0)}")
+            try:
+                sent=await bot.send_photo(chat_id=channel_id,photo=BufferedInputFile(make_article_png(),filename="tech-content-card.png"),caption=channel_text[:1024],parse_mode="HTML")
+            except Exception:
+                sent=await bot.send_message(chat_id=channel_id,text=channel_text[:4096],parse_mode="HTML",disable_web_page_preview=False)
+        published_at=datetime.now(timezone.utc).isoformat()
+        await db.execute("UPDATE articles SET status='published',published_message_id=?,published_at=? WHERE id=?",[getattr(sent,"message_id",0),published_at,article_id])
+        await db.execute("UPDATE publication_queue SET status='published',published_at=? WHERE id=?",[published_at,queue_id])
+        await log_automation(db,"INFO","published",f"article={article_id} message={getattr(sent,'message_id',0)} force={force}")
         return True
     except Exception as e:
-        await db.execute("UPDATE publication_queue SET status='failed', last_error=? WHERE id=?", [str(e)[:1500], queue_id])
-        await db.execute("UPDATE articles SET status='ready' WHERE id=?", [article_id])
-        await log_automation(db, "ERROR", "publication_failed", f"article={article_id} {e}")
-        try:
-            await bot.send_message(ADMIN_ID, f"❌ خطا در انتشار خودکار\nArticle: {article_id}\nError: {html.escape(str(e)[:800])}")
-        except Exception:
-            pass
+        await db.execute("UPDATE publication_queue SET status='failed',last_error=? WHERE id=?",[str(e)[:1500],queue_id])
+        await db.execute("UPDATE articles SET status='ready' WHERE id=?",[article_id])
+        await log_automation(db,"ERROR","publication_failed",f"article={article_id} {e}")
+        try: await bot.send_message(ADMIN_ID,f"❌ خطا در انتشار خودکار\nArticle: {article_id}\nError: {html.escape(str(e)[:800])}")
+        except Exception: pass
         return False
 
+async def recheck_failed_providers(db:D1Database,bot:Bot,manager:AIProviderManager):
+    now=datetime.now(timezone.utc).isoformat()
+    rows=await db.execute("SELECT id,name,model_name,status,cooldown_until FROM ai_providers WHERE enabled=1 AND status IN ('invalid','cooldown') AND (cooldown_until IS NULL OR cooldown_until <= ?) ORDER BY priority ASC LIMIT 8",[now])
+    for p in rows:
+        try:
+            result=await manager.test_provider(int(p["id"]))
+            if result.get("ok"):
+                try:
+                    await bot.send_message(ADMIN_ID,f"✅ <b>مدل دوباره در دسترس است</b>\n\nProvider: {html.escape(str(p.get('name')))}\nModel: <code>{html.escape(str(p.get('model_name')))}</code>\nLatency: {result.get('latency_ms',0)}ms",parse_mode="HTML")
+                except Exception: pass
+        except Exception as e:
+            await log_automation(db,"ERROR","provider_recheck_failed",f"provider={p.get('id')} {e}")
 
 async def automation_loop(db: D1Database, bot: Bot):
     ai = AIProviderManager(db, bot)
     last_cleanup = 0.0
+    last_provider_recheck = 0.0
     try:
         while True:
             try:
@@ -1114,6 +1295,9 @@ async def automation_loop(db: D1Database, bot: Bot):
                     if due_sources:
                         await asyncio.gather(*(run_source(src) for src in due_sources), return_exceptions=True)
                     await publish_next_article(db, bot)
+                if time.time() - last_provider_recheck > AI_PROVIDER_RECHECK_MINUTES*60:
+                    await recheck_failed_providers(db,bot,ai)
+                    last_provider_recheck = time.time()
                 if time.time() - last_cleanup > 3600:
                     await cleanup_automation_data(db)
                     last_cleanup = time.time()
@@ -1136,7 +1320,7 @@ async def automation_report(db: D1Database) -> str:
     sources = await db.execute("SELECT COUNT(*) as c FROM sources WHERE enabled=1")
     new_items = await db.execute("SELECT COUNT(*) as c FROM source_items WHERE discovered_at >= ?", [(datetime.now(timezone.utc) - timedelta(days=1)).isoformat()])
     queued = await db.execute("SELECT COUNT(*) as c FROM publication_queue WHERE status='queued'")
-    published = await db.execute("SELECT COUNT(*) as c FROM articles WHERE status='published' AND created_at >= ?", [datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()])
+    published = await db.execute("SELECT COUNT(*) as c FROM articles WHERE status='published' AND COALESCE(published_at,created_at) >= ?", [datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()])
     failed = await db.execute("SELECT COUNT(*) as c FROM publication_queue WHERE status='failed' AND created_at >= ?", [(datetime.now(timezone.utc) - timedelta(days=1)).isoformat()])
     channel = await get_channel_id(db)
     channel_label = await get_setting(db, 'channel_username', '') or ('کانال خصوصی تنظیم شده' if channel else '')
@@ -1576,13 +1760,33 @@ async def cmd_start(message: Message, state: FSMContext, db: D1Database, bot: Bo
         deep_arg = args[1]
         if deep_arg.startswith("auto_"):
             token = deep_arg[5:]
-            article_rows = await db.execute("SELECT * FROM articles WHERE deep_token=? AND status='published'", [token])
+            article_rows = await db.execute("SELECT * FROM articles WHERE deep_token=? AND status IN ('ready','published')", [token])
             if article_rows:
                 article = article_rows[0]
-                text = f"<b>{html.escape(article.get('title') or '')}</b>\n\n{html.escape(article.get('body') or '')}\n\n<a href=\"{html.escape(article.get('source_url') or '')}\">🔗 منبع اصلی</a>"
+                body_html=sanitize_telegram_html(article.get('body') or '')
+                title_html=f"<b>{html.escape(article.get('title') or '')}</b>"
+                source_html=f"<a href=\"{html.escape(article.get('source_url') or '',quote=True)}\">🔗 منبع اصلی</a>"
+                full_text=f"{title_html}\n\n{body_html}\n\n{source_html}"
                 await db.execute("UPDATE posts SET views = views + 1 WHERE id = (SELECT id FROM posts WHERE text LIKE ? LIMIT 1)", [f"%{article.get('title') or ''}%"])
-                for i in range(0, len(text), 3800):
-                    await message.answer(text[i:i+3800], parse_mode="HTML", disable_web_page_preview=True)
+                image=article.get('image_url') or ''
+                sent_photo=False
+                if image:
+                    try:
+                        first=full_text[:1000]
+                        await bot.send_photo(message.chat.id,photo=image,caption=first,parse_mode="HTML")
+                        sent_photo=True
+                        rest=full_text[1000:]
+                        if rest: 
+                            for i in range(0,len(rest),3800): await message.answer(rest[i:i+3800],parse_mode="HTML",disable_web_page_preview=True)
+                    except Exception: sent_photo=False
+                if not sent_photo:
+                    try:
+                        await bot.send_photo(message.chat.id,photo=BufferedInputFile(make_article_png(),filename="tech-content-card.png"),caption=full_text[:1000],parse_mode="HTML")
+                        rest=full_text[1000:]
+                        if rest:
+                            for i in range(0,len(rest),3800): await message.answer(rest[i:i+3800],parse_mode="HTML",disable_web_page_preview=True)
+                    except Exception:
+                        for i in range(0,len(full_text),3800): await message.answer(full_text[i:i+3800],parse_mode="HTML",disable_web_page_preview=True)
                 admin_mode = state_data.get("admin_mode", "user")
                 await message.answer("👇 منوی اصلی:", reply_markup=get_admin_menu() if (user_id == ADMIN_ID and admin_mode != "user") else get_main_menu())
                 return
@@ -2071,7 +2275,7 @@ async def process_unknown_commands(message: Message, state: FSMContext):
 async def admin_add_source_input(message: Message, state: FSMContext, db: D1Database, bot: Bot):
     url = (message.text or "").strip()
     if not url or not re.match(r"^https?://", url, re.I):
-        await message.answer("❌ URL معتبر نیست. نمونه:\nhttps://example.com")
+        await message.answer("❌ URL معتبر نیست. نمونه:\nhttps://example.com",reply_markup=get_exit_menu())
         return
     try:
         source_id = await add_source(db, url)
@@ -2087,7 +2291,7 @@ async def admin_add_source_input(message: Message, state: FSMContext, db: D1Data
                 pass
         await message.answer(f"✅ منبع با موفقیت اضافه شد.\nشناسه: {source_id}", reply_markup=source_list_kb(rows))
     except Exception as e:
-        await message.answer(f"❌ افزودن منبع ناموفق بود:\n{html.escape(str(e))}")
+        await message.answer(f"❌ افزودن منبع ناموفق بود:\n{html.escape(str(e))}",reply_markup=get_exit_menu())
 
 
 
@@ -2119,6 +2323,14 @@ async def admin_automation_setting_input(message:Message,state:FSMContext,db:D1D
         elif key=="ai_verify_mode":
             if value not in {"auto","always","off"}: raise ValueError("auto / always / off")
             await set_setting(db,key,value); parent="auto_schedule"
+        elif key=="__publish_delay__":
+            delay=max(0,min(10080,int(value)))
+            row=await db.execute("SELECT article_id FROM publication_queue WHERE status='queued' ORDER BY score DESC,created_at ASC LIMIT 1")
+            if not row: raise ValueError("صف انتشار خالی است")
+            # برنامه‌ریزی دستی فقط همان اولین آیتم آماده را جابه‌جا می‌کند.
+            when=(datetime.now(timezone.utc)+timedelta(minutes=delay)).isoformat()
+            await db.execute("UPDATE publication_queue SET scheduled_at=? WHERE article_id=? AND status='queued'",[when,row[0]['article_id']])
+            parent="auto_channel"
         else:
             raise ValueError("setting not supported")
         await state.set_state(BotStates.idle)
@@ -2144,12 +2356,20 @@ async def admin_automation_setting_input(message:Message,state:FSMContext,db:D1D
                 sid=int(parent.rsplit("_",1)[1]); await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text="✅ تنظیم منبع ذخیره شد.",reply_markup=get_admin_back_kb(parent))
             elif parent.startswith("provider_view_"):
                 pid=int(parent.rsplit("_",1)[1]); await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text="✅ تنظیم مدل ذخیره شد.",reply_markup=get_admin_back_kb(parent))
+            elif parent=="auto_channel":
+                fake=type("FakeCall",(),{"message":type("FakeMessage",(),{"edit_text":lambda self,*a,**kw: None})()})()
+                # پنل اصلی را در همان پیام با داده فعلی بازسازی می‌کنیم.
+                channel_id=await get_channel_id(db); channel_username=await get_setting(db,'channel_username',''); shown=html.escape(channel_username) if channel_username else ('✅ کانال خصوصی تنظیم شده' if channel_id else '⛔ تنظیم نشده')
+                enabled=(await get_setting(db,'automation_enabled','0'))=='1'
+                text='📢 <b>کانال و انتشار</b>\n\n'+f'کانال فعلی: {shown}\nاتوماسیون: {"🟢 فعال" if enabled else "🔴 خاموش"}'
+                kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📢 تنظیم/تغییر کانال',callback_data='auto_channel_set')],[InlineKeyboardButton(text='🚀 همین حالا منتشر کن',callback_data='publish_now')],[InlineKeyboardButton(text='⏱ زمان‌بندی انتشار',callback_data='publish_schedule')],[InlineKeyboardButton(text='🧪 تست کانال',callback_data='channel_test')],[InlineKeyboardButton(text='🔙 اتوماسیون محتوا',callback_data='auto_back')]])
+                await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text=text,parse_mode='HTML',reply_markup=kb)
             else:
                 await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text="✅ ذخیره شد.",reply_markup=get_admin_menu())
         else:
             await message.answer("✅ ذخیره شد.",reply_markup=get_admin_menu())
     except Exception as e:
-        await message.answer(f"❌ مقدار نامعتبر است: {html.escape(str(e))}")
+        await message.answer(f"❌ مقدار نامعتبر است: {html.escape(str(e))}",reply_markup=get_exit_menu())
 
 
 async def render_admin_home(call: CallbackQuery, db: D1Database):
@@ -2267,6 +2487,8 @@ async def render_channel_panel(call: CallbackQuery, db: D1Database):
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='📢 تنظیم/تغییر کانال', callback_data='auto_channel_set')],
+        [InlineKeyboardButton(text='🚀 همین حالا منتشر کن', callback_data='publish_now')],
+        [InlineKeyboardButton(text='⏱ زمان‌بندی انتشار', callback_data='publish_schedule')],
         [InlineKeyboardButton(text='🧪 تست کانال', callback_data='channel_test')],
         [InlineKeyboardButton(text='🔙 اتوماسیون محتوا', callback_data='auto_back')]
     ])
@@ -2290,6 +2512,24 @@ async def auto_channel_set(call: CallbackQuery, state: FSMContext, db: D1Databas
         'ربات باید در کانال ادمین باشد و اجازه انتشار پیام داشته باشد.',
         parse_mode='HTML', reply_markup=get_exit_menu())
     await call.answer()
+
+@router.callback_query(F.data == "publish_now")
+async def publish_now(call: CallbackQuery, db:D1Database, bot:Bot):
+    if call.from_user.id!=ADMIN_ID: return
+    await call.answer("🚀 در حال انتشار…")
+    try:
+        ok=await publish_next_article(db,bot,force=True)
+        msg="✅ اولین محتوای آماده همین حالا منتشر شد." if ok else "⏸ محتوای آماده‌ای برای انتشار نیست یا سقف روزانه پر شده است."
+    except Exception as e:
+        msg="❌ انتشار دستی شکست خورد:\n"+html.escape(str(e)[:1200])
+    await call.message.edit_text(msg,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 کانال و انتشار",callback_data="auto_channel")]]))
+
+@router.callback_query(F.data == "publish_schedule")
+async def publish_schedule(call:CallbackQuery,state:FSMContext):
+    if call.from_user.id!=ADMIN_ID:return
+    await state.set_state(BotStates.admin_automation_setting)
+    await state.update_data(automation_setting_key="__publish_delay__",panel_message_id=call.message.message_id,parent_callback="auto_channel")
+    await call.message.edit_text("⏱ <b>زمان‌بندی انتشار</b>\n\nچند دقیقه دیگر منتشر شود؟\n\n0 = همین حالا\n2 = دو دقیقه دیگر\n10 = ده دقیقه دیگر\nمثلاً 30",parse_mode="HTML",reply_markup=get_exit_menu()); await call.answer()
 
 @router.callback_query(F.data == "channel_test")
 async def channel_test(call: CallbackQuery, db: D1Database, bot: Bot):
@@ -2326,7 +2566,7 @@ async def admin_channel_input(message: Message, state: FSMContext, db: D1Databas
         member = await bot.get_chat_member(chat.id, me.id)
         status = str(getattr(member, 'status', ''))
         if status not in {'administrator', 'creator'}:
-            await message.answer('❌ ربات در این کانال ادمین نیست یا دسترسی کافی ندارد.')
+            await message.answer('❌ ربات در این کانال ادمین نیست یا دسترسی کافی ندارد. ورودی قبلی باقی است؛ دوباره آیدی/username را بفرست.',reply_markup=get_exit_menu())
             return
         await set_setting(db, 'channel_id', str(chat.id))
         await set_setting(db, 'channel_username', '@' + chat.username if getattr(chat, 'username', None) else '')
@@ -2342,19 +2582,29 @@ async def admin_channel_input(message: Message, state: FSMContext, db: D1Databas
         else:
             await message.answer(text,parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔙 کانال و انتشار',callback_data='auto_channel')]]))
     except Exception as e:
-        await message.answer(f"❌ نتوانستم کانال را تأیید کنم:\n{html.escape(str(e)[:1000])}\n\nآیدی/@username را دوباره بفرست.")
+        await message.answer(f"❌ نتوانستم کانال را تأیید کنم:\n{html.escape(str(e)[:1000])}\n\nآیدی/@username را دوباره بفرست.",reply_markup=get_exit_menu())
 
 
 @router.callback_query(F.data == "cancel_state")
 async def cancel_state(call: CallbackQuery, state: FSMContext, db: D1Database):
+    data=await state.get_data(); parent=data.get("parent_callback") or "admin_home"
     await state.set_state(BotStates.idle)
-    await state.update_data(panel_message_id=None, provider_base_url=None, provider_token=None, provider_edit_id=None)
-    if call.from_user.id == ADMIN_ID:
-        await render_admin_home(call, db)
+    await state.update_data(panel_message_id=None,provider_base_url=None,provider_token=None,provider_edit_id=None)
+    try:
+        if parent=="auto_schedule": await auto_schedule(call,db); return
+        if parent=="auto_quality": await auto_quality(call,db); return
+        if parent=="quality_weights": await quality_weights(call,db); return
+        if parent=="auto_channel": await render_channel_panel(call,db); return
+        if parent=="auto_providers": await auto_providers(call,db); return
+        if parent.startswith("provider_view_"): await provider_view(call,db); return
+        if parent.startswith("source_view_"): await source_view(call,db); return
+        if parent=="auto_sources": await auto_sources(call,db); return
+    except Exception:
+        pass
+    if call.from_user.id==ADMIN_ID:
+        await render_admin_home(call,db)
     else:
-        await call.message.edit_text("لغو شد.", reply_markup=get_main_menu())
-        await call.answer('لغو شد')
-
+        await call.message.edit_text("لغو شد.",reply_markup=get_main_menu()); await call.answer("لغو شد")
 
 @router.callback_query(F.data == "user_home")
 async def user_home(call: CallbackQuery):
@@ -2504,7 +2754,7 @@ async def source_priority(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("source_interval_"))
 async def source_interval(call: CallbackQuery, state: FSMContext):
     source_id = int(call.data.split("_")[-1])
-    await state.update_data(source_interval_id=source_id)
+    await state.update_data(source_interval_id=source_id,panel_message_id=call.message.message_id,parent_callback=f"source_view_{source_id}")
     await state.set_state(BotStates.admin_automation_setting)
     await state.update_data(automation_setting_key="__source_interval__")
     await call.message.edit_text("فاصله بررسی را به دقیقه بفرست. مثلاً 15", reply_markup=get_exit_menu())
@@ -2520,11 +2770,15 @@ async def source_test(call: CallbackQuery, db: D1Database):
     await call.answer("در حال بررسی...", show_alert=True)
     # برای تست دستی، از یک provider واقعی استفاده می‌کنیم ولی در DB فقط state منبع ثبت می‌شود.
     try:
-        items = await discover_source_items(rows[0])
-        await call.message.answer(f"✅ تست منبع موفق بود. {len(items)} محتوای احتمالی پیدا شد.")
+        diag=await discover_source_items(rows[0],return_diagnostics=True)
+        if diag.get("items"):
+            text=f"✅ <b>تست منبع موفق بود.</b>\n\nروش: <code>{html.escape(str(diag.get('method')))}</code>\nآیتم قابل بررسی: {len(diag.get('items',[]))}"
+        else:
+            text="❌ <b>منبع فعلاً قابل دریافت نیست.</b>\n\n"+html.escape(str(diag.get('error','بدون نتیجه'))[:1800])
+        await call.message.edit_text(text,parse_mode='HTML',reply_markup=get_admin_back_kb(f"source_view_{source_id}"))
     except Exception as e:
         await db.execute("UPDATE sources SET last_error=? WHERE id=?", [str(e)[:1000], source_id])
-        await call.message.answer(f"❌ تست منبع ناموفق:\n{html.escape(str(e))}")
+        await call.message.edit_text(f"❌ تست منبع ناموفق:\n{html.escape(str(e))}",reply_markup=get_admin_back_kb(f"source_view_{source_id}"))
 
 
 @router.callback_query(F.data == "auto_providers")
@@ -2543,7 +2797,7 @@ async def auto_providers(call: CallbackQuery, db: D1Database):
 @router.callback_query(F.data == "auto_add_provider")
 async def auto_add_provider(call: CallbackQuery, state: FSMContext):
     await state.set_state(BotStates.admin_add_provider)
-    await state.update_data(provider_draft={})
+    await state.update_data(provider_draft={},parent_callback="auto_providers",panel_message_id=call.message.message_id)
     await call.message.edit_text(
         "🤖 افزودن مدل جدید\n\n"
         "مرحله ۱ از ۳\n"
@@ -2558,7 +2812,7 @@ async def auto_add_provider(call: CallbackQuery, state: FSMContext):
 async def provider_base_input(message: Message, state: FSMContext, bot: Bot):
     base_url = (message.text or '').strip()
     if not re.match(r'^https?://', base_url, re.I):
-        await message.answer("❌ Base URL معتبر نیست. باید با http:// یا https:// شروع شود.")
+        await message.answer("❌ Base URL معتبر نیست. باید با http:// یا https:// شروع شود.",reply_markup=get_exit_menu())
         return
     data = await state.get_data()
     panel_id = data.get('panel_message_id')
@@ -2578,7 +2832,7 @@ async def provider_base_input(message: Message, state: FSMContext, bot: Bot):
 async def provider_token_input(message: Message, state: FSMContext, bot: Bot):
     token = (message.text or '').strip()
     if len(token) < 4:
-        await message.answer("❌ توکن خیلی کوتاه است. دوباره ارسال کنید.")
+        await message.answer("❌ توکن خیلی کوتاه است. دوباره ارسال کنید.",reply_markup=get_exit_menu())
         return
     data = await state.get_data()
     panel_id = data.get('panel_message_id')
@@ -2601,7 +2855,7 @@ async def provider_model_input(message: Message, state: FSMContext, db: D1Databa
     base_url = data.get('provider_base_url','')
     token = data.get('provider_token','')
     if not model:
-        await message.answer("❌ نام مدل خالی است.")
+        await message.answer("❌ نام مدل خالی است.",reply_markup=get_exit_menu())
         return
     panel_id = data.get('panel_message_id')
     if panel_id:
@@ -2617,14 +2871,21 @@ async def provider_model_input(message: Message, state: FSMContext, db: D1Databa
     finally:
         await tester.close()
     if not result.get('ok'):
+        parent=data.get("parent_callback","auto_providers")
+        panel_id=data.get("panel_message_id")
         await state.set_state(BotStates.idle)
-        await state.update_data(provider_base_url=None, provider_token=None, provider_edit_id=None, panel_message_id=None)
-        await message.answer(
-            "❌ این مدل در تست اولیه قبول نشد.\n\n"
+        await state.update_data(provider_base_url=None, provider_token=None, provider_edit_id=None)
+        error_text=("❌ این مدل در تست اولیه قبول نشد.\n\n"
             f"HTTP/API: {html.escape(str(result.get('error','unknown'))[:1000])}\n\n"
-            "هیچ چیزی ذخیره نشد. Base URL یا نام دقیق مدل را بررسی کن.",
-            reply_markup=get_admin_menu()
-        )
+            "هیچ چیزی ذخیره نشد. Base URL یا نام دقیق مدل را بررسی کن.")
+        kb = provider_list_kb(await db.execute("SELECT id,name,base_url,model_name,priority,enabled,status,last_error,last_latency_ms FROM ai_providers ORDER BY priority ASC,id ASC")) if parent=="auto_providers" else get_admin_back_kb(parent)
+        if panel_id:
+            try:
+                await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text=error_text,parse_mode='HTML',reply_markup=kb)
+            except Exception:
+                await message.answer(error_text,parse_mode='HTML',reply_markup=kb)
+        else:
+            await message.answer(error_text,parse_mode='HTML',reply_markup=kb)
         return
     now = datetime.now(timezone.utc).isoformat()
     host = urllib.parse.urlsplit(base_url).netloc or 'provider'
@@ -2646,10 +2907,16 @@ async def provider_model_input(message: Message, state: FSMContext, db: D1Databa
     await state.set_state(BotStates.idle)
     await state.update_data(provider_base_url=None, provider_token=None, provider_edit_id=None, panel_message_id=None)
     rows = await db.execute("SELECT id,name,base_url,model_name,priority,enabled,status,last_error,last_latency_ms FROM ai_providers ORDER BY priority ASC, id ASC")
-    await message.answer(
-        f"✅ {action_text}\n\n🤖 Model: <code>{html.escape(model)}</code>\n⚡ زمان پاسخ تست: {result.get('latency_ms',0)}ms\n🔢 اولویت: {priority}",
-        parse_mode='HTML', reply_markup=provider_list_kb(rows)
-    )
+    parent=data.get("parent_callback","auto_providers")
+    panel_id=data.get("panel_message_id")
+    text=f"✅ {action_text}\n\n🤖 Model: <code>{html.escape(model)}</code>\n⚡ زمان پاسخ تست: {result.get('latency_ms',0)}ms\n🔢 اولویت: {priority}"
+    if panel_id:
+        try:
+            await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text=text,parse_mode='HTML',reply_markup=provider_list_kb(rows) if parent=="auto_providers" else get_admin_back_kb(parent))
+        except Exception:
+            await message.answer(text,parse_mode='HTML',reply_markup=provider_list_kb(rows))
+    else:
+        await message.answer(text,parse_mode='HTML',reply_markup=provider_list_kb(rows))
 
 
 @router.callback_query(F.data.startswith("provider_view_"))
@@ -2698,7 +2965,7 @@ async def provider_edit(call: CallbackQuery, state: FSMContext, db: D1Database):
         await call.answer("مدل پیدا نشد", show_alert=True); return
     p = rows[0]
     await state.set_state(BotStates.admin_add_provider)
-    await state.update_data(provider_edit_id=pid, provider_base_url=None, provider_token=None, panel_message_id=call.message.message_id)
+    await state.update_data(provider_edit_id=pid, provider_base_url=None, provider_token=None, panel_message_id=call.message.message_id,parent_callback="provider_view_"+str(pid))
     await call.message.edit_text(
         f"✏️ <b>ویرایش مدل #{pid}</b>\n\n"
         f"مدل فعلی: <code>{html.escape(str(p.get('model_name')))}</code>\n\n"
@@ -2726,7 +2993,7 @@ async def provider_test(call: CallbackQuery, db: D1Database):
 async def provider_priority(call: CallbackQuery, state: FSMContext):
     pid = int(call.data.split("_")[-1])
     await state.set_state(BotStates.admin_automation_setting)
-    await state.update_data(automation_setting_key="__provider_priority__", provider_priority_id=pid)
+    await state.update_data(automation_setting_key="__provider_priority__", provider_priority_id=pid,parent_callback=f"provider_view_{pid}",panel_message_id=call.message.message_id)
     await call.message.edit_text("🔢 اولویت این مدل را به عدد بفرست.\nعدد کمتر = اولویت بالاتر.", reply_markup=get_exit_menu())
     await call.answer()
 
@@ -2931,11 +3198,15 @@ async def health_dry_run(call:CallbackQuery,db:D1Database):
                      f"دلیل: {html.escape(str(out.get('why','-'))[:500])}")
             else:
                 ai_info=out.get("ai") or {}
+                preview_ch=sanitize_telegram_html(out.get("channel_html") or out.get("channel_text") or "")
+                preview_ar=sanitize_telegram_html(out.get("article_html") or out.get("article_text") or "")
                 msg=("✅ <b>تولید آزمایشی موفق است.</b>\n\n"
                      f"منبع: {html.escape(str(chosen_src.get('name')))}\n"
-                     f"امتیاز: {out.get('score','-')}\n"
+                     f"امتیاز نهایی: {out.get('score','-')}\n"
                      f"عنوان: {html.escape(str(out.get('title','-')))}\n"
-                     f"مدل: {html.escape(str(ai_info.get('model','-')))}")
+                     f"مدل: {html.escape(str(ai_info.get('model','-')))}\n\n"
+                     "<b>پیش‌نمایش کانال:</b>\n"+preview_ch[:900]+"\n\n"
+                     "<b>پیش‌نمایش مقاله ربات:</b>\n"+(preview_ar if len(preview_ar)<=3400 else html.escape(strip_html_text(preview_ar)[:3400])+"…"))
     except Exception as e:
         msg="❌ تست تولید شکست خورد:\n"+html.escape(str(e)[:1500])
     finally: await m.close()
