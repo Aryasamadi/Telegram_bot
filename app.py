@@ -216,6 +216,10 @@ async def initialize_database(db: D1Database):
         {"sql": "CREATE INDEX IF NOT EXISTS idx_posts_text ON posts(text)"},
         {"sql": "CREATE TABLE IF NOT EXISTS saves(user INTEGER, post INTEGER, folder TEXT, PRIMARY KEY(user, post))"},
         {"sql": "CREATE TABLE IF NOT EXISTS votes(user_id INTEGER, post_id INTEGER, vote_type TEXT, PRIMARY KEY(user_id, post_id))"},
+        {"sql": "CREATE TABLE IF NOT EXISTS article_saves(user_id INTEGER, article_id INTEGER, folder TEXT, PRIMARY KEY(user_id, article_id))"},
+        {"sql": "CREATE TABLE IF NOT EXISTS article_votes(user_id INTEGER, article_id INTEGER, vote_type TEXT, PRIMARY KEY(user_id, article_id))"},
+        {"sql": "CREATE INDEX IF NOT EXISTS idx_article_votes_article ON article_votes(article_id)"},
+        {"sql": "CREATE INDEX IF NOT EXISTS idx_article_saves_article ON article_saves(article_id)"},
         {"sql": "CREATE TABLE IF NOT EXISTS user_states(user_id INTEGER PRIMARY KEY, state TEXT, data TEXT)"},
         {"sql": "CREATE TABLE IF NOT EXISTS processed_updates(update_id INTEGER PRIMARY KEY, processed_at TEXT)"}
     ]
@@ -1370,7 +1374,7 @@ def _format_technical_tokens(text: str) -> str:
 
 def _visualize_plain_paragraphs(title: str, value: str, category: str, article: bool=False) -> str:
     """Normalize and enrich Telegram formatting without inventing factual content."""
-    clean=sanitize_telegram_html(value or "")
+    clean=dedupe_adjacent_emojis(sanitize_telegram_html(value or ""))
     plain=strip_html_text(clean)
     if not plain:
         return ""
@@ -1429,14 +1433,52 @@ def _visualize_plain_paragraphs(title: str, value: str, category: str, article: 
             result=result.replace(html.escape(plain_parts[idx],quote=False), f"<blockquote>{q}</blockquote>", 1)
     return result
 
+def dedupe_adjacent_emojis(text: str) -> str:
+    """Collapse directly repeated visual emojis while preserving intentional variety."""
+    emojis = ["💻","⚙️","🚀","🔎","🤖","🧠","⚡","🔬","🛡️","🔐","🚨","🧩","📚","💡","🧭","📝","🌐","✨","📌","🔭","📱","🔍","🛰️","🧪","🛠️","🎯","📢","📰","🔗"]
+    for e in emojis:
+        while f"{e} {e}" in text:
+            text = text.replace(f"{e} {e}", e)
+        while f"{e}{e}" in text:
+            text = text.replace(f"{e}{e}", e)
+    return text
+
+def relative_time_label(value: str) -> str:
+    """Human-friendly relative age, calculated every time the article is opened."""
+    if not value:
+        return "زمان نامشخص"
+    try:
+        dt=datetime.fromisoformat(str(value).replace('Z','+00:00'))
+        if dt.tzinfo is None:
+            dt=dt.replace(tzinfo=timezone.utc)
+        now=datetime.now(timezone.utc)
+        seconds=max(0,int((now-dt.astimezone(timezone.utc)).total_seconds()))
+        def fa(n:int)->str:
+            return str(n).translate(str.maketrans("0123456789","۰۱۲۳۴۵۶۷۸۹"))
+        if seconds < 60: return "همین الان"
+        minutes=seconds//60
+        if minutes < 60: return f"{fa(minutes)} دقیقه پیش"
+        hours=minutes//60
+        if hours < 24: return f"{fa(hours)} ساعت پیش"
+        days=hours//24
+        if days < 7: return f"{fa(days)} روز پیش"
+        weeks=days//7
+        if weeks < 5: return f"{fa(weeks)} هفته پیش"
+        months=days//30
+        if months < 12: return f"{fa(months)} ماه پیش"
+        years=days//365
+        return f"{fa(years)} سال پیش"
+    except Exception:
+        return "زمان نامشخص"
+
 def ensure_rich_channel_format(title: str, value: str, category: str = "tech") -> str:
-    clean=sanitize_telegram_html(value or "")
+    clean=dedupe_adjacent_emojis(sanitize_telegram_html(value or ""))
     if not strip_html_text(clean):
         return rich_channel_fallback(title, "اطلاعات قابل انتشار از منبع دریافت شد.")
     return _visualize_plain_paragraphs(title, clean, category, article=False)
 
 def ensure_rich_article_format(title: str, value: str, source_url: str) -> str:
-    clean=sanitize_telegram_html(value or "")
+    clean=dedupe_adjacent_emojis(sanitize_telegram_html(value or ""))
     if not strip_html_text(clean):
         return rich_article_fallback(title, "اطلاعات کافی برای تهیه متن کامل از منبع دریافت شد.", source_url)
     return _visualize_plain_paragraphs(title, clean, "tech", article=True)
@@ -2370,9 +2412,8 @@ FOLDER_NAMES = {
 
 def get_main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🤖 هوش مصنوعی", callback_data="user_ai"), InlineKeyboardButton(text="💾 ذخیره‌های من", callback_data="user_saves")],
-        [InlineKeyboardButton(text="👤 پروفایل", callback_data="user_profile"), InlineKeyboardButton(text="❓ راهنما", callback_data="user_help")],
-        [InlineKeyboardButton(text="📞 ارتباط با مدیریت", callback_data="user_contact")]
+        [InlineKeyboardButton(text="💾 ذخیره‌های من", callback_data="user_saves"), InlineKeyboardButton(text="👤 پروفایل", callback_data="user_profile")],
+        [InlineKeyboardButton(text="❓ راهنما", callback_data="user_help")]
     ])
 
 
@@ -2435,6 +2476,23 @@ def get_post_inline_kb(post_id: int, likes: int, dislikes: int, is_saved: bool) 
             ]
         ]
     )
+
+def get_article_inline_kb(article_id: int, likes: int, dislikes: int, is_saved: bool) -> InlineKeyboardMarkup:
+    save_text = "❌ حذف از ذخیره‌ها" if is_saved else "💾 ذخیره"
+    save_cb = f"aunsave_{article_id}" if is_saved else f"asave_{article_id}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"👍 {likes}", callback_data=f"alike_{article_id}"),
+         InlineKeyboardButton(text=f"👎 {dislikes}", callback_data=f"adis_{article_id}")],
+        [InlineKeyboardButton(text=save_text, callback_data=save_cb)],
+        [InlineKeyboardButton(text="❓ راهنما", callback_data="user_help")]
+    ])
+
+def get_save_to_article_folder_kb(article_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=FOLDER_NAMES["cyber"], callback_data=f"afsave_{article_id}_cyber"), InlineKeyboardButton(text=FOLDER_NAMES["tech"], callback_data=f"afsave_{article_id}_tech")],
+        [InlineKeyboardButton(text=FOLDER_NAMES["ai"], callback_data=f"afsave_{article_id}_ai"), InlineKeyboardButton(text=FOLDER_NAMES["edu"], callback_data=f"afsave_{article_id}_edu")],
+        [InlineKeyboardButton(text="🔙 برگشت", callback_data=f"article_actions_{article_id}")]
+    ])
 
 def get_saved_folder_pagination_kb(post_id: int, folder: str, index: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -2682,32 +2740,49 @@ async def deliver_article_by_token(message: Message, bot: Bot, db: D1Database, t
     rows=await db.execute("SELECT * FROM articles WHERE deep_token=? AND status IN ('ready','published','test')",[token])
     if not rows: return False
     article=rows[0]
-    try: await db.execute("UPDATE articles SET deep_views=COALESCE(deep_views,0)+1 WHERE id=?",[article.get('id')])
+    article_id=int(article.get('id') or 0)
+    try: await db.execute("UPDATE articles SET deep_views=COALESCE(deep_views,0)+1 WHERE id=?",[article_id])
     except Exception: pass
+
     title=html.escape(str(article.get('title') or 'مطلب'))
-    body=sanitize_telegram_html(article.get('body') or '')
+    body=dedupe_adjacent_emojis(sanitize_telegram_html(article.get('body') or ''))
     source_url=normalize_url(article.get('source_url') or '')
-    if source_url and "🔗 منبع اصلی" not in strip_html_text(body):
-        body=f"{body}\n\n<b>🔗 لینک منبع</b>\n<a href=\"{html.escape(source_url,quote=True)}\">منبع اصلی</a>"
-    source_date=format_source_publication_date(article.get('source_published_at') or '')
-    if source_date and "تاریخ انتشار:" not in strip_html_text(body):
-        body=body.rstrip()+f"\n\n<i>تاریخ انتشار: {source_date}</i>"
+    # Exactly one short source link inside the full article; no author and no related-links section.
+    if source_url and html.escape(source_url,quote=True) not in body:
+        body=f"{body.rstrip()}\n\n<a href=\"{html.escape(source_url,quote=True)}\">منبع اصلی</a>"
+    relative=relative_time_label(article.get('source_published_at') or article.get('published_at') or article.get('created_at') or '')
+    if 'پیش' not in strip_html_text(body)[-80:]:
+        body=body.rstrip()+f"\n\n<i>⏱ {relative}</i>"
     full=f"<b>📖 {title}</b>\n\n{body}"
+
+    like_rows=await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='like'",[article_id])
+    dislike_rows=await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='dislike'",[article_id])
+    save_rows=await db.execute("SELECT folder FROM article_saves WHERE user_id=? AND article_id=?",[message.from_user.id,article_id])
+    kb=get_article_inline_kb(article_id,like_rows[0].get('c',0) if like_rows else 0,dislike_rows[0].get('c',0) if dislike_rows else 0,bool(save_rows))
+
     image=await resolve_article_image(db,article)
-    # No generated/default/placeholder image is ever sent. Only the real source image may be used.
     if image:
         try:
-            photo_caption=f"<b>📖 {title}</b>\n\n✨ مقاله کامل در پیام‌های بعدی…"
+            photo_caption=f"<b>📖 {title}</b>\n\n<i>⏱ {relative}</i>"
             await bot.send_photo(message.chat.id,photo=image,caption=photo_caption,parse_mode='HTML')
         except Exception:
             pass
+    first=True
     for i in range(0,len(full),3800):
         chunk=full[i:i+3800]
-        if chunk: await message.answer(chunk,parse_mode='HTML',disable_web_page_preview=True)
-    try:
-        await db.execute("UPDATE automation_logs SET details=details WHERE id=(SELECT MAX(id) FROM automation_logs)")
-    except Exception: pass
+        if chunk:
+            await message.answer(chunk,parse_mode='HTML',disable_web_page_preview=True,reply_markup=kb if i+3800>=len(full) else None)
+            first=False
     return True
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer("🌐 /help • help ➜ راهنما\n📞 /man • man ➜ تماس با مدیر\n🚀 /start • start ➜ شروع\n✨ انتخاب کن و شروع کن 🚀", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="user_home")]]))
+
+@router.message(Command("man"))
+async def cmd_man(message: Message, state: FSMContext):
+    await state.set_state(BotStates.user_chat_admin)
+    await message.answer("📞 پیام خود را برای مدیریت ارسال کن.", reply_markup=get_exit_menu())
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, db: D1Database, bot: Bot):
@@ -3064,9 +3139,8 @@ async def process_admin_replies(message: Message, state: FSMContext, bot: Bot):
             await message.answer(f"❌ خطا در ارسال پیام به کاربر: {e}")
 
 COMMANDS_LIST = [
-    "کاربر", "مدیریت", "🤖 هوش مصنوعی", "💾 ذخیره‌های من", "📞 ارتباط با مدیریت",
-    "❓ راهنما", "👤 پروفایل", "➕ افزودن پست", "📁 مدیریت محتوا",
-    "📊 آمار", "📢 ارسال همگانی", "⚙️ اتوماسیون محتوا"
+    "کاربر", "مدیریت", "💾 ذخیره‌های من", "❓ راهنما", "👤 پروفایل", "➕ افزودن پست",
+    "📁 مدیریت محتوا", "📊 آمار", "📢 ارسال همگانی", "⚙️ اتوماسیون محتوا"
 ]
 
 @router.message(F.text.in_(COMMANDS_LIST), StateFilter(None, BotStates.idle))
@@ -3075,16 +3149,7 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
     user_id = message.from_user.id
     state_data = await state.get_data()
     
-    if text == "🤖 هوش مصنوعی":
-        history = [{"role": "system", "content": "You are a helpful assistant. Reply clearly in Persian."}]
-        await state.set_state(BotStates.ai_chat)
-        await state.update_data(ai_history=history)
-        await message.answer(
-            "سلام من هوش مصنوعی TechNowAi هستم 🦾\nچطور میتونم کمکت کنم ❔",
-            reply_markup=get_exit_menu()
-        )
-        
-    elif text == "کاربر":
+    if text == "کاربر":
         await state.update_data(admin_mode="user")
         await message.answer("✅ فاز کاربری فعال شد.", reply_markup=get_main_menu())
         
@@ -3096,15 +3161,7 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
             await message.answer("⛔ شما دسترسی مدیریت ندارید.")
             
     elif text == "❓ راهنما":
-        first_name = message.from_user.first_name or "دوست"
-        help_text = f""" خب {first_name} جان ببین 👀
-
-اینجا فقط یه ابزار ساده نیست، یه دستیار شخصیه که بهت کمک می‌کنه پست‌های طولانی و جذاب کانال @TechNowAi رو خیلی راحت و بدون دردسر بخونی. 🤓
-
-وقتی تو کانال یه مطلب توجهت رو جلب می‌کنه، با زدن روی لینک مستقیم میای اینجا تا هم متن کاملش رو با تمرکز مطالعه کنی و هم اگه دوست داشتی تو آرشیو شخصیت نگهش داری! 📚✨
-
-برای اینکه دقیق‌تر بدونی چطور می‌تونی از همه امکانات استفاده کنی، دکمه پایین رو لمس کن 👇"""
-        await message.answer(help_text, reply_markup=get_help_more_kb())
+        await message.answer("🌐 /help • راهنما\n📞 /man • تماس با مدیر\n🚀 /start • شروع", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="user_home")]]))
         
     elif text == "👤 پروفایل":
         rows = await db.execute("SELECT joined_at, role FROM users WHERE id = ?", [user_id])
@@ -3118,13 +3175,11 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
             try:
                 joined_dt = datetime.fromisoformat(joined_str).replace(tzinfo=timezone.utc)
                 delta = datetime.now(timezone.utc) - joined_dt
-                days = delta.days
-                hours = int(delta.seconds / 3600)
-                time_string = f"⏱️ مدت همراهی: {days} روز و {hours} ساعت ⏳"
-                
+                days = max(0, delta.days)
+                time_string = f"⏱️ مدت همراهی: {days} روز پیش" if days else "⏱️ مدت همراهی: امروز"
                 tehran_tz = pytz.timezone("Asia/Tehran")
                 joined_tehran = joined_dt.astimezone(tehran_tz)
-                date_str = joined_tehran.strftime("%Y/%m/%d ساعت %H:%M")
+                date_str = joined_tehran.strftime("%Y/%m/%d")
                 join_date_line = f"📅 تاریخ عضویت: {date_str}\n"
             except Exception:
                 pass
@@ -3135,26 +3190,23 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
         
         role_display = "مدیر 🌟" if user_role_db == "admin" else "کاربر عادی 🟢"
         first_name_clean = message.from_user.first_name or "عزیز"
-        profile_text = f"""👤 پروفایل {first_name_clean} عزیز
+        article_saves_count=(await db.execute("SELECT COUNT(*) as c FROM article_saves WHERE user_id=?",[user_id]))[0].get("c",0)
+        article_likes_count=(await db.execute("SELECT COUNT(*) as c FROM article_votes WHERE user_id=? AND vote_type='like'",[user_id]))[0].get("c",0)
+        profile_text = f"""👤 <b>پروفایل</b> · {html.escape(first_name_clean)}
 
+🗓 <b>عضویت</b>
 {join_date_line}{time_string}
-💾 مطالب ذخیره‌شده: {saves_count}
-👍 لایک‌های شما: {likes_count}
-👎 دیس‌لایک‌های شما: {dislikes_count}
 
-🔰 سطح حساب: {role_display}
-🔰 سطح ویژه به زودی ..."""
-        await message.answer(profile_text)
+📚 <b>فعالیت</b>
+💾 ذخیره‌ها: <b>{saves_count + article_saves_count}</b>
+👍 لایک‌ها: <b>{likes_count + article_likes_count}</b>
+👎 دیس‌لایک‌ها: <b>{dislikes_count}</b>
+
+🔰 <b>{role_display}</b>"""
+        await message.answer(profile_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="user_home")]]))
         
     elif text == "💾 ذخیره‌های من":
         await message.answer("📂 کدوم پوشه رو میخوای باز کنی؟ 👇", reply_markup=get_folder_selection_kb())
-        
-    elif text == "📞 ارتباط با مدیریت":
-        await state.set_state(BotStates.user_chat_admin)
-        await message.answer(
-            "🛡️ ارتباط امن و ناشناس با مدیریت برقرار شد!\n\nهر پیامی داری همین الان بفرست ...",
-            reply_markup=get_exit_menu()
-        )
         
     elif text == "➕ افزودن پست":
         if user_id == ADMIN_ID:
@@ -3226,7 +3278,7 @@ async def admin_add_source_input(message: Message, state: FSMContext, db: D1Data
         data = await state.get_data()
         panel_id = data.get('panel_message_id')
         await state.set_state(BotStates.idle)
-        rows = await db.execute("SELECT * FROM sources ORDER BY priority DESC, id DESC")
+        rows = await db.execute("SELECT * FROM sources ORDER BY priority ASC, id ASC")
         if panel_id:
             try:
                 await bot.edit_message_text(chat_id=message.chat.id, message_id=panel_id, text=f"✅ منبع اضافه شد.\n\nشناسه: {source_id}", reply_markup=source_list_kb(rows))
@@ -3320,13 +3372,10 @@ async def admin_automation_setting_input(message:Message,state:FSMContext,db:D1D
             elif parent.startswith("provider_view_"):
                 pid=int(parent.rsplit("_",1)[1]); await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text="✅ تنظیم مدل ذخیره شد.",reply_markup=get_admin_back_kb(parent))
             elif parent=="auto_channel":
-                fake=type("FakeCall",(),{"message":type("FakeMessage",(),{"edit_text":lambda self,*a,**kw: None})()})()
-                # پنل اصلی را در همان پیام با داده فعلی بازسازی می‌کنیم.
-                channel_id=await get_channel_id(db); channel_username=await get_setting(db,'channel_username',''); shown=html.escape(channel_username) if channel_username else ('✅ کانال خصوصی تنظیم شده' if channel_id else '⛔ تنظیم نشده')
-                enabled=(await get_setting(db,'automation_enabled','0'))=='1'
-                text='📢 <b>کانال و انتشار</b>\n\n'+f'کانال فعلی: {shown}\nاتوماسیون: {"🟢 فعال" if enabled else "🔴 خاموش"}'
-                kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📢 تنظیم/تغییر کانال',callback_data='auto_channel_set')],[InlineKeyboardButton(text='🚀 همین حالا منتشر کن',callback_data='publish_now')],[InlineKeyboardButton(text='⏱ زمان‌بندی انتشار',callback_data='publish_schedule')],[InlineKeyboardButton(text='🧪 تست کانال',callback_data='channel_test')],[InlineKeyboardButton(text='🔙 اتوماسیون محتوا',callback_data='auto_back')]])
-                await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text=text,parse_mode='HTML',reply_markup=kb)
+                # The current parent for publication settings is the modern schedule panel.
+                # Always render that same panel after saving; never return to the legacy row menu.
+                text,kb=await get_schedule_panel(db)
+                await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text=text,parse_mode="HTML",reply_markup=kb)
             else:
                 target = parent if parent in {"auto_channel","auto_schedule","auto_quality","quality_weights","auto_providers","auto_sources","editorial_prompts"} else "admin_home"
                 await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text="✅ ذخیره شد.",parse_mode="HTML",reply_markup=get_admin_back_kb(target))
@@ -3593,7 +3642,33 @@ async def user_ai(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "user_saves")
 async def user_saves(call: CallbackQuery):
-    await call.message.edit_text("💾 ذخیره‌های من\n\nیک پوشه را انتخاب کن:", reply_markup=get_folder_selection_kb())
+    await call.message.edit_text("💾 ذخیره‌های من\n\nیک بخش را انتخاب کن:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗂 ذخیره‌های قدیمی", callback_data="user_saves_legacy"), InlineKeyboardButton(text="📰 مقالات اتوماسیون", callback_data="user_saves_articles")],
+        [InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="user_home")]
+    ]))
+    await call.answer()
+
+@router.callback_query(F.data == "user_saves_legacy")
+async def user_saves_legacy(call: CallbackQuery):
+    await call.message.edit_text("💾 ذخیره‌های قدیمی\n\nیک پوشه را انتخاب کن:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=FOLDER_NAMES["cyber"], callback_data="f_view_cyber"), InlineKeyboardButton(text=FOLDER_NAMES["tech"], callback_data="f_view_tech")],
+        [InlineKeyboardButton(text=FOLDER_NAMES["ai"], callback_data="f_view_ai"), InlineKeyboardButton(text=FOLDER_NAMES["edu"], callback_data="f_view_edu")],
+        [InlineKeyboardButton(text="🔙 ذخیره‌های من", callback_data="user_saves")]
+    ]))
+    await call.answer()
+
+@router.callback_query(F.data == "user_saves_articles")
+async def user_saves_articles(call: CallbackQuery, db: D1Database):
+    uid=call.from_user.id
+    rows=await db.execute("SELECT a.id,a.title,a.deep_token FROM article_saves s JOIN articles a ON a.id=s.article_id WHERE s.user_id=? ORDER BY a.id DESC LIMIT 20",[uid])
+    if not rows:
+        txt="📰 مقالات اتوماسیون\n\nفعلاً چیزی ذخیره نکردی."
+    else:
+        lines=["📰 <b>مقالات اتوماسیون ذخیره‌شده</b>"]
+        for r in rows:
+            lines.append(f"\n• <a href=\"https://t.me/{BOT_USERNAME_RUNTIME or BOT_USERNAME.lstrip('@')}?start=article_{r.get('deep_token','')}\">{html.escape(str(r.get('title') or 'مطلب')[:90])}</a>")
+        txt=''.join(lines)
+    await call.message.edit_text(txt,parse_mode="HTML",disable_web_page_preview=True,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 ذخیره‌های من",callback_data="user_saves")]]))
     await call.answer()
 
 
@@ -3612,7 +3687,7 @@ async def user_profile(call: CallbackQuery, db: D1Database):
 
 @router.callback_query(F.data == "user_help")
 async def user_help(call: CallbackQuery):
-    await call.message.edit_text("❓ راهنما\n\nاز دکمه‌های شیشه‌ای برای هوش مصنوعی، ذخیره‌ها و ارتباط با مدیریت استفاده کن.\n\nبرای مقالات کانال، دکمه «📖 بیشتر بخوانید» متن کامل و عمیق‌تر را داخل ربات باز می‌کند.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💡 توضیحات بیشتر', callback_data='help_more')],[InlineKeyboardButton(text='🔙 منوی اصلی', callback_data='user_home')]]))
+    await call.message.edit_text("🌐 /help • راهنما\n📞 /man • تماس با مدیر\n🚀 /start • شروع", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="user_home")]]))
     await call.answer()
 
 
@@ -3656,7 +3731,7 @@ async def auto_report(call:CallbackQuery,db:D1Database):
 @router.callback_query(F.data == "auto_sources")
 async def auto_sources(call: CallbackQuery, db: D1Database):
     await call.answer()
-    rows = await db.execute("SELECT * FROM sources ORDER BY priority DESC, id DESC")
+    rows = await db.execute("SELECT * FROM sources ORDER BY priority ASC, id ASC")
     text = "🌐 منابع محتوا\n\n"
     if not rows:
         text += "هنوز منبع اضافه نشده است."
@@ -3709,7 +3784,7 @@ async def source_delete(call: CallbackQuery, db: D1Database):
     source_id = int(call.data.split("_")[-1])
     await db.execute("DELETE FROM sources WHERE id=?", [source_id])
     await db.execute("DELETE FROM source_items WHERE source_id=?", [source_id])
-    rows = await db.execute("SELECT * FROM sources ORDER BY priority DESC, id DESC")
+    rows = await db.execute("SELECT * FROM sources ORDER BY priority ASC, id ASC")
     await call.message.edit_text("✅ منبع حذف شد.", reply_markup=source_list_kb(rows))
     await call.answer("حذف شد")
 
@@ -4253,7 +4328,7 @@ async def health_test_ai(call:CallbackQuery,db:D1Database):
                 results.append(f"❌ {html.escape(str(p.get('model_name')))}\n<code>{html.escape(str(result.get('error','unknown'))[:650])}</code>")
     finally: await m.close()
     await log_automation(db,"INFO","health_test_ai_finished",f"providers={len(rows)}")
-    await edit_health_progress(call.message,"🧪 <b>نتیجه تست مدل‌های AI</b>\n\n"+"\n".join(results)); await call.answer()
+    await edit_health_progress(call.message,"🧪 <b>نتیجه تست مدل‌های AI</b>\n\n"+"\n".join(results), get_admin_back_kb("auto_health")); await call.answer()
 
 @router.callback_query(F.data == "health_test_source")
 async def health_test_source(call:CallbackQuery,db:D1Database,bot:Bot):
@@ -4276,11 +4351,13 @@ async def health_test_source(call:CallbackQuery,db:D1Database,bot:Bot):
                 results.append(f"❌ {src.get('name')}: {html.escape(str(e)[:220])}")
     finally: await ai.close()
     await log_automation(db,"INFO","health_test_sources_finished",f"sources={len(rows)}")
-    await edit_health_progress(call.message,"🧪 <b>نتیجه تست همه منابع</b>\n\n"+"\n".join(results)); await call.answer()
+    await edit_health_progress(call.message,"🧪 <b>نتیجه تست همه منابع</b>\n\n"+"\n".join(results), get_admin_back_kb("auto_health")); await call.answer()
 
-async def edit_health_progress(message: Message, text: str):
-    try: await message.edit_text(text,parse_mode="HTML")
-    except Exception: pass
+async def edit_health_progress(message: Message, text: str, reply_markup=None):
+    try:
+        await message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    except Exception:
+        pass
 
 def health_progress_block(stage: int, total: int, title: str, detail: str = "") -> str:
     total=max(1,total); filled=max(0,min(total,stage)); bar="█"*filled+"░"*(total-filled); pct=int((filled/total)*100)
@@ -4322,16 +4399,16 @@ async def health_dry_run(call:CallbackQuery,db:D1Database,bot:Bot):
     try:
         src,item=await choose_test_candidate(db,ai)
         if not item:
-            await edit_health_progress(call.message,"❌ <b>هیچ Candidate قابل استفاده‌ای برای تست پیدا نشد.</b>\n\nهمه منابع، آرشیو و Web Scout بررسی شدند."); return
+            await edit_health_progress(call.message,"❌ <b>هیچ Candidate قابل استفاده‌ای برای تست پیدا نشد.</b>\n\nهمه منابع، آرشیو و Web Scout بررسی شدند.", get_admin_back_kb("auto_health")); return
         await edit_health_progress(call.message,health_progress_block(2,6,"محتوا پیدا شد",f"منبع: {src.get('name')}\nعنوان: {item.get('title')[:180]}"))
         test_hash=item.get('_test_hash') or text_hash((item.get('title') or '')+' '+(item.get('body') or item.get('description') or ''))
         await db.execute("INSERT INTO test_history(source_url,content_hash,title,tested_at) VALUES(?,?,?,?)",[item.get('url') or '',test_hash,item.get('title') or '',datetime.now(timezone.utc).isoformat()])
         weights={k:float(await get_setting(db,'weight_'+k,'10')) for k in ['global','technology','ai','cyber','education','iran','freshness','source','novelty']}
         out=await ai_editorial_process(ai,item,src,[],weights,await get_manager_editorial_prompts(db))
         if out.get('error'):
-            await edit_health_progress(call.message,"❌ <b>تست تولید شکست خورد</b>\n\n<code>"+html.escape(str(out['error'])[:1800])+"</code>"); return
+            await edit_health_progress(call.message,"❌ <b>تست تولید شکست خورد</b>\n\n<code>"+html.escape(str(out['error'])[:1800])+"</code>", get_admin_back_kb("auto_health")); return
         if not out.get('accept',True):
-            await edit_health_progress(call.message,f"⚠️ <b>AI پاسخ داد اما این Candidate را نپذیرفت.</b>\n\nامتیاز: <b>{out.get('score','-')}</b>\nدلیل: {html.escape(str(out.get('why','-'))[:800])}\n\nبرای تست سیستم می‌توانی یک منبع دیگر را هم امتحان کنی."); return
+            await edit_health_progress(call.message,f"⚠️ <b>AI پاسخ داد اما این Candidate را نپذیرفت.</b>\n\nامتیاز: <b>{out.get('score','-')}</b>\nدلیل: {html.escape(str(out.get('why','-'))[:800])}\n\nبرای تست سیستم می‌توانی یک منبع دیگر را هم امتحان کنی.", get_admin_back_kb("auto_health")); return
         await edit_health_progress(call.message,health_progress_block(4,6,"محتوا تولید شد","در حال بررسی Formatting و طول متن…"))
         ch=sanitize_telegram_html(out.get('channel_html') or '')
         ar=sanitize_telegram_html(out.get('article_html') or '')
@@ -4346,10 +4423,10 @@ async def health_dry_run(call:CallbackQuery,db:D1Database,bot:Bot):
              f"📊 امتیاز: <b>{out.get('score','-')}</b>\n\n"
              "<b>📝 کانال:</b>\n"+ch[:1500]+"\n\n<b>📖 مقاله:</b>\n"+ar[:4200]+"\n\n"
              "🚫 <b>انتشار انجام نشد.</b> این همان موتور تولید واقعی بود اما در حالت تست.")
-        await edit_health_progress(call.message,msg)
+        await edit_health_progress(call.message,msg, get_admin_back_kb("auto_health"))
     except Exception as e:
         logger.exception('health dry run failed')
-        await edit_health_progress(call.message,"❌ <b>تست تولید شکست خورد</b>\n\n<code>"+html.escape(str(e)[:2500])+"</code>")
+        await edit_health_progress(call.message,"❌ <b>تست تولید شکست خورد</b>\n\n<code>"+html.escape(str(e)[:2500])+"</code>", get_admin_back_kb("auto_health"))
     finally: await ai.close()
 
 def make_health_png(width=1280,height=720):
@@ -4385,10 +4462,10 @@ async def health_run_cycle(call:CallbackQuery,db:D1Database,bot:Bot):
         total_queued=sum((r.get('queued',0) if isinstance(r,dict) else 0) for r in results)
         q=await db.execute("SELECT COUNT(*) c FROM publication_queue WHERE status='queued'")
         await log_automation(db,"INFO","real_cycle_finished",json.dumps({"sources":len(rows),"processed":total_processed,"queued":total_queued,"published":bool(published)},ensure_ascii=False))
-        await edit_health_progress(call.message,f"✅ <b>چرخه واقعی کامل شد.</b>\n\n🌐 منابع: {len(rows)}\n📰 آیتم‌های پیدا شده: {total_found}\n🆕 Candidateهای جدید/قابل بررسی: {total_new}\n🤖 پردازش‌شده توسط AI: {total_processed}\n📥 اضافه‌شده به صف: {total_queued}\n📦 صف فعلی: <b>{q[0].get('c',0) if q else 0}</b>\n📢 انتشار این چرخه: {'✅ بله' if published else '⏸ خیر'}")
+        await edit_health_progress(call.message,f"✅ <b>چرخه واقعی کامل شد.</b>\n\n🌐 منابع: {len(rows)}\n📰 آیتم‌های پیدا شده: {total_found}\n🆕 Candidateهای جدید/قابل بررسی: {total_new}\n🤖 پردازش‌شده توسط AI: {total_processed}\n📥 اضافه‌شده به صف: {total_queued}\n📦 صف فعلی: <b>{q[0].get('c',0) if q else 0}</b>\n📢 انتشار این چرخه: {'✅ بله' if published else '⏸ خیر'}", get_admin_back_kb("auto_health"))
     except Exception as e:
         logger.exception('health run cycle failed')
-        await edit_health_progress(call.message,"❌ <b>اجرای چرخه شکست خورد</b>\n\n<code>"+html.escape(str(e)[:2500])+"</code>")
+        await edit_health_progress(call.message,"❌ <b>اجرای چرخه شکست خورد</b>\n\n<code>"+html.escape(str(e)[:2500])+"</code>", get_admin_back_kb("auto_health"))
     finally: await ai.close()
 
 @router.callback_query(F.data == "health_test_publish")
@@ -4444,10 +4521,10 @@ async def health_test_publish(call:CallbackQuery,db:D1Database,bot:Bot):
                 f"🤖 مدل: <code>{html.escape(str((out.get('ai') or {}).get('model') or '-'))}</code>\n"
                 f"📢 Message ID: <code>{getattr(sent,'message_id',0)}</code>\n"
                 f"🔗 <a href=\"{html.escape(deep,quote=True)}\">📖 باز کردن ادامه مطلب تست</a>")
-        await edit_health_progress(call.message,result)
+        await edit_health_progress(call.message,result, get_admin_back_kb("auto_health"))
     except Exception as e:
         logger.exception('real publish test failed')
-        await edit_health_progress(call.message,'❌ <b>تست انتشار واقعی شکست خورد</b>\n\n<code>'+html.escape(str(e)[:2500])+'</code>')
+        await edit_health_progress(call.message,'❌ <b>تست انتشار واقعی شکست خورد</b>\n\n<code>'+html.escape(str(e)[:2500])+'</code>', get_admin_back_kb("auto_health"))
     finally: await ai.close()
 
 @router.callback_query(F.data == "health_deployment")
@@ -4720,6 +4797,69 @@ async def on_channel_post(message: Message, db: D1Database):
 # ============================================================
 # پردازش رویدادهای کلیک روی کیبوردهای شیشه‌ای (Callback Queries)
 # ============================================================
+@router.callback_query(F.data.startswith("alike_") | F.data.startswith("adis_"))
+async def process_article_voting(call: CallbackQuery, db: D1Database):
+    parts=call.data.split("_")
+    new_vote="like" if parts[0]=="alike" else "dislike"
+    article_id=int(parts[1]); user_id=call.from_user.id
+    try:
+        existing=await db.execute("SELECT vote_type FROM article_votes WHERE user_id=? AND article_id=?",[user_id,article_id])
+        old=existing[0].get("vote_type") if existing else None
+        if old==new_vote:
+            await db.execute("DELETE FROM article_votes WHERE user_id=? AND article_id=?",[user_id,article_id])
+            msg="رأی شما برداشته شد"
+        elif old:
+            await db.execute("UPDATE article_votes SET vote_type=? WHERE user_id=? AND article_id=?",[new_vote,user_id,article_id])
+            msg="رأی شما تغییر کرد"
+        else:
+            await db.execute("INSERT INTO article_votes(user_id,article_id,vote_type) VALUES(?,?,?)",[user_id,article_id,new_vote])
+            msg="رأی شما ثبت شد"
+        likes=(await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='like'",[article_id]))[0].get("c",0)
+        dislikes=(await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='dislike'",[article_id]))[0].get("c",0)
+        saved=bool(await db.execute("SELECT folder FROM article_saves WHERE user_id=? AND article_id=?",[user_id,article_id]))
+        await call.message.edit_reply_markup(reply_markup=get_article_inline_kb(article_id,likes,dislikes,saved))
+        await call.answer(msg,show_alert=True)
+    except Exception as e:
+        await call.answer("❌ خطا در ثبت رأی",show_alert=True)
+
+@router.callback_query(F.data.startswith("asave_"))
+async def process_article_save_action(call: CallbackQuery):
+    article_id=int(call.data.split("_")[1])
+    await call.message.answer("📂 این مطلب را در کدام پوشه ذخیره کنم؟",reply_markup=get_save_to_article_folder_kb(article_id))
+    await call.answer()
+
+@router.callback_query(F.data.startswith("afsave_"))
+async def process_article_folder_save(call: CallbackQuery, db: D1Database):
+    parts=call.data.split("_"); article_id=int(parts[1]); folder=parts[2]; user_id=call.from_user.id
+    try:
+        await db.execute("INSERT OR IGNORE INTO article_saves(user_id,article_id,folder) VALUES(?,?,?)",[user_id,article_id,folder])
+        await call.answer(f"✅ در {FOLDER_NAMES.get(folder,folder)} ذخیره شد",show_alert=True)
+        try: await call.message.delete()
+        except Exception: pass
+    except Exception:
+        await call.answer("❌ خطا در ذخیره",show_alert=True)
+
+@router.callback_query(F.data.startswith("aunsave_"))
+async def process_article_unsave(call: CallbackQuery, db: D1Database):
+    article_id=int(call.data.split("_")[1]); user_id=call.from_user.id
+    try:
+        await db.execute("DELETE FROM article_saves WHERE user_id=? AND article_id=?",[user_id,article_id])
+        row=await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='like'",[article_id])
+        drow=await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='dislike'",[article_id])
+        await call.message.edit_reply_markup(reply_markup=get_article_inline_kb(article_id,row[0].get('c',0),drow[0].get('c',0),False))
+        await call.answer("🗑️ از ذخیره‌ها حذف شد",show_alert=True)
+    except Exception:
+        await call.answer("❌ خطا در حذف",show_alert=True)
+
+@router.callback_query(F.data.startswith("article_actions_"))
+async def article_actions(call: CallbackQuery, db: D1Database):
+    article_id=int(call.data.split("_")[2]); user_id=call.from_user.id
+    likes=(await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='like'",[article_id]))[0].get('c',0)
+    dislikes=(await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='dislike'",[article_id]))[0].get('c',0)
+    saved=bool(await db.execute("SELECT folder FROM article_saves WHERE user_id=? AND article_id=?",[user_id,article_id]))
+    await call.message.edit_reply_markup(reply_markup=get_article_inline_kb(article_id,likes,dislikes,saved))
+    await call.answer()
+
 @router.callback_query(F.data.startswith("like_") | F.data.startswith("dis_"))
 async def process_post_voting(call: CallbackQuery, db: D1Database):
     parts = call.data.split("_")
