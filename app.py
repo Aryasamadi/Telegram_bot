@@ -899,39 +899,128 @@ class AIProviderManager:
             return content,data,latency,usage,protocol,endpoint
 
     async def test_provider_values(self, base_url, api_key, model):
+        """Universal provider test.
+
+        The test intentionally follows the proven minimal OpenAI-compatible request
+        used by the reference bot: model + messages only.  A GET /models preflight is
+        NOT required because many gateways disable /models while /chat/completions
+        works perfectly.  For Gemini/Anthropic native endpoints we use their native
+        wire format.  If the minimal OpenAI-compatible request fails with a 4xx, a
+        second compatibility attempt adds temperature/max_tokens so providers that
+        require those fields can still be accepted.
+        """
         await self.start()
         base=(base_url or "").strip(); key=(api_key or "").strip(); mdl=(model or "").strip()
-        if not base: return {"ok":False,"stage":"validation","error":"Base URL خالی است."}
-        if not key: return {"ok":False,"stage":"validation","error":"API Key/Token خالی است."}
-        if not mdl: return {"ok":False,"stage":"validation","error":"نام دقیق مدل خالی است."}
-        protocol=self.protocol(base)
-        candidates=[(protocol,self.endpoint(base,protocol,mdl))]
+        if not base:
+            return {"ok":False,"stage":"validation","error":"Base URL خالی است."}
+        if not key:
+            return {"ok":False,"stage":"validation","error":"API Key/Token خالی است."}
+        if not mdl:
+            return {"ok":False,"stage":"validation","error":"نام دقیق مدل خالی است."}
+
+        detected=self.protocol(base)
+        candidates=[(detected,self.endpoint(base,detected,mdl))]
+        # Gemini can be supplied either as native v1beta or as Google's official
+        # OpenAI-compatible endpoint. Try the alternate wire format too.
         if "generativelanguage.googleapis.com" in base:
             compat=self.google_openai_endpoint(base)
-            if compat and all(ep!=compat for _,ep in candidates):
+            if compat and all(ep != compat for _,ep in candidates):
                 candidates.append(("openai",compat))
+            native=self.endpoint("https://generativelanguage.googleapis.com/v1beta","gemini",mdl)
+            if all(ep != native for _,ep in candidates):
+                candidates.append(("gemini",native))
+
         diagnostics=[]
-        for proto,endpoint in candidates:
-            preflight="not_run"
+        for proto, endpoint in candidates:
+            started=time.perf_counter()
             try:
-                if "generativelanguage.googleapis.com" in endpoint:
-                    headers={"x-goog-api-key":key,"User-Agent":HTTP_USER_AGENT} if proto=="gemini" else {"Authorization":f"Bearer {key}","User-Agent":HTTP_USER_AGENT}
-                    model_path=(f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(mdl,safe='')}" if proto=="gemini" else f"https://generativelanguage.googleapis.com/v1beta/openai/models/{urllib.parse.quote(mdl,safe='')}")
-                    async with self._session.get(model_path,headers=headers,timeout=aiohttp.ClientTimeout(total=15)) as r:
-                        pre_raw=await r.text()
-                        if r.status==200: preflight="ok"
-                        else:
-                            diagnostics.append(f"{proto} preflight HTTP {r.status}: {pre_raw[:700]}")
-                            preflight=f"HTTP {r.status}"
-                content,data,latency,usage,actual_proto,actual_endpoint=await self._request(
-                    {"base_url":base,"encrypted_api_key":encrypt_secret(key),"model_name":mdl},
-                    [{"role":"system","content":"You are a connectivity test. Do not analyze anything."},{"role":"user","content":"Reply with exactly: TEST_OK"}],
-                    0,32,forced_protocol=proto,forced_endpoint=endpoint)
-                return {"ok":True,"latency_ms":latency,"preview":content.strip()[:120],"usage":usage,"protocol":actual_proto,"endpoint":actual_endpoint,"preflight":preflight,"diagnostics":diagnostics}
+                headers={"Content-Type":"application/json","User-Agent":HTTP_USER_AGENT}
+                if proto=="anthropic":
+                    headers["x-api-key"]=key
+                    headers["anthropic-version"]="2023-06-01"
+                    payload={
+                        "model":mdl,
+                        "messages":[{"role":"user","content":"Reply with exactly: TEST_OK"}],
+                        "max_tokens":32,
+                    }
+                elif proto=="gemini":
+                    headers["x-goog-api-key"]=key
+                    payload={
+                        "contents":[{"role":"user","parts":[{"text":"Reply with exactly: TEST_OK"}]}],
+                        "generationConfig":{"maxOutputTokens":32},
+                    }
+                else:
+                    # Deliberately minimal: this is the same compatibility trick as
+                    # the reference bot and avoids gateways rejecting optional fields.
+                    headers["Authorization"]=f"Bearer {key}"
+                    payload={
+                        "model":mdl,
+                        "messages":[{"role":"user","content":"Reply with exactly: TEST_OK"}],
+                    }
+
+                async with self._session.post(endpoint,headers=headers,json=payload,timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    raw=await resp.text()
+                    latency=int((time.perf_counter()-started)*1000)
+                    try:
+                        data=json.loads(raw)
+                    except Exception:
+                        data={}
+
+                    if resp.status==200:
+                        content=self._extract_content(proto,data)
+                        if content:
+                            return {
+                                "ok":True,
+                                "latency_ms":latency,
+                                "preview":content.strip()[:120],
+                                "usage":(data.get("usageMetadata") if proto=="gemini" else data.get("usage")) or {},
+                                "protocol":proto,
+                                "endpoint":endpoint,
+                                "preflight":"skipped_by_design",
+                                "diagnostics":diagnostics,
+                            }
+                        reason=self._empty_response_reason(proto,data)
+                        diagnostics.append(f"{proto} HTTP 200 اما پاسخ قابل استخراج نبود: {reason} | response={raw[:1800]}")
+                        continue
+
+                    # A second, still conservative OpenAI-compatible attempt. Some
+                    # gateways require max_tokens/temperature even though the minimal
+                    # request is otherwise valid.
+                    if proto=="openai" and resp.status in {400,422}:
+                        retry_payload={**payload,"temperature":0,"max_tokens":32}
+                        retry_started=time.perf_counter()
+                        async with self._session.post(endpoint,headers=headers,json=retry_payload,timeout=aiohttp.ClientTimeout(total=30)) as r2:
+                            raw2=await r2.text()
+                            retry_latency=int((time.perf_counter()-retry_started)*1000)
+                            try: data2=json.loads(raw2)
+                            except Exception: data2={}
+                            if r2.status==200:
+                                content2=self._extract_content("openai",data2)
+                                if content2:
+                                    return {
+                                        "ok":True,
+                                        "latency_ms":retry_latency,
+                                        "preview":content2.strip()[:120],
+                                        "usage":data2.get("usage") or {},
+                                        "protocol":"openai",
+                                        "endpoint":endpoint,
+                                        "preflight":"skipped_by_design",
+                                        "diagnostics":diagnostics,
+                                        "compat_retry":True,
+                                    }
+                            diagnostics.append(f"openai retry HTTP {r2.status}: {raw2[:1400]}")
+                    diagnostics.append(f"{proto} HTTP {resp.status}: endpoint={endpoint} | body={raw[:1600]}")
             except Exception as e:
-                diagnostics.append(f"{proto} {endpoint}: {str(e)[:1600]}")
-                continue
-        return {"ok":False,"stage":"request","protocol":protocol,"endpoint":candidates[0][1],"error":"\n\n".join(diagnostics)[:5000],"diagnostics":diagnostics}
+                diagnostics.append(f"{proto} {endpoint}: {type(e).__name__}: {str(e)[:1800]}")
+
+        return {
+            "ok":False,
+            "stage":"request",
+            "protocol":detected,
+            "endpoint":candidates[0][1] if candidates else "",
+            "error":"\n\n".join(diagnostics)[:7000],
+            "diagnostics":diagnostics,
+        }
 
     async def gemini_web_scout(self, site_url:str, max_items:int=5) -> Dict[str,Any]:
         await self.start()
