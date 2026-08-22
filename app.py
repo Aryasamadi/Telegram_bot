@@ -48,7 +48,7 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "10.4.0-content-db-queue-editor-deeplink-report-final"
+BUILD_VERSION = "10.6.0-rich-publish-fast-ui-minute-schedule-final"
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_AI_WORKERS = 3
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -72,6 +72,7 @@ DEFAULT_SOURCE_INTERVAL_MINUTES = int(os.getenv("DEFAULT_SOURCE_INTERVAL_MINUTES
 DEFAULT_MAX_DAILY_POSTS = int(os.getenv("MAX_DAILY_POSTS", "6"))
 DEFAULT_MIN_CONTENT_SCORE = float(os.getenv("MIN_CONTENT_SCORE", "75"))
 DEFAULT_MIN_HOURS_BETWEEN_POSTS = float(os.getenv("MIN_HOURS_BETWEEN_POSTS", "2"))
+DEFAULT_MIN_POST_GAP_MINUTES = max(1, int(round(DEFAULT_MIN_HOURS_BETWEEN_POSTS * 60)))
 DEFAULT_PUBLISH_START_HOUR = int(os.getenv("PUBLISH_START_HOUR", "8"))
 DEFAULT_PUBLISH_END_HOUR = int(os.getenv("PUBLISH_END_HOUR", "23"))
 CONTENT_RETENTION_DAYS = int(os.getenv("CONTENT_RETENTION_DAYS", "30"))
@@ -275,6 +276,7 @@ async def initialize_automation_database(db: D1Database):
         "max_daily_posts": str(DEFAULT_MAX_DAILY_POSTS),
         "min_content_score": str(DEFAULT_MIN_CONTENT_SCORE),
         "min_hours_between_posts": str(DEFAULT_MIN_HOURS_BETWEEN_POSTS),
+        "min_post_gap_minutes": str(DEFAULT_MIN_POST_GAP_MINUTES),
         "publish_start_hour": str(DEFAULT_PUBLISH_START_HOUR),
         "publish_end_hour": str(DEFAULT_PUBLISH_END_HOUR),
         "default_source_interval": str(DEFAULT_SOURCE_INTERVAL_MINUTES),
@@ -307,6 +309,16 @@ async def initialize_automation_database(db: D1Database):
     }
     for k, v in defaults.items():
         await db.execute("INSERT OR IGNORE INTO automation_settings(key, value) VALUES(?, ?)", [k, v])
+    # مهاجرت تنظیم فاصله انتشار: اگر نصب قبلی مقدار ساعتی داشته، همان مقدار به دقیقه منتقل شود.
+    try:
+        gap_rows = await db.execute("SELECT value FROM automation_settings WHERE key='min_post_gap_minutes'")
+        legacy_rows = await db.execute("SELECT value FROM automation_settings WHERE key='min_hours_between_posts'")
+        current_gap = float(gap_rows[0].get('value')) if gap_rows and gap_rows[0].get('value') not in (None,'') else 0
+        legacy_gap = float(legacy_rows[0].get('value')) if legacy_rows and legacy_rows[0].get('value') not in (None,'') else 0
+        if current_gap == DEFAULT_MIN_POST_GAP_MINUTES and legacy_gap > 0 and abs(legacy_gap*60-current_gap) > 0.01:
+            await db.execute("UPDATE automation_settings SET value=? WHERE key='min_post_gap_minutes'", [str(int(round(legacy_gap*60)))])
+    except Exception:
+        pass
     # Provider قدیمی محیطی را از چرخه failover خارج می‌کنیم؛ مدیر فقط مدل‌هایی را که
     # خودش در پنل تست کرده است وارد اتوماسیون می‌کند.
     try:
@@ -731,6 +743,7 @@ async def enrich_candidate_content(item: Dict[str, Any]) -> Dict[str, Any]:
         item["description"] = item.get("description") or parsed["description"]
         item["body"] = parsed["body"][:14000]
         item["image_url"] = item.get("image_url") or parsed["image_url"]
+        item["links"] = parsed.get("links", [])[:25]
         item["url"] = parsed["canonical_url"] or item["url"]
     except Exception:
         pass
@@ -1282,6 +1295,44 @@ def rich_article_fallback(title: str, text: str, source_url: str) -> str:
             f"<blockquote>این مطلب بر پایه اطلاعات منبع تهیه شده؛ جزئیات و زمینه را می‌توانید از متن کامل بخوانید.</blockquote>\n"
             f"<a href=\"{html.escape(source_url,quote=True)}\">🔗 منبع اصلی</a>")
 
+def sanitize_resource_links(raw_links):
+    out=[]; seen=set()
+    if not isinstance(raw_links,list): return out
+    for item in raw_links:
+        if not isinstance(item,dict): continue
+        url=normalize_url(str(item.get("url") or ""))
+        label=strip_html_text(str(item.get("label") or item.get("title") or "")).strip()
+        if not url.startswith(("http://","https://")) or not label or url in seen: continue
+        seen.add(url); out.append({"label":label[:120],"url":url})
+    return out[:5]
+
+def append_resource_links(article_html: str, resource_links, source_url: str = "") -> str:
+    links=sanitize_resource_links(resource_links); rendered=[]
+    for x in links:
+        rendered.append(f'<a href="{html.escape(x["url"],quote=True)}">🔗 {html.escape(x["label"])}</a>')
+    if not rendered and source_url:
+        u=normalize_url(source_url)
+        if u: rendered.append(f'<a href="{html.escape(u,quote=True)}">🔗 منبع اصلی</a>')
+    if not rendered: return article_html
+    return article_html.rstrip()+"\n\n<b>🔗 لینک‌های مرتبط</b>\n"+"\n".join(rendered)
+
+async def resolve_article_image(db: D1Database, article: dict) -> str:
+    existing=normalize_url(article.get("image_url") or "")
+    if existing: return existing
+    source_url=normalize_url(article.get("source_url") or "")
+    if not source_url: return ""
+    try:
+        session=await get_http_session()
+        raw,_=await http_get(source_url,session)
+        parsed=extract_html_page(raw,source_url)
+        image=normalize_url(parsed.get("image_url") or "")
+        if image: await db.execute("UPDATE articles SET image_url=? WHERE id=?",[image,int(article.get("id"))])
+        return image
+    except Exception as exc:
+        try: await log_automation(db,"WARN","article_image_resolution_failed",f"article={article.get('id')} {str(exc)[:220]}")
+        except Exception: pass
+        return ""
+
 def make_article_png(width=1280,height=720):
     # کارت تصویری fallback؛ بدون وابستگی به PIL. برای زمانی که منبع عکس قابل دریافت نیست.
     raw=bytearray()
@@ -1454,6 +1505,8 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
 منبع: {source.get('name')}
 عنوان: {item.get('title')}
 URL: {item.get('url')}
+لینک‌های داخل صفحه:
+{json.dumps(item.get('links') or [], ensure_ascii=False)[:5000]}
 متن منبع:
 {body}
 
@@ -1480,17 +1533,20 @@ URL: {item.get('url')}
 قواعد نگارش:
 - فارسی روان، دوستانه، عامیانه و خوش‌خوان؛ رسمی و خشک نباش.
 - اگر اصطلاح فنی لازم است، معادل فارسی + اصطلاح انگلیسی را بیاور.
-- در هر پاراگراف یک ایموجی دقیق و مرتبط استفاده کن؛ از تکرار بی‌هدف ایموجی‌ها خودداری کن.
-- متن را با تیتر، پاراگراف‌های کوتاه، Bold، Italic و در صورت طبیعی Quote خوش‌خوان کن.
+- در هر پاراگراف اصلی یک ایموجی دقیق و مرتبط داشته باش؛ تکراری و تزئینی نباشد.
+- نسخه کانال باید 2 تا 4 نشانه بصری متنوع داشته باشد و فاصله‌گذاری طبیعی موبایلی داشته باشد.
+- نسخه کامل باید تیترهای کوتاه Bold و در بخش‌های مهم 2 تا 3 Quote واقعی از منبع داشته باشد، فقط وقتی مناسب است.
+- متن را با تیتر، پاراگراف‌های کوتاه، Bold، Italic و Quote خوش‌خوان کن.
 - سؤال‌هایی مثل «هدف چیست؟» یا «چه معنایی دارد؟» را به عنوان سؤال رها نکن؛ پاسخ و اطلاعات موجود در منبع را مستقیم بیان کن.
 - هیچ نتیجه‌گیری شخصی یا قضاوتی به کاربر تحمیل نکن.
 - «طبق منبع»، «گزارش شده» و «این شرکت گفته» را فقط وقتی لازم است برای نسبت‌دادن ادعا استفاده کن.
 - چیزی را که در منبع نیست به عنوان واقعیت نساز.
 - channel_html و article_html را با HTML سازگار با Telegram بده؛ Markdown استفاده نکن.
-- لینک منبع را خودت داخل channel_html یا article_html قرار نده؛ برنامه آن را اضافه می‌کند.
+- اگر متن یک سایت، ثبت‌نام، دوره، ابزار، مستندات یا صفحه مشخصی را معرفی کرده و URL آن در «لینک‌های داخل صفحه» وجود دارد، آن را در resource_links برگردان. URL را حدس نزن.
+- لینک Deep Link مقاله توسط برنامه اضافه می‌شود.
 
 فقط JSON معتبر:
-{{"accept":true/false,"score":0-100,"global_relevance":0-10,"technology_relevance":0-10,"ai_relevance":0-10,"cyber_relevance":0-10,"education_relevance":0-10,"iran_relevance":0-10,"freshness":0-10,"reliability":0-10,"duplicate_risk":0-10,"category":"ai|tech|cyber|edu|general","why":"دلیل داخلی کوتاه","title":"...","channel_html":"...","article_html":"...","facts":["..."]}}"""
+{{"accept":true/false,"score":0-100,"global_relevance":0-10,"technology_relevance":0-10,"ai_relevance":0-10,"cyber_relevance":0-10,"education_relevance":0-10,"iran_relevance":0-10,"freshness":0-10,"reliability":0-10,"duplicate_risk":0-10,"category":"ai|tech|cyber|edu|general","why":"دلیل داخلی کوتاه","title":"...","channel_html":"...","article_html":"...","facts":["..."],"resource_links":[{"label":"...","url":"https://..."}]}}"""
     result=await ai.call([{"role":"system","content":"You are a Persian technology content producer. Be neutral and factual. Return JSON only."},{"role":"user","content":prompt}],0.35,5000,"editorial")
     obj=parse_json_object(result.get("content",""))
     if not obj:
@@ -1503,7 +1559,12 @@ URL: {item.get('url')}
     category=str(obj.get("category") or source.get("category") or "tech")
     ch=ensure_rich_channel_format(title, obj.get("channel_html") or obj.get("channel_text") or "", category)
     ar=ensure_rich_article_format(title, obj.get("article_html") or obj.get("article_text") or "", item.get("url") or "")
-    obj["title"]=title; obj["channel_html"]=ch; obj["article_html"]=ar
+    resource_links=sanitize_resource_links(obj.get("resource_links"))
+    ar=append_resource_links(ar, resource_links, item.get("url") or "")
+    if resource_links:
+        first=resource_links[0]
+        ch += f'\n\n<a href="{html.escape(first["url"],quote=True)}">🔗 {html.escape(first["label"])}</a>'
+    obj["title"]=title; obj["channel_html"]=ch; obj["article_html"]=ar; obj["resource_links"]=resource_links
     # امتیاز نهایی را خود ربات از وزن‌های مدیر محاسبه می‌کند؛ بنابراین تغییر وزن واقعاً اثر دارد.
     dims={
         "global":float(obj.get("global_relevance",5) or 0),
@@ -1556,8 +1617,6 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
             next_check=(now+timedelta(minutes=int(source.get('interval_minutes') or DEFAULT_SOURCE_INTERVAL_MINUTES))).isoformat()
             await db.execute('UPDATE sources SET last_checked_at=?,next_check_at=?,last_error=? WHERE id=?',[now.isoformat(),next_check,'; '.join(stats['diagnostics'][-4:])[:1200],source_id])
             return stats
-        next_check=(now+timedelta(minutes=int(source.get('interval_minutes') or DEFAULT_SOURCE_INTERVAL_MINUTES))).isoformat()
-        await db.execute('UPDATE sources SET last_checked_at=?,next_check_at=?,last_error=NULL WHERE id=?',[now.isoformat(),next_check,source_id])
         recent_rows=await db.execute("SELECT title FROM articles WHERE status IN ('published','ready') ORDER BY id DESC LIMIT 50")
         recent_titles=[r.get('title','') for r in recent_rows]
         weight_keys=['global','technology','ai','cyber','education','iran','freshness','source','novelty']
@@ -1669,11 +1728,15 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                             stats['diagnostics'].append(f"Scout process: {str(scout_error)[:180]}")
             else:
                 stats['diagnostics'].append('🤖 Web Scout پس از رد مستقیم‌ها نیز نتیجه‌ای نداد.')
+        finished=datetime.now(timezone.utc)
+        next_check=(finished+timedelta(minutes=int(source.get('interval_minutes') or DEFAULT_SOURCE_INTERVAL_MINUTES))).isoformat()
+        await db.execute('UPDATE sources SET last_checked_at=?,next_check_at=?,last_error=NULL WHERE id=?',[finished.isoformat(),next_check,source_id])
         await log_automation(db,'INFO','source_cycle',json.dumps(stats,ensure_ascii=False)[:1800])
         return stats
     except Exception as e:
         stats['errors']+=1; stats['diagnostics'].append(str(e)[:500])
-        await db.execute('UPDATE sources SET last_checked_at=?,next_check_at=?,last_error=? WHERE id=?',[now.isoformat(),(now+timedelta(minutes=int(source.get('interval_minutes') or DEFAULT_SOURCE_INTERVAL_MINUTES))).isoformat(),str(e)[:1200],source_id])
+        failed_at=datetime.now(timezone.utc)
+        await db.execute('UPDATE sources SET last_checked_at=?,next_check_at=?,last_error=? WHERE id=?',[failed_at.isoformat(),(failed_at+timedelta(minutes=int(source.get('interval_minutes') or DEFAULT_SOURCE_INTERVAL_MINUTES))).isoformat(),str(e)[:1200],source_id])
         await log_automation(db,'ERROR','source_cycle_failed',json.dumps(stats,ensure_ascii=False)[:1600])
         return stats
 
@@ -1700,8 +1763,8 @@ async def can_publish_now(db: D1Database) -> bool:
         latest = max(latest_times)
         try:
             delta = datetime.now(timezone.utc) - datetime.fromisoformat(latest.replace("Z", "+00:00"))
-            min_hours = float(await get_setting(db, "min_hours_between_posts", str(DEFAULT_MIN_HOURS_BETWEEN_POSTS)))
-            if delta.total_seconds() < min_hours * 3600:
+            min_gap = float(await get_setting(db, "min_post_gap_minutes", str(DEFAULT_MIN_POST_GAP_MINUTES)))
+            if delta.total_seconds() < min_gap * 60:
                 return False
         except Exception:
             pass
@@ -1755,13 +1818,17 @@ async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> b
         if not token or not bot_username: raise RuntimeError("deep link token یا نام کاربری ربات تنظیم نشده است")
         deep_link=f"https://t.me/{bot_username}?start=article_{token}"
         channel_id=await get_channel_id(db)
-        channel_text=sanitize_telegram_html(row.get("channel_text") or row.get("title") or "")
+        title_out=str(row.get("title") or "مطلب")
+        channel_text=ensure_rich_channel_format(title_out,row.get("channel_text") or "",str(row.get("category") or "tech"))
+        source_url=normalize_url(row.get("source_url") or "")
+        if source_url and "<a href=" not in channel_text.lower():
+            channel_text += f"\n\n<a href=\"{html.escape(source_url,quote=True)}\">🔗 منبع اصلی</a>"
         channel_text += f"\n\n<a href=\"{html.escape(deep_link,quote=True)}\">📖 بیشتر بخوانید</a>"
-        image_url=row.get("image_url") or ""
+        image_url=await resolve_article_image(db,row)
         sent=None
         if image_url:
             try:
-                sent=await bot.send_photo(chat_id=channel_id,photo=image_url,caption=channel_text[:1024],parse_mode="HTML")
+                sent=await bot.send_photo(chat_id=channel_id,photo=image_url,caption=publication_caption(title_out,channel_text,deep_link),parse_mode="HTML")
             except Exception as img_error:
                 await log_automation(db,"WARN","source_image_failed",f"article={article_id} {img_error}")
         if sent is None:
@@ -1839,11 +1906,41 @@ async def automation_loop(db: D1Database, bot: Bot):
                 await log_automation(db,'ERROR','automation_loop_failed',str(e)[:1500])
                 await set_setting(db,'last_cycle_result',json.dumps({'error':str(e)[:1000]},ensure_ascii=False))
                 await set_setting(db,'worker_heartbeat_at',datetime.now(timezone.utc).isoformat())
-            await asyncio.sleep(15)
+            await asyncio.sleep(2)
     finally:
         await ai.close()
 
 
+
+def format_duration_minutes(value) -> str:
+    try: m=max(0,int(float(value)))
+    except Exception: m=0
+    if m < 60: return f"{m} دقیقه"
+    h=m//60; rem=m%60
+    return f"{h} ساعت" if rem==0 else f"{h} ساعت و {rem} دقیقه"
+
+async def get_schedule_panel(db:D1Database):
+    channel_id=await get_channel_id(db); channel_username=await get_setting(db,"channel_username","")
+    shown=html.escape(channel_username) if channel_username else ("✅ کانال خصوصی تنظیم شده" if channel_id else "⛔ تنظیم نشده")
+    enabled=(await get_setting(db,"automation_enabled","0"))=="1"
+    max_daily=await get_setting(db,"max_daily_posts",str(DEFAULT_MAX_DAILY_POSTS))
+    gap=int(float(await get_setting(db,"min_post_gap_minutes",str(DEFAULT_MIN_POST_GAP_MINUTES))))
+    src_interval=await get_setting(db,"default_source_interval",str(DEFAULT_SOURCE_INTERVAL_MINUTES))
+    workers=await get_setting(db,"max_workers",str(DEFAULT_MAX_WORKERS))
+    ai_workers=await get_setting(db,"max_ai_workers",str(DEFAULT_MAX_AI_WORKERS))
+    est=await next_publication_estimate(db)
+    if est["minutes"]<=0: nxt="آماده انتشار طبق برنامه"
+    elif est["minutes"]<60: nxt=f"حدود {est['minutes']} دقیقه دیگر"
+    else: nxt=f"حدود {est['minutes']//60} ساعت و {est['minutes']%60} دقیقه دیگر"
+    text=("📢 <b>انتشار و زمان‌بندی</b>\n\n"
+          f"📢 کانال: <b>{shown}</b>\n"
+          f"🤖 اتوماسیون: <b>{'🟢 فعال' if enabled else '🔴 خاموش'}</b>\n\n"
+          f"🔢 سقف روزانه: <b>{max_daily}</b> پست\n"
+          f"⏱ فاصله انتشار: <b>{format_duration_minutes(gap)}</b>\n"
+          f"🌐 فاصله بررسی منابع: <b>{src_interval} دقیقه</b>\n"
+          f"⚡ Worker منابع: <b>{workers}</b> · 🧠 Worker AI: <b>{ai_workers}</b>\n"
+          f"🕐 نوبت تقریبی بعدی: <b>{nxt}</b>")
+    return text, schedule_menu_kb()
 
 async def automation_report(db: D1Database) -> str:
     settings={
@@ -1851,7 +1948,7 @@ async def automation_report(db: D1Database) -> str:
         'max_daily':await get_setting(db,'max_daily_posts',str(DEFAULT_MAX_DAILY_POSTS)),
         'min_score':await get_setting(db,'min_content_score',str(DEFAULT_MIN_CONTENT_SCORE)),
         'source_interval':await get_setting(db,'default_source_interval',str(DEFAULT_SOURCE_INTERVAL_MINUTES)),
-        'publish_gap':await get_setting(db,'min_hours_between_posts',str(DEFAULT_MIN_HOURS_BETWEEN_POSTS)),
+        'publish_gap':await get_setting(db,'min_post_gap_minutes',str(DEFAULT_MIN_POST_GAP_MINUTES)),
     }
     sources=await db.execute("SELECT COUNT(*) c FROM sources WHERE enabled=1")
     discovered=await db.execute("SELECT COUNT(*) c FROM source_items WHERE discovered_at>=?",[(datetime.now(timezone.utc)-timedelta(days=1)).isoformat()])
@@ -1899,13 +1996,29 @@ async def automation_report(db: D1Database) -> str:
         f"❌ انتشار ناموفق ۲۴ ساعت: <b>{failed[0].get('c',0) if failed else 0}</b>\n"
         f"⭐ حداقل امتیاز: <b>{settings['min_score']}</b>\n"
         f"⏱ فاصله بررسی منابع: <b>{settings['source_interval']} دقیقه</b>\n"
-        f"📢 فاصله انتشار: <b>{settings['publish_gap']} ساعت</b>\n"
+        f"📢 فاصله انتشار: <b>{format_duration_minutes(settings['publish_gap'])}</b>\n"
         f"💓 Heartbeat: <b>{hb_label}</b>\n"
         f"🕐 آخرین شروع چرخه: <b>{html.escape(last_started or 'هنوز اجرا نشده')}</b>\n"
         f"✅ آخرین پایان چرخه: <b>{html.escape(last_cycle or 'هنوز اجرا نشده')}</b>\n"
         f"📋 آخرین نتیجه: <b>{html.escape(result_line)}</b>"
     )
 
+
+async def automation_overview(db: D1Database) -> str:
+    enabled=await get_setting(db,"automation_enabled","0")=="1"
+    sources=await db.execute("SELECT COUNT(*) c FROM sources WHERE enabled=1")
+    queued=await db.execute("SELECT COUNT(*) c FROM publication_queue WHERE status='queued'")
+    max_daily=await get_setting(db,"max_daily_posts",str(DEFAULT_MAX_DAILY_POSTS))
+    gap=await get_setting(db,"min_post_gap_minutes",str(DEFAULT_MIN_POST_GAP_MINUTES))
+    interval=await get_setting(db,"default_source_interval",str(DEFAULT_SOURCE_INTERVAL_MINUTES))
+    return ("📰 <b>اتوماسیون محتوا</b>\n\n"
+            f"🤖 وضعیت: <b>{'🟢 فعال' if enabled else '🔴 خاموش'}</b>\n"
+            f"🌐 منابع فعال: <b>{sources[0].get('c',0) if sources else 0}</b>\n"
+            f"📥 صف فعلی: <b>{queued[0].get('c',0) if queued else 0}</b>\n"
+            f"🔢 سقف روزانه: <b>{max_daily}</b>\n"
+            f"⏱ فاصله انتشار: <b>{format_duration_minutes(gap)}</b>\n"
+            f"🌐 فاصله بررسی منابع: <b>{interval} دقیقه</b>\n\n"
+            "ℹ️ گزارش کامل فقط از دکمه «📊 گزارش» نمایش داده می‌شود.")
 
 def automation_menu_kb(enabled: bool) -> InlineKeyboardMarkup:
     state_text = "⏸ خاموش کردن اتوماسیون" if enabled else "▶️ روشن کردن اتوماسیون"
@@ -1914,7 +2027,7 @@ def automation_menu_kb(enabled: bool) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=state_text, callback_data=state_cb)],
         [InlineKeyboardButton(text="🌐 منابع خبری", callback_data="auto_sources"), InlineKeyboardButton(text="🤖 مدل‌های AI", callback_data="auto_providers")],
         [InlineKeyboardButton(text="📢 انتشار و زمان‌بندی", callback_data="auto_channel"), InlineKeyboardButton(text="🧠 کیفیت محتوا", callback_data="auto_quality")],
-        [InlineKeyboardButton(text="🗃 محتوا و داده‌ها", callback_data="auto_content_db"), InlineKeyboardButton(text="📥 صف انتشار", callback_data="auto_queue")],
+        [InlineKeyboardButton(text="🗃 محتوا و داده‌ها", callback_data="auto_content_db")],
         [InlineKeyboardButton(text="🧪 تست و سلامت", callback_data="auto_health"), InlineKeyboardButton(text="📊 گزارش", callback_data="auto_report")],
         [InlineKeyboardButton(text="🔙 پنل اصلی", callback_data="admin_home")]
     ])
@@ -1946,9 +2059,10 @@ def quality_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ حداقل امتیاز انتشار", callback_data="set_min_score")],
         [InlineKeyboardButton(text="🎯 وزن معیارهای محتوا", callback_data="quality_weights")],
-        [InlineKeyboardButton(text="🧾 معیارها", callback_data="quality_about")],
+        [InlineKeyboardButton(text="✍️ دستورهای تولید محتوا", callback_data="editorial_prompts")],
         [InlineKeyboardButton(text="🔙 اتوماسیون محتوا", callback_data="auto_back")]
     ])
+
 
 def schedule_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1958,6 +2072,7 @@ def schedule_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⚡ Workerهای بررسی منابع", callback_data="set_workers")],
         [InlineKeyboardButton(text="🧠 Workerهای AI", callback_data="set_ai_workers")],
         [InlineKeyboardButton(text="🛡 راستی‌آزمایی AI", callback_data="set_ai_verify")],
+        [InlineKeyboardButton(text="🚀 همین حالا منتشر کن", callback_data="publish_now")],
         [InlineKeyboardButton(text="🔙 اتوماسیون محتوا", callback_data="auto_back")]
     ])
 
@@ -2372,7 +2487,7 @@ async def cmd_start(message: Message, state: FSMContext, db: D1Database, bot: Bo
     args = message.text.split()
     if len(args) > 1:
         deep_arg = args[1]
-        if deep_arg.startswith("auto_"):
+        if deep_arg.startswith(("auto_", "article_")):
             ok=await deliver_article_by_token(message,bot,db,deep_arg)
             if ok:
                 admin_mode = state_data.get("admin_mode", "user")
@@ -2850,8 +2965,8 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
     elif text == "⚙️ اتوماسیون محتوا":
         if user_id == ADMIN_ID:
             enabled = (await get_setting(db, "automation_enabled", "0")) == "1"
-            report = await automation_report(db)
-            await message.answer(report, reply_markup=automation_menu_kb(enabled))
+            overview = await automation_overview(db)
+            await message.answer(overview, parse_mode="HTML", reply_markup=automation_menu_kb(enabled))
         else:
             await message.answer("⛔ شما دسترسی مدیریت ندارید.")
 
@@ -2910,7 +3025,12 @@ async def admin_automation_setting_input(message:Message,state:FSMContext,db:D1D
         elif key.startswith("weight_"):
             value=str(max(0,min(100,float(value)))); await set_setting(db,key,value); parent="quality_weights"
         elif key in {"max_daily_posts","default_source_interval"}:
-            value=str(max(1,int(value))); await set_setting(db,key,value); parent="auto_schedule"
+            value=str(max(1,int(value)))
+            await set_setting(db,key,value)
+            if key == "default_source_interval":
+                now_interval=datetime.now(timezone.utc).isoformat()
+                await db.execute("UPDATE sources SET interval_minutes=?, next_check_at=? WHERE enabled=1",[int(value),now_interval])
+            parent="auto_schedule"
         elif key in {"max_workers","max_ai_workers"}:
             value=str(max(1,min(4,int(value)))); await set_setting(db,key,value); parent="auto_schedule"
         elif key=="min_content_score":
@@ -2920,7 +3040,10 @@ async def admin_automation_setting_input(message:Message,state:FSMContext,db:D1D
             if len(value)>5000: value=value[:5000]
             await set_setting(db,key,value); parent="auto_quality"
         elif key=="min_hours_between_posts":
-            value=str(max(0,float(value))); await set_setting(db,key,value); parent="auto_schedule"
+            minutes=max(1,int(float(value)))
+            await set_setting(db,"min_post_gap_minutes",str(minutes))
+            await set_setting(db,"min_hours_between_posts",str(minutes/60))
+            parent="auto_schedule"
         elif key=="ai_verify_mode":
             if value not in {"auto","always","off"}: raise ValueError("auto / always / off")
             await set_setting(db,key,value); parent="auto_schedule"
@@ -2931,7 +3054,7 @@ async def admin_automation_setting_input(message:Message,state:FSMContext,db:D1D
             # برنامه‌ریزی دستی فقط همان اولین آیتم آماده را جابه‌جا می‌کند.
             when=(datetime.now(timezone.utc)+timedelta(minutes=delay)).isoformat()
             await db.execute("UPDATE publication_queue SET scheduled_at=? WHERE article_id=? AND status='queued'",[when,row[0]['article_id']])
-            parent="auto_channel"
+            parent="auto_schedule"
         else:
             raise ValueError("setting not supported")
         await state.set_state(BotStates.idle)
@@ -2940,11 +3063,7 @@ async def admin_automation_setting_input(message:Message,state:FSMContext,db:D1D
         panel_id=data.get("panel_message_id")
         if panel_id:
             if parent=="auto_schedule":
-                channel_id=await get_channel_id(db); channel_username=await get_setting(db,'channel_username','')
-                enabled=(await get_setting(db,'automation_enabled','0'))=='1'
-                max_daily=await get_setting(db,'max_daily_posts',str(DEFAULT_MAX_DAILY_POSTS)); gap=await get_setting(db,'min_hours_between_posts',str(DEFAULT_MIN_HOURS_BETWEEN_POSTS)); src_interval=await get_setting(db,'default_source_interval',str(DEFAULT_SOURCE_INTERVAL_MINUTES))
-                text=(f"📢 <b>انتشار و زمان‌بندی</b>\n\n📢 کانال: <b>{html.escape(channel_username) if channel_username else ('✅ کانال خصوصی تنظیم شده' if channel_id else '⛔ تنظیم نشده')}</b>\n🤖 اتوماسیون: <b>{'🟢 فعال' if enabled else '🔴 خاموش'}</b>\n\n🔢 سقف روزانه: <b>{max_daily}</b>\n⏱ فاصله انتشار: <b>{gap} ساعت</b>\n🌐 فاصله بررسی: <b>{src_interval} دقیقه</b>")
-                kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📢 تنظیم کانال',callback_data='auto_channel_set')],[InlineKeyboardButton(text='🔢 سقف روزانه',callback_data='set_max_daily'),InlineKeyboardButton(text='⏱ فاصله انتشار',callback_data='set_min_gap')],[InlineKeyboardButton(text='🌐 فاصله بررسی',callback_data='set_default_interval')],[InlineKeyboardButton(text='🚀 همین حالا',callback_data='publish_now'),InlineKeyboardButton(text='📥 صف',callback_data='auto_queue')],[InlineKeyboardButton(text='🔙 اتوماسیون محتوا',callback_data='auto_back')]])
+                text,kb=await get_schedule_panel(db)
                 await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text=text,parse_mode="HTML",reply_markup=kb)
             elif parent=="auto_quality":
                 score=await get_setting(db,"min_content_score",str(DEFAULT_MIN_CONTENT_SCORE))
@@ -3002,9 +3121,9 @@ async def admin_home(call: CallbackQuery, db: D1Database):
 @router.callback_query(F.data == "admin_automation")
 async def admin_automation(call: CallbackQuery, db: D1Database):
     if call.from_user.id != ADMIN_ID: return
-    enabled = (await get_setting(db, 'automation_enabled', '0')) == '1'
-    await call.message.edit_text(await automation_report(db), reply_markup=automation_menu_kb(enabled))
     await call.answer()
+    enabled = (await get_setting(db, 'automation_enabled', '0')) == '1'
+    await call.message.edit_text(await automation_overview(db), parse_mode='HTML', reply_markup=automation_menu_kb(enabled))
 
 
 @router.callback_query(F.data == "admin_ai")
@@ -3092,7 +3211,7 @@ async def render_channel_panel(call: CallbackQuery, db: D1Database):
         shown = '⛔ هنوز تنظیم نشده'
     enabled = (await get_setting(db, 'automation_enabled', '0')) == '1'
     max_daily=await get_setting(db,'max_daily_posts',str(DEFAULT_MAX_DAILY_POSTS))
-    gap=await get_setting(db,'min_hours_between_posts',str(DEFAULT_MIN_HOURS_BETWEEN_POSTS))
+    gap=await get_setting(db,'min_post_gap_minutes',str(DEFAULT_MIN_POST_GAP_MINUTES))
     src_interval=await get_setting(db,'default_source_interval',str(DEFAULT_SOURCE_INTERVAL_MINUTES))
     est=await next_publication_estimate(db)
     if est['minutes']<=0: nxt='آماده انتشار طبق برنامه'
@@ -3102,7 +3221,7 @@ async def render_channel_panel(call: CallbackQuery, db: D1Database):
           f"📢 کانال: <b>{shown}</b>\n"
           f"🤖 اتوماسیون: <b>{'🟢 فعال' if enabled else '🔴 خاموش'}</b>\n\n"
           f"🔢 سقف روزانه: <b>{max_daily}</b>\n"
-          f"⏱ فاصله انتشار: <b>{gap} ساعت</b>\n"
+          f"⏱ فاصله انتشار: <b>{format_duration_minutes(gap)}</b>\n"
           f"🌐 فاصله بررسی منابع: <b>{src_interval} دقیقه</b>\n"
           f"🕐 نوبت بعدی: <b>{nxt}</b>\n\n"
           "مدیر فقط فاصله‌ها را تعیین می‌کند؛ نوبت هر محتوا خودکار محاسبه می‌شود.")
@@ -3111,7 +3230,6 @@ async def render_channel_panel(call: CallbackQuery, db: D1Database):
         [InlineKeyboardButton(text='🔢 سقف پست روزانه',callback_data='set_max_daily'),InlineKeyboardButton(text='⏱ فاصله انتشار',callback_data='set_min_gap')],
         [InlineKeyboardButton(text='🌐 فاصله بررسی منابع',callback_data='set_default_interval')],
         [InlineKeyboardButton(text='🚀 همین حالا منتشر کن',callback_data='publish_now'),InlineKeyboardButton(text='🧪 تست کانال',callback_data='channel_test')],
-        [InlineKeyboardButton(text='📥 صف انتشار',callback_data='auto_queue')],
         [InlineKeyboardButton(text='🔙 اتوماسیون محتوا',callback_data='auto_back')]
     ])
     await call.message.edit_text(text,parse_mode='HTML',reply_markup=kb)
@@ -3119,12 +3237,13 @@ async def render_channel_panel(call: CallbackQuery, db: D1Database):
 @router.callback_query(F.data == "auto_channel")
 async def auto_channel(call: CallbackQuery, db: D1Database):
     if call.from_user.id != ADMIN_ID: return
-    await render_channel_panel(call, db)
     await call.answer()
+    await render_channel_panel(call, db)
 
 @router.callback_query(F.data == "auto_channel_set")
 async def auto_channel_set(call: CallbackQuery, state: FSMContext, db: D1Database):
     if call.from_user.id != ADMIN_ID: return
+    await call.answer()
     await state.set_state(BotStates.admin_channel_input)
     await state.update_data(panel_message_id=call.message.message_id)
     await call.message.edit_text(
@@ -3133,7 +3252,6 @@ async def auto_channel_set(call: CallbackQuery, state: FSMContext, db: D1Databas
         'مثال: <code>@my_channel</code> یا <code>-1001234567890</code>\n\n'
         'ربات باید در کانال ادمین باشد و اجازه انتشار پیام داشته باشد.',
         parse_mode='HTML', reply_markup=get_exit_menu())
-    await call.answer()
 
 @router.callback_query(F.data == "publish_now")
 async def publish_now(call: CallbackQuery, db:D1Database, bot:Bot):
@@ -3144,13 +3262,13 @@ async def publish_now(call: CallbackQuery, db:D1Database, bot:Bot):
         msg="✅ اولین محتوای آماده همین حالا منتشر شد." if ok else "⏸ محتوای آماده‌ای برای انتشار نیست یا سقف روزانه پر شده است."
     except Exception as e:
         msg="❌ انتشار دستی شکست خورد:\n"+html.escape(str(e)[:1200])
-    await call.message.edit_text(msg,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 کانال و انتشار",callback_data="auto_channel")]]))
+    await call.message.edit_text(msg,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 انتشار و زمان‌بندی",callback_data="auto_schedule")]]))
 
 @router.callback_query(F.data == "publish_schedule")
 async def publish_schedule(call:CallbackQuery,state:FSMContext):
     if call.from_user.id!=ADMIN_ID:return
     await state.set_state(BotStates.admin_automation_setting)
-    await state.update_data(automation_setting_key="__publish_delay__",panel_message_id=call.message.message_id,parent_callback="auto_channel")
+    await state.update_data(automation_setting_key="__publish_delay__",panel_message_id=call.message.message_id,parent_callback="auto_schedule")
     await call.message.edit_text("⏱ <b>زمان‌بندی انتشار</b>\n\nچند دقیقه دیگر منتشر شود؟\n\n0 = همین حالا\n2 = دو دقیقه دیگر\n10 = ده دقیقه دیگر\nمثلاً 30",parse_mode="HTML",reply_markup=get_exit_menu()); await call.answer()
 
 @router.callback_query(F.data == "channel_test")
@@ -3276,36 +3394,37 @@ async def user_contact(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "auto_on")
 async def auto_on(call: CallbackQuery, db: D1Database):
-    await set_setting(db, "automation_enabled", "1")
-    await call.message.edit_text((await automation_report(db)), reply_markup=automation_menu_kb(True))
     await call.answer("اتوماسیون فعال شد")
+    await set_setting(db, "automation_enabled", "1")
+    await call.message.edit_text(await automation_overview(db), parse_mode='HTML', reply_markup=automation_menu_kb(True))
 
 
 @router.callback_query(F.data == "auto_off")
 async def auto_off(call: CallbackQuery, db: D1Database):
-    await set_setting(db, "automation_enabled", "0")
-    await call.message.edit_text((await automation_report(db)), reply_markup=automation_menu_kb(False))
     await call.answer("اتوماسیون خاموش شد")
+    await set_setting(db, "automation_enabled", "0")
+    await call.message.edit_text(await automation_overview(db), parse_mode='HTML', reply_markup=automation_menu_kb(False))
 
 
 @router.callback_query(F.data == "auto_back")
 async def auto_back(call: CallbackQuery, db: D1Database):
-    enabled = (await get_setting(db, "automation_enabled", "0")) == "1"
-    await call.message.edit_text(await automation_report(db), reply_markup=automation_menu_kb(enabled))
     await call.answer()
+    enabled = (await get_setting(db, "automation_enabled", "0")) == "1"
+    await call.message.edit_text(await automation_overview(db), parse_mode='HTML', reply_markup=automation_menu_kb(enabled))
 
 
 @router.callback_query(F.data == "auto_report")
 async def auto_report(call:CallbackQuery,db:D1Database):
     if call.from_user.id!=ADMIN_ID:return
-    await call.message.edit_text(await automation_report(db),reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    await call.answer()
+    await call.message.edit_text(await automation_report(db),parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 بروزرسانی",callback_data="auto_report")],
         [InlineKeyboardButton(text="🔙 اتوماسیون محتوا",callback_data="auto_back")]]))
-    await call.answer()
 
 
 @router.callback_query(F.data == "auto_sources")
 async def auto_sources(call: CallbackQuery, db: D1Database):
+    await call.answer()
     rows = await db.execute("SELECT * FROM sources ORDER BY priority DESC, id DESC")
     text = "🌐 منابع محتوا\n\n"
     if not rows:
@@ -3314,7 +3433,6 @@ async def auto_sources(call: CallbackQuery, db: D1Database):
         for s in rows[:20]:
             text += f"{'🟢' if s.get('enabled') else '🔴'} #{s.get('id')} {s.get('name')} | {s.get('interval_minutes')}m | {s.get('category')}\n"
     await call.message.edit_text(text, reply_markup=source_list_kb(rows))
-    await call.answer()
 
 
 @router.callback_query(F.data == "auto_add_source")
@@ -3327,6 +3445,7 @@ async def auto_add_source(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("source_view_"))
 async def source_view(call: CallbackQuery, db: D1Database):
+    await call.answer()
     source_id = int(call.data.split("_")[-1])
     rows = await db.execute("SELECT * FROM sources WHERE id=?", [source_id])
     if not rows:
@@ -3343,7 +3462,6 @@ async def source_view(call: CallbackQuery, db: D1Database):
     ])
     text = f"🌐 #{s['id']} {s.get('name')}\n\nURL: {s.get('url')}\nدسته: {s.get('category')}\nفاصله: {s.get('interval_minutes')} دقیقه\nاولویت: {s.get('priority')}\nآخرین بررسی: {s.get('last_checked_at') or '-'}\nخطا: {s.get('last_error') or '-'}"
     await call.message.edit_text(text, reply_markup=kb)
-    await call.answer()
 
 
 @router.callback_query(F.data.startswith("source_toggle_"))
@@ -3380,7 +3498,6 @@ async def source_interval(call: CallbackQuery, state: FSMContext):
     await state.set_state(BotStates.admin_automation_setting)
     await state.update_data(automation_setting_key="__source_interval__")
     await call.message.edit_text("فاصله بررسی را به دقیقه بفرست. مثلاً 15", reply_markup=get_exit_menu())
-    await call.answer()
 
 
 @router.callback_query(F.data.startswith("source_test_"))
@@ -3413,7 +3530,6 @@ async def auto_providers(call: CallbackQuery, db: D1Database):
         for p in rows:
             text += f"{'🟢' if p.get('enabled') else '🔴'} #{p['id']} {p.get('name')} | {p.get('model_name')} | priority={p.get('priority')}\n"
     await call.message.edit_text(text, parse_mode='HTML', reply_markup=provider_list_kb(rows))
-    await call.answer()
 
 
 @router.callback_query(F.data == "auto_add_provider")
@@ -3546,6 +3662,7 @@ async def provider_model_input(message: Message, state: FSMContext, db: D1Databa
 
 @router.callback_query(F.data.startswith("provider_view_"))
 async def provider_view(call: CallbackQuery, db: D1Database):
+    await call.answer()
     pid = int(call.data.split("_")[-1])
     rows = await db.execute("SELECT id,name,base_url,model_name,priority,enabled,web_enabled,status,last_error,last_latency_ms,cooldown_until FROM ai_providers WHERE id=?", [pid])
     if not rows:
@@ -3566,12 +3683,12 @@ async def provider_view(call: CallbackQuery, db: D1Database):
             f"Latency: {p.get('last_latency_ms') or 0}ms\n"
             f"آخرین خطا: {html.escape(str(p.get('last_error') or '-'))[:500]}")
     await call.message.edit_text(text, parse_mode='HTML', reply_markup=kb)
-    await call.answer()
 
 
 @router.callback_query(F.data.startswith("provider_web_toggle_"))
 async def provider_web_toggle(call: CallbackQuery, db: D1Database):
     if call.from_user.id != ADMIN_ID: return
+    await call.answer()
     pid=int(call.data.rsplit("_",1)[-1])
     rows=await db.execute("SELECT web_enabled FROM ai_providers WHERE id=?",[pid])
     if not rows:
@@ -3583,6 +3700,7 @@ async def provider_web_toggle(call: CallbackQuery, db: D1Database):
 
 @router.callback_query(F.data == "provider_help")
 async def provider_help(call: CallbackQuery):
+    await call.answer()
     text = ("🤖 <b>راهنمای مدل‌های هوش مصنوعی</b>\n\n"
             "برای افزودن هر مدل فقط سه چیز لازم است:\n"
             "1️⃣ Base URL\n2️⃣ Token / API Key\n3️⃣ نام دقیق Model\n\n"
@@ -3598,7 +3716,6 @@ async def provider_help(call: CallbackQuery):
             "Token همان Gemini API Key است و Model باید دقیقاً نام مدل باشد؛ مثلاً gemini-3.6-flash.\n\n"
             "ربات در افزودن مدل، اول endpoint را بررسی می‌کند و بعد واقعاً TEST_OK را به مدل می‌فرستد؛ اگر Google باشد هر دو مسیر Native و OpenAI-compatible را در صورت نیاز امتحان می‌کند.")
     await call.message.edit_text(text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 فهرست مدل‌ها", callback_data="auto_providers")]]))
-    await call.answer()
 
 
 @router.callback_query(F.data.startswith("provider_edit_"))
@@ -3615,7 +3732,6 @@ async def provider_edit(call: CallbackQuery, state: FSMContext, db: D1Database):
         f"مدل فعلی: <code>{html.escape(str(p.get('model_name')))}</code>\n\n"
         "مرحله ۱ از ۳\n🔗 Base URL جدید را ارسال کن.",
         parse_mode='HTML', reply_markup=get_exit_menu())
-    await call.answer()
 
 
 @router.callback_query(F.data.startswith("provider_test_"))
@@ -3639,7 +3755,6 @@ async def provider_priority(call: CallbackQuery, state: FSMContext):
     await state.set_state(BotStates.admin_automation_setting)
     await state.update_data(automation_setting_key="__provider_priority__", provider_priority_id=pid,parent_callback=f"provider_view_{pid}",panel_message_id=call.message.message_id)
     await call.message.edit_text("🔢 اولویت این مدل را به عدد بفرست.\nعدد کمتر = اولویت بالاتر.", reply_markup=get_exit_menu())
-    await call.answer()
 
 
 @router.callback_query(F.data.startswith("provider_toggle_"))
@@ -3665,7 +3780,6 @@ async def provider_delete(call: CallbackQuery, db: D1Database):
     await call.message.edit_text(
         f"⚠️ <b>حذف مدل</b>\n\nمدل: <code>{html.escape(str(p.get('model_name')))}</code>\n\nاین Provider از چرخه Failover حذف خواهد شد. ادامه می‌دهی؟",
         parse_mode='HTML', reply_markup=kb)
-    await call.answer()
 
 
 @router.callback_query(F.data.regexp(r"^provider_delete_confirm_(\d+)$"))
@@ -3688,6 +3802,7 @@ def automation_content_db_kb() -> InlineKeyboardMarkup:
 @router.callback_query(F.data == "auto_content_db")
 async def auto_content_db(call: CallbackQuery, db: D1Database):
     if call.from_user.id != ADMIN_ID: return
+    await call.answer()
     rows=await db.execute("SELECT (SELECT COUNT(*) FROM articles) articles,(SELECT COUNT(*) FROM publication_queue WHERE status='queued') queued,(SELECT COUNT(*) FROM source_items) source_items,(SELECT COUNT(*) FROM test_history) tests")
     r=rows[0] if rows else {}
     text=("🗃 <b>محتوا و داده‌های اتوماسیون</b>\n\n"
@@ -3701,6 +3816,7 @@ async def auto_content_db(call: CallbackQuery, db: D1Database):
 @router.callback_query(F.data == "auto_db")
 async def auto_db(call: CallbackQuery, db: D1Database):
     if call.from_user.id != ADMIN_ID: return
+    await call.answer()
     rows=await db.execute("SELECT (SELECT COUNT(*) FROM articles) articles,(SELECT COUNT(*) FROM publication_queue) queue_all,(SELECT COUNT(*) FROM source_items) source_items,(SELECT COUNT(*) FROM automation_logs) logs,(SELECT COUNT(*) FROM test_history) tests")
     r=rows[0] if rows else {}
     text=("🗄 <b>دیتای اتوماسیون</b>\n\n"
@@ -3716,6 +3832,7 @@ async def auto_db(call: CallbackQuery, db: D1Database):
 @router.callback_query(F.data == "auto_db_delete_confirm")
 async def auto_db_delete_confirm(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID: return
+    await call.answer()
     kb=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='⚠️ بله، همه داده‌ها حذف شود',callback_data='auto_db_delete_yes')],
         [InlineKeyboardButton(text='↩️ لغو',callback_data='auto_db')]
@@ -3725,6 +3842,7 @@ async def auto_db_delete_confirm(call: CallbackQuery):
 @router.callback_query(F.data == "auto_db_delete_yes")
 async def auto_db_delete_yes(call: CallbackQuery, db: D1Database):
     if call.from_user.id != ADMIN_ID: return
+    await call.answer()
     await db.execute_batch([
         {"sql":"DELETE FROM publication_queue"},
         {"sql":"DELETE FROM articles"},
@@ -3747,11 +3865,9 @@ async def auto_quality(call: CallbackQuery, db: D1Database):
         [InlineKeyboardButton(text='⭐ تغییر حداقل امتیاز', callback_data='set_min_score')],
         [InlineKeyboardButton(text='🎯 وزن معیارهای محتوا', callback_data='quality_weights')],
         [InlineKeyboardButton(text='✍️ دستورهای محتوای تولید', callback_data='editorial_prompts')],
-        [InlineKeyboardButton(text='📖 معیارها', callback_data='quality_about')],
         [InlineKeyboardButton(text='🔙 اتوماسیون محتوا', callback_data='auto_back')]
     ])
     await call.message.edit_text(text, parse_mode='HTML', reply_markup=kb)
-    await call.answer()
 
 @router.callback_query(F.data == "quality_about")
 async def quality_about(call: CallbackQuery):
@@ -3850,6 +3966,7 @@ async def set_weight_novelty(call:CallbackQuery,state:FSMContext):
 
 @router.callback_query(F.data == "quality_weights")
 async def quality_weights(call:CallbackQuery,db:D1Database):
+    await call.answer()
     items=[("global","🌍 اهمیت جهانی"),("technology","💻 فناوری"),("ai","🤖 هوش مصنوعی"),("cyber","🔐 امنیت سایبری"),("education","📚 آموزش"),("iran","🇮🇷 ایران/فارسی"),("freshness","🆕 تازگی"),("source","✅ اعتبار منبع"),("novelty","♻️ عدم تکرار")]
     text="🎯 <b>وزن معیارها</b>\nعدد بالاتر = اهمیت بیشتر.\n\n"; rows=[]
     for k,label in items:
@@ -3860,13 +3977,14 @@ async def quality_weights(call:CallbackQuery,db:D1Database):
 @router.callback_query(F.data == "auto_schedule")
 async def auto_schedule(call: CallbackQuery, db: D1Database):
     if call.from_user.id != ADMIN_ID: return
-    await render_channel_panel(call, db)
     await call.answer()
-
+    text,kb=await get_schedule_panel(db)
+    await call.message.edit_text(text,parse_mode="HTML",reply_markup=kb)
 
 @router.callback_query(F.data == "auto_health")
 async def auto_health(call:CallbackQuery,db:D1Database,bot:Bot):
     if call.from_user.id!=ADMIN_ID:return
+    await call.answer()
     channel=await get_channel_id(db)
     providers=await db.execute("SELECT status,enabled FROM ai_providers")
     healthy=sum(1 for p in providers if p.get('enabled') and p.get('status')=='healthy')
@@ -4100,6 +4218,7 @@ async def health_test_publish(call:CallbackQuery,db:D1Database,bot:Bot):
 @router.callback_query(F.data == "health_deployment")
 async def health_deployment(call:CallbackQuery,db:D1Database):
     if call.from_user.id!=ADMIN_ID:return
+    await call.answer()
     hb=await get_setting(db,'worker_heartbeat_at',''); started=await get_setting(db,'worker_started_at',''); cycle=await get_setting(db,'last_cycle_finished_at','')
     now=datetime.now(timezone.utc); hb_age=None
     if hb:
@@ -4115,6 +4234,7 @@ async def health_deployment(call:CallbackQuery,db:D1Database):
 
 @router.callback_query(F.data == "health_logs")
 async def health_logs(call:CallbackQuery,db:D1Database):
+    await call.answer()
     rows=await db.execute("SELECT level,event,details,created_at FROM automation_logs ORDER BY id DESC LIMIT 15")
     text='📜 <b>آخرین لاگ‌های اتوماسیون</b>\n\n'
     if not rows: text+='هنوز لاگی ثبت نشده است.'
@@ -4137,30 +4257,29 @@ async def prompt_for_setting(call: CallbackQuery, state: FSMContext, key: str, l
 
 
 @router.callback_query(F.data == "set_max_daily")
-async def set_max_daily(call: CallbackQuery, state: FSMContext):
-    await prompt_for_setting(call, state, "max_daily_posts", "🔢 تعداد تقریبی/حداکثر پست روزانه را به عدد بفرست. مثلاً 6")
-
+async def set_max_daily(call: CallbackQuery, state: FSMContext, db: D1Database):
+    current=await get_setting(db,"max_daily_posts",str(DEFAULT_MAX_DAILY_POSTS))
+    await prompt_for_setting(call, state, "max_daily_posts", f"🔢 سقف تقریبی پست روزانه را به عدد بفرست.\nفعلاً روی <b>{html.escape(current)}</b> است.")
 @router.callback_query(F.data == "set_min_score")
 async def set_min_score(call: CallbackQuery, state: FSMContext):
     await prompt_for_setting(call, state, "min_content_score", "⭐ حداقل امتیاز انتشار را بین 0 تا 100 بفرست. پیشنهاد: 75", "auto_quality")
 
 @router.callback_query(F.data == "set_min_gap")
-async def set_min_gap(call: CallbackQuery, state: FSMContext):
-    await prompt_for_setting(call, state, "min_hours_between_posts", "⏱ حداقل فاصله بین دو پست را بر حسب ساعت بفرست. مثلاً 2")
-
+async def set_min_gap(call: CallbackQuery, state: FSMContext, db: D1Database):
+    current=await get_setting(db,"min_post_gap_minutes",str(DEFAULT_MIN_POST_GAP_MINUTES))
+    await prompt_for_setting(call, state, "min_hours_between_posts", f"⏱ حداقل فاصله بین دو پست را بر حسب دقیقه بفرست.\nفعلاً روی <b>{format_duration_minutes(current)}</b> است. مثال: 30 یعنی هر ۳۰ دقیقه.")
 @router.callback_query(F.data == "set_default_interval")
-async def set_default_interval(call: CallbackQuery, state: FSMContext):
-    await prompt_for_setting(call, state, "default_source_interval", "🌐 فاصله بررسی پیش‌فرض منابع را بر حسب دقیقه بفرست. مثلاً 15")
-
+async def set_default_interval(call: CallbackQuery, state: FSMContext, db: D1Database):
+    current=await get_setting(db,"default_source_interval",str(DEFAULT_SOURCE_INTERVAL_MINUTES))
+    await prompt_for_setting(call, state, "default_source_interval", f"🌐 فاصله بررسی پیش‌فرض منابع را بر حسب دقیقه بفرست.\nفعلاً روی <b>{html.escape(current)}</b> دقیقه است.")
 @router.callback_query(F.data == "set_workers")
-async def set_workers(call: CallbackQuery, state: FSMContext):
-    await prompt_for_setting(call, state, "max_workers", "⚡ تعداد Workerهای همزمان را بین 1 تا 4 بفرست. پیشنهاد برای Railway کوچک: 2")
-
+async def set_workers(call: CallbackQuery, state: FSMContext, db: D1Database):
+    current=await get_setting(db,"max_workers",str(DEFAULT_MAX_WORKERS))
+    await prompt_for_setting(call, state, "max_workers", f"⚡ تعداد Workerهای همزمان را بین 1 تا 4 بفرست.\nفعلاً روی <b>{html.escape(current)}</b> است.")
 @router.callback_query(F.data == "set_ai_workers")
-async def set_ai_workers(call: CallbackQuery, state: FSMContext):
-    await prompt_for_setting(call, state, "max_ai_workers", "🧠 تعداد درخواست‌های همزمان AI را بین 1 تا 4 بفرست. پیشنهاد Railway کوچک: 2 یا 3")
-
-
+async def set_ai_workers(call: CallbackQuery, state: FSMContext, db: D1Database):
+    current=await get_setting(db,"max_ai_workers",str(DEFAULT_MAX_AI_WORKERS))
+    await prompt_for_setting(call, state, "max_ai_workers", f"🧠 تعداد درخواست‌های همزمان AI را بین 1 تا 4 بفرست.\nفعلاً روی <b>{html.escape(current)}</b> است.")
 @router.callback_query(F.data == "set_ai_verify")
 async def set_ai_verify(call:CallbackQuery,state:FSMContext):
     await prompt_for_setting(call,state,"ai_verify_mode","🛡 حالت راستی‌آزمایی را بفرست:\nauto = فقط موارد حساس\nalways = همیشه\noff = خاموش","auto_schedule")
@@ -4176,10 +4295,10 @@ async def next_publication_estimate(db:D1Database)->Dict[str,Any]:
             dt=datetime.fromisoformat(str(raw).replace("Z","+00:00"))
             if latest is None or dt>latest: latest=dt
         except Exception: pass
-    interval_hours=float(await get_setting(db,"min_hours_between_posts",str(DEFAULT_MIN_HOURS_BETWEEN_POSTS)))
-    target=max(now, latest+timedelta(hours=interval_hours) if latest else now)
+    interval_minutes=float(await get_setting(db,"min_post_gap_minutes",str(DEFAULT_MIN_POST_GAP_MINUTES)))
+    target=max(now, latest+timedelta(minutes=interval_minutes) if latest else now)
     queued=await db.execute("SELECT COUNT(*) c FROM publication_queue WHERE status='queued'")
-    return {"target":target,"minutes":max(0,int((target-now).total_seconds()/60)) if target>now else 0,"latest":latest,"interval_minutes":int(interval_hours*60),"queued":int(queued[0].get('c',0)) if queued else 0}
+    return {"target":target,"minutes":max(0,int((target-now).total_seconds()/60)) if target>now else 0,"latest":latest,"interval_minutes":int(interval_minutes),"queued":int(queued[0].get('c',0)) if queued else 0}
 
 @router.callback_query(F.data == "auto_publish_now")
 async def auto_publish_now(call:CallbackQuery,db:D1Database,bot:Bot):
@@ -4193,6 +4312,7 @@ async def auto_publish_now(call:CallbackQuery,db:D1Database,bot:Bot):
 
 @router.callback_query(F.data == "auto_queue")
 async def auto_queue(call: CallbackQuery, db: D1Database):
+    await call.answer()
     est=await next_publication_estimate(db)
     rows=await db.execute("SELECT q.id,q.article_id,q.status,q.attempts,a.title,a.score,a.category,a.deep_views FROM publication_queue q JOIN articles a ON a.id=q.article_id WHERE q.status='queued' ORDER BY a.score DESC,q.created_at ASC LIMIT 20")
     last_txt=est['latest'].astimezone(pytz.timezone('Asia/Tehran')).strftime('%H:%M') if est['latest'] else 'هنوز منتشر نشده'
@@ -4217,6 +4337,7 @@ async def auto_queue(call: CallbackQuery, db: D1Database):
 @router.callback_query(F.data == "auto_articles")
 async def auto_articles(call: CallbackQuery, db: D1Database):
     if call.from_user.id != ADMIN_ID: return
+    await call.answer()
     rows=await db.execute("SELECT id,title,score,status,category,created_at,published_at,deep_views FROM articles ORDER BY id DESC LIMIT 20")
     text="📰 <b>محتوای تولیدشده</b>\n\n"
     kb=[]
