@@ -1158,16 +1158,15 @@ class AIProviderManager:
         providers=[p for p in rows if "generativelanguage.googleapis.com" in str(p.get("base_url") or "") and p.get("status") not in {"invalid","cooldown"}]
         if not providers: return {"ok":False,"error":"هیچ Provider بومی Gemini برای Web Scout فعال نیست."}
         domain=urllib.parse.urlsplit(site_url).netloc
-        prompt=f'''یک Source Scout کنترل‌شده برای یک کانال فارسی فناوری هستی.
-URL منبع: {site_url}
-دامنه: {domain}
+        scout_schema = {"items":[{"title":"...","url":"https://...","description":"خلاصه factual کوتاه","published_at":"","image_url":"https://..."}]}
+        prompt = (
+            "یک Source Scout کنترل‌شده برای یک کانال فارسی فناوری هستی.\n"
+            f"URL منبع: {site_url}\nدامنه: {domain}\n\n"
+            f"با ابزارهای وب خودت سایت/دامنه را بررسی کن و حداکثر {max_items} مطلب جدید و واقعاً مرتبط پیدا کن. حوزه‌ها: فناوری، هوش مصنوعی، مدل‌ها، ابزارها، امنیت سایبری، آموزش و اخبار مهم جهان. ایران/فارسی‌زبان بودن امتیاز است ولی شرط اجباری نیست. فقط مقاله/خبر مشخص را برگردان، نه صفحه دسته‌بندی یا صفحه اصلی. اگر تاریخ دقیق را نمی‌دانی خالی بگذار؛ حدس نزن.\n\n"
+            f"خروجی فقط JSON معتبر با این ساختار: {json.dumps(scout_schema, ensure_ascii=False)}\n\n"
+            "محتوا را تحلیل یا قضاوت نکن؛ فقط candidateهای واقعی را پیدا و اطلاعات قابل مشاهده را استخراج کن."
+        )
 
-با ابزارهای وب خودت سایت/دامنه را بررسی کن و حداکثر {max_items} مطلب جدید و واقعاً مرتبط پیدا کن. حوزه‌ها: فناوری، هوش مصنوعی، مدل‌ها، ابزارها، امنیت سایبری، آموزش و اخبار مهم جهان. ایران/فارسی‌زبان بودن امتیاز است ولی شرط اجباری نیست. فقط مقاله/خبر مشخص را برگردان، نه صفحه دسته‌بندی یا صفحه اصلی. اگر تاریخ دقیق را نمی‌دانی خالی بگذار؛ حدس نزن.
-
-خروجی فقط JSON معتبر با این ساختار:
-{{"items":[{{"title":"...","url":"https://...","description":"خلاصه factual کوتاه","published_at":"...","image_url":"https://..."}}]}}
-
-محتوا را تحلیل یا قضاوت نکن؛ فقط candidateهای واقعی را پیدا و اطلاعات قابل مشاهده را استخراج کن.'''
         for p in providers[:4]:
             key=decrypt_secret(p.get("encrypted_api_key") or ""); model=p.get("model_name") or ""
             endpoint=self.endpoint(p.get("base_url") or "https://generativelanguage.googleapis.com/v1beta","gemini",model)
@@ -1518,7 +1517,17 @@ async def universal_web_scout(ai: AIProviderManager, site_url: str, max_items: i
     this keeps the fallback generic for compatible gateways that expose web tools."""
     rows = await ai.db.execute("SELECT * FROM ai_providers WHERE enabled=1 AND (web_enabled=1 OR status='healthy') ORDER BY web_enabled DESC, priority ASC, id ASC")
     domain = urllib.parse.urlsplit(site_url).netloc
-    prompt = f"""You are a controlled web scout for a Persian technology channel.\nSource URL: {site_url}\nDomain: {domain}\n\nFind up to {max_items} of the NEWEST articles published on this exact site within the last {int(NEWS_FRESHNESS_MAX_HOURS)} hours about technology, AI, AI models/tools, cybersecurity, education, or important technology news. Freshness is mandatory. Prefer articles published in the last few hours. Do not return older articles just because they are relevant. Iran/Persian language or geography must NOT be used as a source priority. Do not return the homepage or category pages. Do not invent dates or URLs. Every returned item MUST include a verifiable published_at timestamp; if the timestamp cannot be established, do not return the item. Return only valid JSON: {{\"items\":[{{\"title\":\"...\",\"url\":\"https://...\",\"description\":\"...\",\"published_at\":\"\",\"image_url\":\"\"}}]}}"""
+    scout_schema = {"items":[{"title":"...","url":"https://...","description":"...","published_at":"","image_url":""}]}
+    prompt = (
+        "You are a controlled web scout for a Persian technology channel.\n"
+        f"Source URL: {site_url}\n"
+        f"Domain: {domain}\n\n"
+        f"Find up to {max_items} of the NEWEST articles published on this exact site within the last {int(NEWS_FRESHNESS_MAX_HOURS)} hours about technology, AI, AI models/tools, cybersecurity, education, or important technology news. "
+        "Freshness is mandatory. Prefer articles published in the last few hours. Do not return older articles just because they are relevant. "
+        "Iran/Persian language or geography must NOT be used as a source priority. Do not return the homepage or category pages. Do not invent dates or URLs. "
+        "Every returned item MUST include a verifiable published_at timestamp; if the timestamp cannot be established, do not return the item. "
+        f"Return only valid JSON matching this schema: {json.dumps(scout_schema, ensure_ascii=False)}"
+    )
     attempts=[]
     for p in rows[:8]:
         status=str(p.get('status') or '')
@@ -1697,6 +1706,13 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
     manager_prompts=manager_prompts or {}
     channel_scope=manager_prompts.get("channel") or "تمرکز روی خبرهای فنی و ارزشمند؛ محتوای سطحی و کلیشه‌ای را کنار بگذار."
     article_scope=manager_prompts.get("article") or "نسخه کامل را فنی، غنی و مبتنی بر واقعیت‌های منبع بنویس."
+    editorial_schema={
+        "accept": True, "score": 0, "global_relevance": 0, "technology_relevance": 0,
+        "ai_relevance": 0, "cyber_relevance": 0, "education_relevance": 0, "iran_relevance": 0,
+        "freshness": 0, "reliability": 0, "duplicate_risk": 0, "category": "ai|tech|cyber|edu|general",
+        "why": "...", "title": "...", "channel_html": "...", "article_html": "...",
+        "facts": ["..."], "resource_links": [{"label":"...","url":"https://..."}]
+    }
     prompt=f"""تو موتور تحریریه و تولید محتوای یک کانال فارسی حرفه‌ای هستی؛ نه قاضی، نه مفسر سیاسی و نه منتقد.
 وظیفه تو این است که از منبع داده‌شده محتوای فنی، غنی، دقیق، بی‌طرف و قابل‌فهم بسازی. انتخاب نهایی فقط بر اساس معیارهای عددی مدیر انجام می‌شود؛ در متن نهایی قضاوت، توصیه یا ارزش‌گذاری ننویس.
 
@@ -1751,7 +1767,7 @@ URL: {item.get('url')}
 - لینک Deep Link مقاله توسط برنامه اضافه می‌شود.
 
 فقط JSON معتبر:
-{{"accept":true/false,"score":0-100,"global_relevance":0-10,"technology_relevance":0-10,"ai_relevance":0-10,"cyber_relevance":0-10,"education_relevance":0-10,"iran_relevance":0-10,"freshness":0-10,"reliability":0-10,"duplicate_risk":0-10,"category":"ai|tech|cyber|edu|general","why":"دلیل داخلی کوتاه","title":"...","channel_html":"...","article_html":"...","facts":["..."],"resource_links":[{"label":"...","url":"https://..."}]}}"""
+{json.dumps(editorial_schema, ensure_ascii=False)}"""
     result=await ai.call([{"role":"system","content":"You are a Persian technology content producer. Be neutral and factual. Return JSON only."},{"role":"user","content":prompt}],0.35,5000,"editorial")
     obj=parse_json_object(result.get("content",""))
     if not obj:
@@ -3312,11 +3328,12 @@ async def admin_automation_setting_input(message:Message,state:FSMContext,db:D1D
                 kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📢 تنظیم/تغییر کانال',callback_data='auto_channel_set')],[InlineKeyboardButton(text='🚀 همین حالا منتشر کن',callback_data='publish_now')],[InlineKeyboardButton(text='⏱ زمان‌بندی انتشار',callback_data='publish_schedule')],[InlineKeyboardButton(text='🧪 تست کانال',callback_data='channel_test')],[InlineKeyboardButton(text='🔙 اتوماسیون محتوا',callback_data='auto_back')]])
                 await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text=text,parse_mode='HTML',reply_markup=kb)
             else:
-                await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text="✅ ذخیره شد.",reply_markup=get_admin_menu())
+                target = parent if parent in {"auto_channel","auto_schedule","auto_quality","quality_weights","auto_providers","auto_sources","editorial_prompts"} else "admin_home"
+                await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text="✅ ذخیره شد.",parse_mode="HTML",reply_markup=get_admin_back_kb(target))
         else:
             await message.answer("✅ ذخیره شد.",reply_markup=get_admin_menu())
     except Exception as e:
-        await message.answer(f"❌ مقدار نامعتبر است: {html.escape(str(e))}",reply_markup=get_exit_menu())
+        await message.answer(f"❌ مقدار نامعتبر است: {html.escape(str(e))}",parse_mode="HTML",reply_markup=get_admin_back_kb(parent if parent else "admin_home"))
 
 
 async def render_admin_home(call: CallbackQuery, db: D1Database):
@@ -4467,9 +4484,8 @@ async def auto_settings_legacy(call: CallbackQuery, db: D1Database):
     # سازگاری با callbackهای قدیمی؛ به برنامه انتشار هدایت می‌شود.
     await auto_schedule(call, db)
 
-def current_automation_parent(call: CallbackQuery, fallback: str = "auto_schedule") -> str:
-    text = str(getattr(call.message, "text", "") or "")
-    return "auto_channel" if "انتشار و زمان‌بندی" in text else fallback
+def current_automation_parent(call: CallbackQuery, fallback: str = "auto_channel") -> str:
+    return fallback
 
 async def prompt_for_setting(call: CallbackQuery, state: FSMContext, key: str, label: str, parent: str = "auto_schedule"):
     await state.set_state(BotStates.admin_automation_setting)
@@ -4481,7 +4497,7 @@ async def prompt_for_setting(call: CallbackQuery, state: FSMContext, key: str, l
 @router.callback_query(F.data == "set_max_daily")
 async def set_max_daily(call: CallbackQuery, state: FSMContext, db: D1Database):
     current=await get_setting(db,"max_daily_posts",str(DEFAULT_MAX_DAILY_POSTS))
-    await prompt_for_setting(call, state, "max_daily_posts", f"🔢 <b>سقف تقریبی پست روزانه</b> را به عدد بفرست.\nفعلاً روی <b>{html.escape(current)}</b> پست است.", current_automation_parent(call))
+    await prompt_for_setting(call, state, "max_daily_posts", f"🔢 <b>سقف تقریبی پست روزانه</b> را به عدد بفرست.\nفعلاً روی <b>{html.escape(current)}</b> پست است.", "auto_channel")
 @router.callback_query(F.data == "set_min_score")
 async def set_min_score(call: CallbackQuery, state: FSMContext):
     await prompt_for_setting(call, state, "min_content_score", "⭐ حداقل امتیاز انتشار را بین 0 تا 100 بفرست. پیشنهاد: 75", "auto_quality")
@@ -4489,22 +4505,22 @@ async def set_min_score(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "set_min_gap")
 async def set_min_gap(call: CallbackQuery, state: FSMContext, db: D1Database):
     current=await get_setting(db,"min_post_gap_minutes",str(DEFAULT_MIN_POST_GAP_MINUTES))
-    await prompt_for_setting(call, state, "min_post_gap_minutes", f"⏱ <b>حداقل فاصله بین دو پست</b> را بر حسب دقیقه بفرست.\nفعلاً روی <b>{format_duration_minutes(current)}</b> است.\nمثال: <code>30</code> یعنی هر ۳۰ دقیقه و <code>120</code> یعنی هر ۲ ساعت.", current_automation_parent(call))
+    await prompt_for_setting(call, state, "min_post_gap_minutes", f"⏱ <b>حداقل فاصله بین دو پست</b> را بر حسب دقیقه بفرست.\nفعلاً روی <b>{format_duration_minutes(current)}</b> است.\nمثال: <code>30</code> یعنی هر ۳۰ دقیقه و <code>120</code> یعنی هر ۲ ساعت.", "auto_channel")
 @router.callback_query(F.data == "set_default_interval")
 async def set_default_interval(call: CallbackQuery, state: FSMContext, db: D1Database):
     current=await get_setting(db,"default_source_interval",str(DEFAULT_SOURCE_INTERVAL_MINUTES))
-    await prompt_for_setting(call, state, "default_source_interval", f"🌐 <b>فاصله بررسی پیش‌فرض منابع</b> را بر حسب دقیقه بفرست.\nفعلاً روی <b>{html.escape(current)}</b> دقیقه است.\nمثال: <code>1</code> یعنی هر دقیقه.", current_automation_parent(call))
+    await prompt_for_setting(call, state, "default_source_interval", f"🌐 <b>فاصله بررسی پیش‌فرض منابع</b> را بر حسب دقیقه بفرست.\nفعلاً روی <b>{html.escape(current)}</b> دقیقه است.\nمثال: <code>1</code> یعنی هر دقیقه.", "auto_channel")
 @router.callback_query(F.data == "set_workers")
 async def set_workers(call: CallbackQuery, state: FSMContext, db: D1Database):
     current=await get_setting(db,"max_workers",str(DEFAULT_MAX_WORKERS))
-    await prompt_for_setting(call, state, "max_workers", f"⚡ تعداد Workerهای همزمان را بین 1 تا 4 بفرست.\nفعلاً روی <b>{html.escape(current)}</b> است.")
+    await prompt_for_setting(call, state, "max_workers", f"⚡ تعداد Workerهای همزمان را بین 1 تا 4 بفرست.\nفعلاً روی <b>{html.escape(current)}</b> است.", "auto_channel")
 @router.callback_query(F.data == "set_ai_workers")
 async def set_ai_workers(call: CallbackQuery, state: FSMContext, db: D1Database):
     current=await get_setting(db,"max_ai_workers",str(DEFAULT_MAX_AI_WORKERS))
-    await prompt_for_setting(call, state, "max_ai_workers", f"🧠 تعداد درخواست‌های همزمان AI را بین 1 تا 4 بفرست.\nفعلاً روی <b>{html.escape(current)}</b> است.")
+    await prompt_for_setting(call, state, "max_ai_workers", f"🧠 تعداد درخواست‌های همزمان AI را بین 1 تا 4 بفرست.\nفعلاً روی <b>{html.escape(current)}</b> است.", "auto_channel")
 @router.callback_query(F.data == "set_ai_verify")
 async def set_ai_verify(call:CallbackQuery,state:FSMContext):
-    await prompt_for_setting(call,state,"ai_verify_mode","🛡 حالت راستی‌آزمایی را بفرست:\nauto = فقط موارد حساس\nalways = همیشه\noff = خاموش","auto_schedule")
+    await prompt_for_setting(call,state,"ai_verify_mode","🛡 حالت راستی‌آزمایی را بفرست:\nauto = فقط موارد حساس\nalways = همیشه\noff = خاموش","auto_quality")
 
 async def next_publication_estimate(db:D1Database)->Dict[str,Any]:
     now=datetime.now(timezone.utc)
