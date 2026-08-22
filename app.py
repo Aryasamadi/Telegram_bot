@@ -48,7 +48,8 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "9.2.0-rich-pipeline-e2e-final"
+BUILD_VERSION = "10.0.0-automation-e2e-failover-final"
+STARTED_AT = time.time()
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_AI_WORKERS = 3
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -277,6 +278,10 @@ async def initialize_automation_database(db: D1Database):
         "ai_web_scout_enabled": "1",
         "ai_web_scout_max_items": "5",
         "last_cleanup_at": "",
+        "automation_heartbeat": "",
+        "automation_last_cycle": "",
+        "automation_last_cycle_result": "",
+        "automation_last_test_url": "",
         "last_manual_channel_post_at": "",
         "channel_id": CHANNEL_ID,
         "channel_username": "",
@@ -1245,7 +1250,7 @@ def make_article_png(width=1280,height=720):
 def extract_xml_locs_resilient(text: str) -> List[str]:
     # بعض سایت‌ها XML ناقص/بزرگ تحویل می‌دهند؛ در این حالت فقط locها را با regex بیرون می‌کشیم.
     found=[]
-    for m in re.finditer(r"<loc[^>]*>\s*(.*?)\s*</loc>", text or "", flags=re.I|re.S):
+    for m in re.finditer(r"<loc[^>]*>\\s*(.*?)\\s*</loc>", text or "", flags=re.I|re.S):
         u=html.unescape(re.sub(r"<[^>]+>","",m.group(1)).strip())
         if u: found.append(normalize_url(u))
     return [u for u in dict.fromkeys(found) if u]
@@ -1314,7 +1319,7 @@ URL: {item.get('url')}
         "novelty":10-max(0,min(10,float(obj.get("duplicate_risk",0) or 0)))
     }
     total_weight=sum(max(0,float(weights.get(k,0))) for k in dims)
-    weighted=sum(max(0,min(10,v))*max(0,float(weights.get(k,0))) for k,v in dims.items())
+    weighted=sum(max(0,min(10,v))*max(0,float(weights.get(k,0))) for k,v in dims)
     obj["score"]=round((weighted/(total_weight*10))*100,1) if total_weight else round(float(obj.get("score",0) or 0),1)
     return {**obj,"ai":result}
 
@@ -1334,24 +1339,48 @@ async def add_source(db: D1Database, url: str, category: str = "tech", interval_
     return int(source_id)
 
 
+async def ai_web_scout_failover(ai: AIProviderManager, site_url: str, max_items: int = 5) -> Dict[str, Any]:
+    """Try every enabled AI provider for URL scouting. Providers without web access may fail; then next provider is tried."""
+    providers=await ai.providers()
+    domain=urllib.parse.urlsplit(site_url).netloc
+    prompt=f"""URL سایت: {site_url}\nدامنه: {domain}\n\nاگر به وب/URL دسترسی واقعی داری، همین سایت را بررسی کن و حداکثر {max_items} مقاله/خبر واقعی و مرتبط با فناوری، هوش مصنوعی، ابزارها، مدل‌ها یا امنیت سایبری پیدا کن. صفحه اصلی یا دسته‌بندی را برنگردان. اگر دسترسی وب نداری یا نمی‌توانی سایت را واقعاً ببینی، صریحاً بگو WEB_ACCESS=false و چیزی را حدس نزن. خروجی فقط JSON: {{\"WEB_ACCESS\":true/false,\"items\":[{{\"title\":\"...\",\"url\":\"https://...\",\"description\":\"...\",\"published_at\":\"...\",\"image_url\":\"https://...\"}}]}}"""
+    errors=[]
+    for p in providers:
+        try:
+            result=await ai.call([{"role":"system","content":"You are a web source scout. Never invent URLs or articles. Return JSON only."},{"role":"user","content":prompt}],0.1,1800,"web_scout")
+            content=result.get("content") or ""
+            obj=parse_json_object(content)
+            if not obj.get("WEB_ACCESS"):
+                errors.append(f"{p.get('model_name')}: no web access")
+                continue
+            clean=[]
+            for it in obj.get("items") or []:
+                if not isinstance(it,dict): continue
+                u=normalize_url(str(it.get("url") or "")); t=strip_html_text(str(it.get("title") or ""))[:500]
+                if u and t and same_domain(u,site_url):
+                    clean.append({"title":t,"url":u,"description":strip_html_text(str(it.get("description") or ""))[:2000],"published_at":str(it.get("published_at") or "")[:100],"image_url":normalize_url(str(it.get("image_url") or ""))})
+            if clean:
+                return {"ok":True,"items":clean[:max_items],"provider":result.get("provider"),"model":result.get("model")}
+            errors.append(f"{p.get('model_name')}: no valid candidates")
+        except Exception as e:
+            errors.append(f"{p.get('model_name')}: {str(e)[:180]}")
+    return {"ok":False,"error":" | ".join(errors)[:2000]}
+
 async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProviderManager):
     source_id=source["id"]; now=datetime.now(timezone.utc)
     try:
         discovery=await discover_source_items(source, return_diagnostics=True)
         items=discovery.get("items") or []
-        # اگر لینک/عنوان پیدا شد ولی متن قابل استفاده نیست، هنوز چرخه را شکست‌خورده فرض نکن؛
-        # در این حالت Web Scout می‌تواند URL سایت را مستقیماً بررسی کند.
-        usable=any(len((x.get("body") or x.get("description") or "").strip()) >= 200 for x in items if isinstance(x,dict))
-        if (not items or not usable) and await get_setting(db,"ai_web_scout_enabled","1") == "1":
+        if not items and await get_setting(db,"ai_web_scout_enabled","1") == "1":
             try:
-                scout=await ai.gemini_web_scout(source.get("url") or "", int(await get_setting(db,"ai_web_scout_max_items","5")))
+                scout=await ai_web_scout_failover(ai,source.get("url") or "",int(await get_setting(db,"ai_web_scout_max_items","5")))
                 if scout.get("ok"):
-                    scout_items=scout.get("items") or []
-                    if scout_items:
-                        items=scout_items + (items if usable else [])
-                    await log_automation(db,"INFO","gemini_web_scout_used",f"source={source.get('id')} provider={scout.get('provider')} items={len(scout_items)}")
+                    items=scout.get("items") or []
+                    await log_automation(db,"INFO","ai_web_scout_used",f"source={source.get('id')} provider={scout.get('provider')} model={scout.get('model')} items={len(items)}")
+                else:
+                    await log_automation(db,"WARN","ai_web_scout_exhausted",f"source={source.get('id')} {scout.get('error','')[:1500]}")
             except Exception as scout_error:
-                await log_automation(db,"WARN","gemini_web_scout_error",f"source={source.get('id')} {scout_error}")
+                await log_automation(db,"WARN","ai_web_scout_error",f"source={source.get('id')} {scout_error}")
         next_check=(now+timedelta(minutes=int(source.get("interval_minutes") or DEFAULT_SOURCE_INTERVAL_MINUTES))).isoformat()
         await db.execute("UPDATE sources SET last_checked_at=?,next_check_at=?,last_error=NULL WHERE id=?",[now.isoformat(),next_check,source_id])
         recent_rows=await db.execute("SELECT title FROM articles WHERE status='published' ORDER BY id DESC LIMIT 30")
@@ -1406,7 +1435,10 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                 token=make_deep_token(int(aid))
                 await db.execute("UPDATE articles SET deep_token=? WHERE id=?",[token,aid])
                 await db.execute("UPDATE source_items SET status='ready',article_id=?,score=? WHERE id=?",[aid,score,item_id])
-                await db.execute("INSERT OR IGNORE INTO publication_queue(article_id,scheduled_at,status,attempts,created_at) VALUES(?,?, 'queued',0,?)",[aid,now.isoformat(),now.isoformat()])
+                est=await next_publication_estimate(db) if 'next_publication_estimate' in globals() else {"target":now}
+                scheduled=est.get("target") if isinstance(est,dict) else now
+                if not isinstance(scheduled,datetime): scheduled=now
+                await db.execute("INSERT OR IGNORE INTO publication_queue(article_id,scheduled_at,status,attempts,created_at) VALUES(?,?, 'queued',0,?)",[aid,scheduled.isoformat(),now.isoformat()])
                 return 1
         results=await asyncio.gather(*(process_one(x) for x in items[:MAX_SOURCE_ITEMS_PER_CYCLE]),return_exceptions=True)
         return sum(int(x) for x in results if isinstance(x,int))
@@ -1528,6 +1560,7 @@ async def automation_loop(db: D1Database, bot: Bot):
     try:
         while True:
             try:
+                await set_setting(db,"automation_heartbeat",datetime.now(timezone.utc).isoformat())
                 enabled = await get_setting(db, "automation_enabled", "0")
                 if enabled == "1":
                     max_workers = max(1, min(4, int(await get_setting(db, "max_workers", "2"))))
@@ -1538,8 +1571,16 @@ async def automation_loop(db: D1Database, bot: Bot):
                             return await fetch_source_cycle(db, source, ai)
                     await publish_next_article(db, bot)
                     if due_sources:
-                        await asyncio.gather(*(run_source(src) for src in due_sources), return_exceptions=True)
-                    await publish_next_article(db, bot)
+                        results=await asyncio.gather(*(run_source(src) for src in due_sources), return_exceptions=True)
+                        total_processed=sum(int(x) for x in results if isinstance(x,int))
+                    else:
+                        total_processed=0
+                    published=await publish_next_article(db, bot)
+                    q=await db.execute("SELECT COUNT(*) c FROM publication_queue WHERE status='queued'")
+                    qn=int(q[0].get('c',0)) if q else 0
+                    cycle_now=datetime.now(timezone.utc).isoformat()
+                    await set_setting(db,"automation_last_cycle",cycle_now)
+                    await set_setting(db,"automation_last_cycle_result",f"منابع due={len(due_sources)} | پردازش={total_processed} | صف={qn} | انتشار={'بله' if published else 'خیر'}")
                 if time.time() - last_provider_recheck > AI_PROVIDER_RECHECK_MINUTES*60:
                     await recheck_failed_providers(db,bot,ai)
                     last_provider_recheck = time.time()
@@ -1567,6 +1608,8 @@ async def automation_report(db: D1Database) -> str:
     queued = await db.execute("SELECT COUNT(*) as c FROM publication_queue WHERE status='queued'")
     published = await db.execute("SELECT COUNT(*) as c FROM articles WHERE status='published' AND COALESCE(published_at,created_at) >= ?", [datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()])
     failed = await db.execute("SELECT COUNT(*) as c FROM publication_queue WHERE status='failed' AND created_at >= ?", [(datetime.now(timezone.utc) - timedelta(days=1)).isoformat()])
+    ready = await db.execute("SELECT COUNT(*) as c FROM articles WHERE status='ready'")
+    heartbeat = await get_setting(db,"automation_heartbeat","")
     channel = await get_channel_id(db)
     channel_label = await get_setting(db, 'channel_username', '') or ('کانال خصوصی تنظیم شده' if channel else '')
     return (f"📊 گزارش اتوماسیون\n\n"
@@ -1575,6 +1618,8 @@ async def automation_report(db: D1Database) -> str:
             f"🌐 منابع فعال: {sources[0].get('c',0) if sources else 0}\n"
             f"📰 آیتم جدید ۲۴ساعت: {new_items[0].get('c',0) if new_items else 0}\n"
             f"⏳ در صف: {queued[0].get('c',0) if queued else 0}\n"
+            f"📝 آماده تولید/انتشار: {ready[0].get('c',0) if ready else 0}\n"
+            f"💓 Worker: {'فعال' if heartbeat else 'نامشخص'}\n"
             f"📢 منتشرشده امروز: {published[0].get('c',0) if published else 0}/{settings['max_daily']}\n"
             f"⭐ حداقل امتیاز: {settings['min_score']}\n"
             f"❌ انتشار ناموفق ۲۴ساعت: {failed[0].get('c',0) if failed else 0}")
@@ -1588,7 +1633,8 @@ def automation_menu_kb(enabled: bool) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🌐 منابع خبری", callback_data="auto_sources"), InlineKeyboardButton(text="🤖 مدل‌های AI", callback_data="auto_providers")],
         [InlineKeyboardButton(text="📢 کانال و انتشار", callback_data="auto_channel"), InlineKeyboardButton(text="🧠 کیفیت محتوا", callback_data="auto_quality")],
         [InlineKeyboardButton(text="⏱ برنامه انتشار", callback_data="auto_schedule"), InlineKeyboardButton(text="📥 صف انتشار", callback_data="auto_queue")],
-        [InlineKeyboardButton(text="🧪 تست و سلامت", callback_data="auto_health"), InlineKeyboardButton(text="📊 گزارش", callback_data="auto_report")],
+        [InlineKeyboardButton(text="🧪 تست و سلامت", callback_data="auto_health"), InlineKeyboardButton(text="🚦 وضعیت اجرا", callback_data="health_deployment")],
+        [InlineKeyboardButton(text="📊 گزارش", callback_data="auto_report")],
         [InlineKeyboardButton(text="🔙 پنل اصلی", callback_data="admin_home")]
     ])
 
@@ -2005,7 +2051,7 @@ async def cmd_start(message: Message, state: FSMContext, db: D1Database, bot: Bo
         deep_arg = args[1]
         if deep_arg.startswith("auto_"):
             token = deep_arg[5:]
-            article_rows = await db.execute("SELECT * FROM articles WHERE deep_token=? AND status IN ('ready','published','test')", [token])
+            article_rows = await db.execute("SELECT * FROM articles WHERE deep_token=? AND status IN ('ready','published','test_published')", [token])
             if article_rows:
                 article = article_rows[0]
                 body_html=sanitize_telegram_html(article.get('body') or '')
@@ -3383,9 +3429,33 @@ async def auto_health(call:CallbackQuery,db:D1Database,bot:Bot):
         [InlineKeyboardButton(text="🧪 تولید بدون انتشار",callback_data="health_dry_run")],
         [InlineKeyboardButton(text="▶️ اجرای یک چرخه واقعی",callback_data="health_run_cycle")],
         [InlineKeyboardButton(text="📢 تست انتشار واقعی",callback_data="health_test_publish")],
+        [InlineKeyboardButton(text="🚦 وضعیت اجرا / Deployment",callback_data="health_deployment")],
         [InlineKeyboardButton(text="🔄 بروزرسانی",callback_data="auto_health"),InlineKeyboardButton(text="🔙 اتوماسیون",callback_data="auto_back")]
     ])
     await call.message.edit_text(text,parse_mode="HTML",reply_markup=kb); await call.answer()
+
+@router.callback_query(F.data == "health_deployment")
+async def health_deployment(call:CallbackQuery,db:D1Database):
+    if call.from_user.id!=ADMIN_ID: return
+    hb=await get_setting(db,"automation_heartbeat","")
+    last=await get_setting(db,"automation_last_cycle","")
+    result=await get_setting(db,"automation_last_cycle_result","")
+    enabled=await get_setting(db,"automation_enabled","0")
+    now=datetime.now(timezone.utc)
+    def age(raw):
+        try: return int(max(0,(now-datetime.fromisoformat(raw.replace("Z","+00:00"))).total_seconds()))
+        except Exception: return None
+    h_age=age(hb); l_age=age(last)
+    running = h_age is not None and h_age < 45
+    text=("🚦 <b>وضعیت اجرا / Deployment</b>\n\n"
+          f"📦 نسخه: <code>{html.escape(BUILD_VERSION)}</code>\n"
+          f"🤖 ربات: {'🟢 در حال اجرا' if running else '🔴 Heartbeat دریافت نمی‌شود'}\n"
+          f"⚙️ اتوماسیون: {'🟢 فعال' if enabled=='1' else '🔴 خاموش'}\n"
+          f"💓 آخرین Heartbeat: {h_age if h_age is not None else 'نامشخص'} ثانیه قبل\n"
+          f"🔄 آخرین چرخه: {l_age if l_age is not None else 'هنوز اجرا نشده'} ثانیه قبل\n"
+          f"📋 آخرین نتیجه: {html.escape(result[:1200]) if result else 'هنوز گزارشی ثبت نشده'}\n\n"
+          "اگر Heartbeat قرمز است، مشکل معمولاً از Worker/Process اجرای Railway است؛ خود ربات تلگرام ممکن است همچنان پاسخ بدهد.")
+    await call.message.edit_text(text,parse_mode="HTML",reply_markup=get_admin_back_kb("auto_health")); await call.answer()
 
 @router.callback_query(F.data == "health_test_ai")
 async def health_test_ai(call:CallbackQuery,db:D1Database):
@@ -3406,111 +3476,94 @@ async def health_test_ai(call:CallbackQuery,db:D1Database):
 
 @router.callback_query(F.data == "health_test_source")
 async def health_test_source(call:CallbackQuery,db:D1Database):
-    rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC LIMIT 8")
+    if call.from_user.id!=ADMIN_ID: return
+    rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC LIMIT 12")
     if not rows:
         await call.message.edit_text("❌ هیچ منبع فعالی نیست.",reply_markup=get_admin_back_kb("auto_health")); return
-    results=[]
-    for src in rows:
+    total=len(rows); results=[]
+    await call.message.edit_text(f"🧪 <b>تست منابع</b>\n\n⏳ شروع شد...\n\n0/{total}",parse_mode='HTML',reply_markup=get_admin_back_kb("auto_health"))
+    for i,src in enumerate(rows,1):
         try:
             diag=await discover_source_items(src,return_diagnostics=True)
             if diag.get("items"):
-                results.append(f"✅ {src.get('name')}: {len(diag['items'])} آیتم | {diag.get('method')}")
+                line=f"✅ {src.get('name')}: {len(diag['items'])} آیتم | {diag.get('method')}"
             else:
-                results.append(f"⚠️ {src.get('name')}: {diag.get('error','بدون آیتم')[:260]}")
+                line=f"⚠️ {src.get('name')}: {diag.get('error','بدون آیتم')[:220]}"
         except Exception as e:
-            results.append(f"❌ {src.get('name')}: {str(e)[:260]}")
-    text="🧪 <b>تست منابع</b>\n\n"+"\n".join(results)
+            line=f"❌ {src.get('name')}: {str(e)[:220]}"
+        results.append(line)
+        try:
+            await call.message.edit_text("🧪 <b>تست منابع</b>\n\n"+f"⏳ {i}/{total}\n\n"+"\n".join(results[-8:]),parse_mode='HTML',reply_markup=get_admin_back_kb("auto_health"))
+        except Exception: pass
+    text="🧪 <b>تست منابع — کامل شد</b>\n\n"+"\n".join(results)
     await call.message.edit_text(text,parse_mode='HTML',reply_markup=get_admin_back_kb("auto_health")); await call.answer()
 
-async def edit_health_progress(message: Message, text: str):
-    """ویرایش همان پیام تست؛ از ایجاد سیل پیام در چت مدیر جلوگیری می‌کند."""
-    try:
-        await message.edit_text(text, parse_mode="HTML")
-    except Exception:
-        pass
-
-
-def health_progress_block(stage: int, total: int, title: str, detail: str = "") -> str:
-    filled=max(0,min(total,stage)); bar="█"*filled+"░"*(total-filled)
-    pct=int((filled/total)*100) if total else 100
-    return f"🧪 <b>{html.escape(title)}</b>\n\n<code>{bar}</code> {pct}%\n{html.escape(detail)}\n\n⏳ لطفاً منتظر بمان؛ نتیجه نهایی همین پیام نمایش داده می‌شود."
-
 @router.callback_query(F.data == "health_dry_run")
-async def health_dry_run(call:CallbackQuery,db:D1Database):
+async def health_dry_run(call:CallbackQuery,db:D1Database,bot:Bot):
     if call.from_user.id!=ADMIN_ID: return
-    await call.answer("تست شروع شد؛ لطفاً منتظر بمانید…")
-    await edit_health_progress(call.message, health_progress_block(1,6,"تست تولید محتوا شروع شد","در حال بررسی منابع فعال…"))
-    rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC LIMIT 8")
+    rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority DESC,id ASC LIMIT 12")
     if not rows:
-        await edit_health_progress(call.message,"❌ <b>تست انجام نشد</b>\n\nاول حداقل یک منبع فعال اضافه کن.")
-        return
-    m=AIProviderManager(db, None)
-    chosen=None; chosen_src=None; diagnostics=[]
+        await call.message.edit_text("❌ اول یک منبع فعال اضافه کن.",reply_markup=get_admin_back_kb("auto_health")); return
+    await call.message.edit_text("🧪 <b>تولید بدون انتشار</b>\n\n⏳ در حال بررسی منابع و پیدا کردن یک محتوای آزمایشی واقعی...",parse_mode='HTML',reply_markup=get_admin_back_kb("auto_health"))
+    m=AIProviderManager(db,bot); chosen=None; chosen_src=None; diagnostics=[]
     try:
-        await edit_health_progress(call.message, health_progress_block(2,6,"منابع بررسی می‌شوند","اگر ربات نتواند مقاله را بخواند، Web Scout نیز امتحان می‌شود."))
-        for src in rows:
-            try:
-                diag=await discover_source_items(src,return_diagnostics=True)
-                candidates=diag.get("items") or []
-                # اول مقاله‌ای که متن واقعی دارد.
-                for candidate in candidates:
-                    candidate=await enrich_candidate_content(dict(candidate))
-                    if len((candidate.get("body") or candidate.get("description") or "").strip()) >= 200:
-                        chosen=candidate; chosen_src=src; break
-                if chosen: break
-                # اگر خود crawler موفق نشد، URL سایت را به Web Scout بده.
-                if await get_setting(db,"ai_web_scout_enabled","1") == "1":
-                    scout=await m.gemini_web_scout(src.get("url") or "", int(await get_setting(db,"ai_web_scout_max_items","5")))
-                    if scout.get("ok") and scout.get("items"):
-                        for candidate in scout["items"]:
-                            candidate=await enrich_candidate_content(dict(candidate))
-                            if candidate.get("title") and (candidate.get("body") or candidate.get("description")):
-                                chosen=candidate; chosen_src=src; break
-                if chosen: break
-                diagnostics.append(f"{src.get('name')}: محتوای قابل استفاده پیدا نشد")
-            except Exception as e:
-                diagnostics.append(f"{src.get('name')}: {str(e)[:180]}")
-
+        # تست از آرشیو هم مجاز است؛ برای اینکه همیشه یک مقاله ثابت نیاید، منابع و آیتم‌ها را چرخشی/تصادفی انتخاب می‌کنیم.
+        ordered=list(rows); random.shuffle(ordered)
+        for src in ordered:
+            diag=await discover_source_items(src,return_diagnostics=True)
+            items=diag.get("items") or []
+            if items:
+                # چند گزینه را بررسی کن و گزینه‌ای که در source_items قبلاً ثبت نشده را ترجیح بده.
+                candidates=items[:min(5,len(items))]; random.shuffle(candidates)
+                last_test=await get_setting(db,"automation_last_test_url","")
+                for cand in candidates:
+                    u=normalize_url(cand.get("url"))
+                    exists=await db.execute("SELECT id FROM source_items WHERE source_id=? AND canonical_url=?",[src["id"],u]) if u else []
+                    if u and u==last_test: continue
+                    if not exists:
+                        chosen=cand; chosen_src=src; break
+                if chosen is None:
+                    # برای تست، آرشیو قدیمی مجاز است؛ ولی تا حد امکان URL قبلی انتخاب نمی‌شود.
+                    pool=[x for x in candidates if normalize_url(x.get("url"))!=last_test] or candidates
+                    chosen=random.choice(pool); chosen_src=src
+                if chosen:
+                    await set_setting(db,"automation_last_test_url",normalize_url(chosen.get("url") or ""))
+                    break
+            # اگر Fetch شکست خورد، تلاش با Web Scout چند مدل انجام می‌شود.
+            scout=await ai_web_scout_failover(m,src.get("url") or "",int(await get_setting(db,"ai_web_scout_max_items","5")))
+            if scout.get("ok") and scout.get("items"):
+                chosen=random.choice(scout["items"]); chosen_src=src; break
+            diagnostics.append(f"{src.get('name')}: {diag.get('error','بدون آیتم')[:160]}")
         if not chosen:
-            msg="❌ <b>تست تولید به نتیجه نرسید</b>\n\nهیچ‌کدام از منابع محتوای قابل استفاده ندادند.\n\n"+"\n".join(diagnostics[:8])
-            await edit_health_progress(call.message,msg)
-            return
-
-        await edit_health_progress(call.message, health_progress_block(3,6,"محتوا پیدا شد","در حال ارسال محتوای واقعی به مدل AI…"))
-        weights={k:float(await get_setting(db,'weight_'+k,'10')) for k in ['global','technology','ai','cyber','education','iran','freshness','source','novelty']}
-        # تست باید از هر آرشیو مناسب استفاده کند؛ شرط به‌روز بودن در این مسیر اجباری نیست.
-        out=await ai_editorial_process(m,chosen,chosen_src,[],weights)
-        if out.get("error"):
-            await edit_health_progress(call.message,"❌ <b>تست تولید شکست خورد</b>\n\n"+html.escape(str(out["error"])[:1500]))
-            return
-        await edit_health_progress(call.message, health_progress_block(4,6,"محتوا تولید شد","در حال آماده‌سازی قالب، طول متن و ظاهر Telegram…"))
-        if not out.get("accept"):
-            msg=("⚠️ <b>مدل پاسخ داد، اما این مطلب در تست رد شد.</b>\n\n"
-                 f"امتیاز: <b>{out.get('score','-')}</b>\n"
-                 f"دلیل داخلی: {html.escape(str(out.get('why','-'))[:600])}\n\n"
-                 "این رد شدن به معنی خرابی AI نیست؛ تست برای این منبع محتوای مناسب انتخاب نکرده است.")
-            await edit_health_progress(call.message,msg)
-            return
-        preview_ch=sanitize_telegram_html(out.get("channel_html") or out.get("channel_text") or "")
-        preview_ar=sanitize_telegram_html(out.get("article_html") or out.get("article_text") or "")
-        preview_ch=ensure_rich_channel_format(out.get("title") or chosen.get("title") or "",preview_ch,str(out.get("category") or "tech"))
-        preview_ar=ensure_rich_article_format(out.get("title") or chosen.get("title") or "",preview_ar,chosen.get("url") or "")
-        await edit_health_progress(call.message, health_progress_block(5,6,"قالب محتوا آماده شد","Deep Link و نتیجه نهایی تست در حال آماده‌سازی است…"))
-        ai_info=out.get("ai") or {}
-        msg=("✅ <b>تست تولید با موفقیت انجام شد.</b>\n\n"
-             f"🌐 منبع: <b>{html.escape(str(chosen_src.get('name')))}</b>\n"
-             f"📰 عنوان: <b>{html.escape(str(out.get('title') or chosen.get('title') or '-'))}</b>\n"
-             f"🤖 مدل: <code>{html.escape(str(ai_info.get('model') or '-'))}</code>\n"
-             f"📊 امتیاز داخلی: <b>{out.get('score','-')}</b>\n\n"
-             "<b>📝 پیش‌نمایش کانال:</b>\n"+preview_ch[:1300]+"\n\n"
-             "<b>📖 پیش‌نمایش مقاله ربات:</b>\n"+(preview_ar[:3600] if len(preview_ar)<=3600 else preview_ar[:3600]+"…")+"\n\n"
-             "🚫 <b>انتشار:</b> انجام نشد؛ این تست فقط تولید را بررسی کرد.")
-        await edit_health_progress(call.message,msg)
+            msg="❌ هیچ محتوای واقعی برای تست پیدا نشد.\n\n"+"\n".join(diagnostics)
+        else:
+            await call.message.edit_text(f"🧪 <b>تولید بدون انتشار</b>\n\n✅ منبع: {html.escape(str(chosen_src.get('name')))}\n⏳ در حال تولید واقعی با AI...",parse_mode='HTML',reply_markup=get_admin_back_kb("auto_health"))
+            weights={k:float(await get_setting(db,'weight_'+k,'10')) for k in ['global','technology','ai','cyber','education','iran','freshness','source','novelty']}
+            chosen=await enrich_candidate_content(dict(chosen))
+            out=await ai_editorial_process(m,chosen,chosen_src,[],weights)
+            if out.get("error"):
+                msg="❌ تولید واقعی شکست خورد:\n"+html.escape(str(out["error"])[:1500])
+            elif not out.get("accept"):
+                msg=("⚠️ AI پاسخ داد اما معیارهای فعلی این محتوا را رد کردند.\n\n"
+                     f"امتیاز: {out.get('score','-')}\nدلیل: {html.escape(str(out.get('why','-'))[:700])}\n\n"
+                     "💡 برای تست می‌توانی حداقل امتیاز را موقتاً پایین‌تر بگذاری.")
+            else:
+                ai_info=out.get("ai") or {}
+                preview_ch=ensure_rich_channel_format(out.get('title',''),out.get("channel_html") or "",str(out.get('category') or 'tech'))
+                preview_ar=ensure_rich_article_format(out.get('title',''),out.get("article_html") or "",chosen.get('url') or '')
+                msg=("✅ <b>تولید واقعی با موفقیت انجام شد</b>\n\n"
+                     f"🌐 منبع: {html.escape(str(chosen_src.get('name')))}\n"
+                     f"📰 عنوان: {html.escape(str(out.get('title','')))}\n"
+                     f"⭐ امتیاز: {out.get('score','-')}\n"
+                     f"🤖 مدل: {html.escape(str(ai_info.get('model','-')))}\n\n"
+                     "<b>📢 همان محتوایی که برای کانال آماده می‌شود:</b>\n"+preview_ch[:1300]+"\n\n"
+                     "<b>📖 همان محتوایی که داخل ربات قرار می‌گیرد:</b>\n"+(preview_ar[:3500])+"\n\n"
+                     "🚫 انتشار انجام نشد؛ این تست فقط تولید واقعی را اجرا کرد.")
     except Exception as e:
-        logger.exception("health dry run failed")
-        await edit_health_progress(call.message,"❌ <b>تست تولید شکست خورد</b>\n\n<code>"+html.escape(str(e)[:1800])+"</code>")
+        msg="❌ تست تولید شکست خورد:\n"+html.escape(str(e)[:1800])
     finally:
         await m.close()
+    await call.message.edit_text(msg,parse_mode='HTML',reply_markup=get_admin_back_kb("auto_health")); await call.answer()
 
 def make_health_png(width=1280,height=720):
     row=bytearray()
@@ -3527,20 +3580,29 @@ def make_health_png(width=1280,height=720):
 @router.callback_query(F.data == "health_run_cycle")
 async def health_run_cycle(call:CallbackQuery,db:D1Database,bot:Bot):
     if call.from_user.id!=ADMIN_ID: return
+    await call.message.edit_text("▶️ <b>اجرای یک چرخه واقعی</b>\n\n⏳ شروع شد...\nاین تست دقیقاً Pipeline واقعی را اجرا می‌کند؛ داده ساختگی استفاده نمی‌شود.",parse_mode='HTML',reply_markup=get_admin_back_kb("auto_health"))
+    ai=AIProviderManager(db,bot); counts=[]; total=0
     try:
-        sources=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority DESC,next_check_at ASC LIMIT 8")
-        ai=AIProviderManager(db,bot)
-        counts=[]
-        try:
-            for src in sources:
+        sources=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority DESC,next_check_at ASC LIMIT 12")
+        for i,src in enumerate(sources,1):
+            try:
                 result=await fetch_source_cycle(db,src,ai)
-                counts.append(f"{src.get('name')}: {result} مورد پردازش")
-            published=await publish_next_article(db,bot)
-        finally:
-            await ai.close()
-        msg=("✅ <b>یک چرخه واقعی اجرا شد.</b>\n\n"+"\n".join(counts[:8])+f"\n\nانتشار در این چرخه: {'✅ بله' if published else '⏸ خیر (صف/زمان/امتیاز)'}")
+                total+=int(result or 0)
+                counts.append(f"{'✅' if result else '⚠️'} {src.get('name')}: {result} مورد پردازش")
+            except Exception as e:
+                counts.append(f"❌ {src.get('name')}: {str(e)[:180]}")
+            try:
+                await call.message.edit_text("▶️ <b>اجرای یک چرخه واقعی</b>\n\n"+f"⏳ بررسی منابع: {i}/{len(sources)}\n\n"+"\n".join(counts[-8:]),parse_mode='HTML',reply_markup=get_admin_back_kb("auto_health"))
+            except Exception: pass
+        published=await publish_next_article(db,bot)
+        q=await db.execute("SELECT COUNT(*) c FROM publication_queue WHERE status='queued'")
+        queued=int(q[0].get('c',0)) if q else 0
+        await set_setting(db,"automation_last_cycle",datetime.now(timezone.utc).isoformat())
+        await set_setting(db,"automation_last_cycle_result",f"منابع={len(sources)} | پردازش={total} | صف={queued} | انتشار={'بله' if published else 'خیر'}")
+        msg=("✅ <b>چرخه واقعی کامل شد</b>\n\n"+"\n".join(counts)+f"\n\n📥 صف فعلی: <b>{queued}</b>\n📢 انتشار در این چرخه: {'✅ بله' if published else '⏸ خیر'}")
     except Exception as e:
-        msg="❌ اجرای چرخه شکست خورد:\n"+html.escape(str(e)[:1500])
+        msg="❌ اجرای چرخه شکست خورد:\n"+html.escape(str(e)[:1800])
+    finally: await ai.close()
     await call.message.edit_text(msg,parse_mode='HTML',reply_markup=get_admin_back_kb("auto_health")); await call.answer()
 
 @router.callback_query(F.data == "health_test_publish")
@@ -3548,49 +3610,58 @@ async def health_test_publish(call:CallbackQuery,db:D1Database,bot:Bot):
     if call.from_user.id!=ADMIN_ID: return
     channel=await get_channel_id(db)
     if not channel:
-        await call.message.edit_text("❌ <b>کانال تنظیم نشده است.</b>\n\nاز بخش «کانال و انتشار» آیدی کانال یا @username را تنظیم کن.",parse_mode="HTML",reply_markup=get_admin_back_kb("auto_health")); await call.answer(); return
-    await call.answer("تست انتشار شروع شد؛ پیام تست واقعی در کانال ارسال می‌شود…")
-    await edit_health_progress(call.message,health_progress_block(1,5,"تست انتشار واقعی شروع شد","در حال آماده‌سازی یک محتوای واقعیِ آزمایشی…"))
+        await call.message.edit_text("❌ کانال تنظیم نشده.",reply_markup=get_admin_back_kb("auto_health")); return
+    await call.message.edit_text("📢 <b>تست انتشار واقعی</b>\n\n⏳ در حال پیدا کردن و تولید یک محتوای واقعی...",parse_mode='HTML',reply_markup=get_admin_back_kb("auto_health"))
+    ai=AIProviderManager(db,bot)
+    test_article_id=None
     try:
-        await db.execute("DELETE FROM articles WHERE status='test'")
-        now=datetime.now(timezone.utc).isoformat()
-        title="🧪 تست واقعی قالب و ادامه مطلب"
-        article_body=(
-            "<b>🔎 این یک محتوای آزمایشی واقعی است</b>\n\n"
-            "این متن برای بررسی مسیر کامل انتشار ساخته شده تا مطمئن شویم قالب‌بندی، عکس، لینک و نمایش ادامه مطلب درست کار می‌کند.\n\n"
-            "<b>✨ چه چیزهایی در این تست بررسی می‌شود؟</b>\n"
-            "• نمایش تصویر\n• متن چندبخشی و خوانا\n• <i>Italic</i> و <b>Bold</b>\n• <blockquote>یک بخش نقل‌قول آزمایشی برای بررسی ظاهر متن</blockquote>\n"
-            "• Deep Link به همین مقاله داخل ربات\n\n"
-            "اگر روی دکمه «📖 ادامه مطلب» در پست کانال بزنی، باید همین محتوای کامل را داخل ربات ببینی."
-        )
-        ins=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at) VALUES(NULL,?,?,?,?,?,?,100,'test',?) RETURNING id",
-            [title,"<b>🤖 تست قالب انتشار</b>\n\nاین پست برای تست واقعی ظاهر، تصویر و لینک ادامه مطلب ساخته شده.",article_body,"https://example.com/test", "", "tech", now])
-        aid=int(ins[0]["id"]) if ins else 0
-        token=make_deep_token(aid)
-        await db.execute("UPDATE articles SET deep_token=? WHERE id=?",[token,aid])
-        bot_username=await get_runtime_bot_username(bot)
-        if not bot_username: raise RuntimeError("نام کاربری ربات پیدا نشد؛ Bot باید username داشته باشد.")
-        deep_link=f"https://t.me/{bot_username}?start=auto_{token}"
-        channel_html=(
-            "<b>🤖 تست واقعی ربات؛ این بار یک پست کامل!</b>\n\n"
-            "این پست برای بررسی مسیر واقعی انتشار ساخته شده؛ ظاهر متن، تصویر و لینک ادامه مطلب را با همان چیزی که در انتشار خودکار استفاده می‌کنیم چک می‌کند.\n\n"
-            "<i>اگر این متن را با ظاهر مرتب می‌بینی، بخش قالب‌بندی فعال است.</i>\n\n"
-            "<blockquote>📌 یک نقل‌قول آزمایشی برای بررسی Quote</blockquote>\n\n"
-            f'<a href="{html.escape(deep_link,quote=True)}">📖 ادامه مطلب را در ربات بخوانید</a>'
-        )
-        await edit_health_progress(call.message,health_progress_block(2,5,"محتوای تست آماده شد","Deep Link واقعی ساخته شد."))
-        photo=BufferedInputFile(make_article_png(),filename="technowai-test-content.png")
-        await edit_health_progress(call.message,health_progress_block(3,5,"در حال ارسال به کانال…","اگر Bot دسترسی انتشار داشته باشد، پیام در کانال ظاهر می‌شود."))
-        sent=await bot.send_photo(channel,photo=photo,caption=channel_html[:1024],parse_mode="HTML")
-        await edit_health_progress(call.message,health_progress_block(4,5,"انتشار انجام شد","در حال نهایی‌کردن نتیجه تست…"))
-        msg=("✅ <b>تست انتشار واقعی موفق شد.</b>\n\n"
-             f"📢 Message ID: <code>{sent.message_id}</code>\n"
-             f'🔗 Deep Link: <a href="{html.escape(deep_link,quote=True)}">📖 باز کردن ادامه مطلب</a>\n\n'
-             "حالا روی «📖 ادامه مطلب» داخل پست کانال بزن؛ باید مقاله کامل همین تست را در ربات ببینی.")
-        await edit_health_progress(call.message,msg)
+        sources=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority DESC,id ASC LIMIT 12")
+        chosen=None; chosen_src=None
+        for src in sources:
+            diag=await discover_source_items(src,return_diagnostics=True)
+            items=diag.get("items") or []
+            if items:
+                chosen=random.choice(items[:min(5,len(items))]); chosen_src=src; break
+            scout=await ai_web_scout_failover(ai,src.get("url") or "",5)
+            if scout.get("ok") and scout.get("items"):
+                chosen=random.choice(scout["items"]); chosen_src=src; break
+        if not chosen:
+            raise RuntimeError("هیچ منبعی محتوای واقعی قابل استفاده نداد.")
+        chosen=await enrich_candidate_content(dict(chosen))
+        weights={k:float(await get_setting(db,'weight_'+k,'10')) for k in ['global','technology','ai','cyber','education','iran','freshness','source','novelty']}
+        out=await ai_editorial_process(ai,chosen,chosen_src,[],weights)
+        if out.get("error"): raise RuntimeError(str(out["error"]))
+        if not out.get("accept"): raise RuntimeError(f"محتوا با معیار فعلی رد شد؛ امتیاز {out.get('score','-')} | {out.get('why','')}")
+        title=strip_html_text(out.get("title") or chosen.get("title") or "تست انتشار")[:500]
+        article_text=ensure_rich_article_format(title,out.get("article_html") or "",chosen.get("url") or "")
+        channel_text=ensure_rich_channel_format(title,out.get("channel_html") or "",str(out.get("category") or chosen_src.get("category") or "tech"))
+        art=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at) VALUES(NULL,?,?,?,?,?,?,?,?,?) RETURNING id",[title,channel_text,article_text,chosen.get("url") or "",chosen.get("image_url") or "",out.get("category") or "tech",float(out.get("score",0) or 0),"ready",datetime.now(timezone.utc).isoformat()])
+        test_article_id=art[0].get("id") if art else 0
+        if not test_article_id: raise RuntimeError("ذخیره مقاله تستی در دیتابیس انجام نشد.")
+        token=make_deep_token(int(test_article_id))
+        await db.execute("UPDATE articles SET deep_token=? WHERE id=?",[token,test_article_id])
+        await db.execute("INSERT INTO publication_queue(article_id,scheduled_at,status,attempts,created_at) VALUES(?,?, 'queued',0,?)",[test_article_id,datetime.now(timezone.utc).isoformat(),datetime.now(timezone.utc).isoformat()])
+        await call.message.edit_text("📢 <b>تست انتشار واقعی</b>\n\n🤖 تولید واقعی انجام شد.\n⏳ در حال ارسال همان محتوای تولیدشده به کانال...",parse_mode='HTML',reply_markup=get_admin_back_kb("auto_health"))
+        ok=await publish_next_article(db,bot,force=True)
+        if not ok: raise RuntimeError("مقاله تولید شد اما انتشار واقعی انجام نشد؛ لاگ انتشار را بررسی کن.")
+        # تست نباید سقف انتشار روزانه واقعی را مصرف کند.
+        await db.execute("UPDATE articles SET status='test_published' WHERE id=?",[test_article_id])
+        username=await get_runtime_bot_username(bot)
+        deep=f"https://t.me/{username}?start=auto_{token}"
+        msg=("✅ <b>تست انتشار واقعی موفق شد</b>\n\n"
+             f"🌐 منبع: {html.escape(str(chosen_src.get('name')))}\n"
+             f"📰 عنوان: {html.escape(title)}\n"
+             f"🖼 تصویر: {'منبع' if chosen.get('image_url') else 'تصویر fallback'}\n"
+             f"🎨 Formatting: HTML تلگرام\n"
+             f"🔗 Deep Link: <a href=\"{html.escape(deep,quote=True)}\">📖 باز کردن مقاله تست</a>\n\n"
+             "📢 پست ارسال‌شده در کانال همان خروجی واقعی Pipeline بود؛ متن ثابت/نمونه استفاده نشد.")
     except Exception as e:
-        logger.exception("health test publish failed")
-        await edit_health_progress(call.message,"❌ <b>تست انتشار شکست خورد.</b>\n\n<code>"+html.escape(str(e)[:1800])+"</code>")
+        msg="❌ <b>تست انتشار واقعی شکست خورد</b>\n\n"+html.escape(str(e)[:1800])
+        if test_article_id:
+            try: await db.execute("UPDATE publication_queue SET status='failed',last_error=? WHERE article_id=?",[str(e)[:1200],test_article_id])
+            except Exception: pass
+    finally: await ai.close()
+    await call.message.edit_text(msg,parse_mode='HTML',reply_markup=get_admin_back_kb("auto_health")); await call.answer()
 
 @router.callback_query(F.data == "auto_settings")
 async def auto_settings_legacy(call: CallbackQuery, db: D1Database):
