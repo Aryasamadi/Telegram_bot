@@ -2448,19 +2448,31 @@ def get_folder_selection_kb() -> InlineKeyboardMarkup:
         ]
     )
 
-def get_save_to_folder_kb(post_id: int) -> InlineKeyboardMarkup:
+def get_save_to_folder_kb(content_type: str, content_id: int, back_cb: str = "user_saves") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text=FOLDER_NAMES["cyber"], callback_data=f"fsave_{post_id}_cyber"),
-                InlineKeyboardButton(text=FOLDER_NAMES["tech"], callback_data=f"fsave_{post_id}_tech")
+                InlineKeyboardButton(text=FOLDER_NAMES["cyber"], callback_data=f"usave_{content_type}_{content_id}_cyber"),
+                InlineKeyboardButton(text=FOLDER_NAMES["tech"], callback_data=f"usave_{content_type}_{content_id}_tech")
             ],
             [
-                InlineKeyboardButton(text=FOLDER_NAMES["ai"], callback_data=f"fsave_{post_id}_ai"),
-                InlineKeyboardButton(text=FOLDER_NAMES["edu"], callback_data=f"fsave_{post_id}_edu")
-            ]
+                InlineKeyboardButton(text=FOLDER_NAMES["ai"], callback_data=f"usave_{content_type}_{content_id}_ai"),
+                InlineKeyboardButton(text=FOLDER_NAMES["edu"], callback_data=f"usave_{content_type}_{content_id}_edu")
+            ],
+            [InlineKeyboardButton(text="🔙 برگشت", callback_data=back_cb)]
         ]
     )
+
+def unified_saved_kb(folder: str = "all") -> InlineKeyboardMarkup:
+    rows=[
+        [InlineKeyboardButton(text="🗂 همه", callback_data="saved_folder_all"),
+         InlineKeyboardButton(text=FOLDER_NAMES["cyber"], callback_data="saved_folder_cyber")],
+        [InlineKeyboardButton(text=FOLDER_NAMES["tech"], callback_data="saved_folder_tech"),
+         InlineKeyboardButton(text=FOLDER_NAMES["ai"], callback_data="saved_folder_ai")],
+        [InlineKeyboardButton(text=FOLDER_NAMES["edu"], callback_data="saved_folder_edu")],
+        [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="user_home")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def get_post_inline_kb(post_id: int, likes: int, dislikes: int, is_saved: bool) -> InlineKeyboardMarkup:
     save_text = "❌ حذف از ذخیره‌ها" if is_saved else "💾 ذخیره"
@@ -2471,9 +2483,8 @@ def get_post_inline_kb(post_id: int, likes: int, dislikes: int, is_saved: bool) 
                 InlineKeyboardButton(text=f"👍 {likes}", callback_data=f"like_{post_id}"),
                 InlineKeyboardButton(text=f"👎 {dislikes}", callback_data=f"dis_{post_id}")
             ],
-            [
-                InlineKeyboardButton(text=save_text, callback_data=save_cb)
-            ]
+            [InlineKeyboardButton(text=save_text, callback_data=save_cb)],
+            [InlineKeyboardButton(text="❓ راهنما", callback_data="user_help"), InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="user_home")]
         ]
     )
 
@@ -2484,14 +2495,7 @@ def get_article_inline_kb(article_id: int, likes: int, dislikes: int, is_saved: 
         [InlineKeyboardButton(text=f"👍 {likes}", callback_data=f"alike_{article_id}"),
          InlineKeyboardButton(text=f"👎 {dislikes}", callback_data=f"adis_{article_id}")],
         [InlineKeyboardButton(text=save_text, callback_data=save_cb)],
-        [InlineKeyboardButton(text="❓ راهنما", callback_data="user_help")]
-    ])
-
-def get_save_to_article_folder_kb(article_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=FOLDER_NAMES["cyber"], callback_data=f"afsave_{article_id}_cyber"), InlineKeyboardButton(text=FOLDER_NAMES["tech"], callback_data=f"afsave_{article_id}_tech")],
-        [InlineKeyboardButton(text=FOLDER_NAMES["ai"], callback_data=f"afsave_{article_id}_ai"), InlineKeyboardButton(text=FOLDER_NAMES["edu"], callback_data=f"afsave_{article_id}_edu")],
-        [InlineKeyboardButton(text="🔙 برگشت", callback_data=f"article_actions_{article_id}")]
+        [InlineKeyboardButton(text="❓ راهنما", callback_data="user_help"), InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="user_home")]
     ])
 
 def get_saved_folder_pagination_kb(post_id: int, folder: str, index: int) -> InlineKeyboardMarkup:
@@ -2796,11 +2800,8 @@ async def cmd_start(message: Message, state: FSMContext, db: D1Database, bot: Bo
         deep_arg = args[1]
         if deep_arg.startswith(("auto_", "article_")):
             ok=await deliver_article_by_token(message,bot,db,deep_arg)
-            if ok:
-                admin_mode = state_data.get("admin_mode", "user")
-                await message.answer("👇 منوی اصلی:", reply_markup=get_admin_menu() if (user_id == ADMIN_ID and admin_mode != "user") else get_main_menu())
-            else:
-                await message.answer("❌ این لینک ادامه مطلب معتبر نیست یا مقاله دیگر در دسترس نیست.\n\n👇 منوی همین بخش:", reply_markup=get_main_menu())
+            if not ok:
+                await message.answer("❌ این لینک ادامه مطلب معتبر نیست یا مقاله دیگر در دسترس نیست.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="user_home")]]))
             return
         post_id_str = deep_arg
         if post_id_str.isdigit():
@@ -2817,10 +2818,6 @@ async def cmd_start(message: Message, state: FSMContext, db: D1Database, bot: Bo
                 
                 kb = get_post_inline_kb(post_id, post.get("likes", 0), post.get("dislikes", 0), is_saved)
                 await send_post_content(bot, message.chat.id, post, kb)
-                
-                admin_mode = state_data.get("admin_mode", "user")
-                menu = get_admin_menu() if (user_id == ADMIN_ID and admin_mode != "user") else get_main_menu()
-                await message.answer("👇 منوی اصلی:", reply_markup=menu)
                 return
             else:
                 await message.answer("❌ این پست یافت نشد یا حذف شده است.")
@@ -3632,69 +3629,88 @@ async def user_home(call: CallbackQuery):
     await call.answer()
 
 
-@router.callback_query(F.data == "user_ai")
-async def user_ai(call: CallbackQuery, state: FSMContext):
-    await state.set_state(BotStates.ai_chat)
-    await state.update_data(ai_history=[{"role":"system","content":"You are a helpful assistant. Reply clearly in Persian."}])
-    await call.message.edit_text("🤖 هوش مصنوعی آماده است.\n\nسؤالت را بفرست یا فایل متنی ارسال کن.", reply_markup=get_exit_menu())
-    await call.answer()
-
-
 @router.callback_query(F.data == "user_saves")
-async def user_saves(call: CallbackQuery):
-    await call.message.edit_text("💾 ذخیره‌های من\n\nیک بخش را انتخاب کن:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗂 ذخیره‌های قدیمی", callback_data="user_saves_legacy"), InlineKeyboardButton(text="📰 مقالات اتوماسیون", callback_data="user_saves_articles")],
-        [InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="user_home")]
-    ]))
+async def user_saves(call: CallbackQuery, db: D1Database):
+    await call.message.edit_text("💾 <b>ذخیره‌های من</b>\n\nهمه مطالب ذخیره‌شده در یک آرشیو یکپارچه قرار دارند.\nیک پوشه را انتخاب کن:", parse_mode="HTML", reply_markup=unified_saved_kb("all"))
     await call.answer()
 
-@router.callback_query(F.data == "user_saves_legacy")
-async def user_saves_legacy(call: CallbackQuery):
-    await call.message.edit_text("💾 ذخیره‌های قدیمی\n\nیک پوشه را انتخاب کن:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=FOLDER_NAMES["cyber"], callback_data="f_view_cyber"), InlineKeyboardButton(text=FOLDER_NAMES["tech"], callback_data="f_view_tech")],
-        [InlineKeyboardButton(text=FOLDER_NAMES["ai"], callback_data="f_view_ai"), InlineKeyboardButton(text=FOLDER_NAMES["edu"], callback_data="f_view_edu")],
-        [InlineKeyboardButton(text="🔙 ذخیره‌های من", callback_data="user_saves")]
-    ]))
-    await call.answer()
-
-@router.callback_query(F.data == "user_saves_articles")
-async def user_saves_articles(call: CallbackQuery, db: D1Database):
+async def _render_unified_saves(call: CallbackQuery, db: D1Database, folder: str = "all"):
     uid=call.from_user.id
-    rows=await db.execute("SELECT a.id,a.title,a.deep_token FROM article_saves s JOIN articles a ON a.id=s.article_id WHERE s.user_id=? ORDER BY a.id DESC LIMIT 20",[uid])
-    if not rows:
-        txt="📰 مقالات اتوماسیون\n\nفعلاً چیزی ذخیره نکردی."
+    params_post=[uid]; params_article=[uid]
+    folder_sql_post=""; folder_sql_article=""
+    if folder != "all":
+        folder_sql_post=" AND s.folder=?"; params_post.append(folder)
+        folder_sql_article=" AND s.folder=?"; params_article.append(folder)
+    posts=await db.execute(f"SELECT p.id,p.text,p.media_type,s.folder FROM saves s JOIN posts p ON p.id=s.post WHERE s.user=? AND p.deleted=0{folder_sql_post} ORDER BY p.id DESC LIMIT 50",params_post)
+    articles=await db.execute(f"SELECT a.id,a.title,a.body,a.deep_token,s.folder FROM article_saves s JOIN articles a ON a.id=s.article_id WHERE s.user_id=? AND a.status IN ('ready','published','test'){folder_sql_article} ORDER BY a.id DESC LIMIT 50",params_article)
+    items=[]
+    for r in posts:
+        txt=strip_html_text(r.get('text') or '').strip().replace('\n',' ')
+        items.append((int(r.get('id') or 0), 'post', r.get('folder') or '', txt[:160], f"https://t.me/{BOT_USERNAME_RUNTIME or BOT_USERNAME.lstrip('@')}?start={int(r.get('id') or 0)}"))
+    for r in articles:
+        title=strip_html_text(r.get('title') or '').strip().replace('\n',' ')
+        body=strip_html_text(r.get('body') or '').strip().replace('\n',' ')
+        preview=(body if body and body.lower()!=title.lower() else title)[:180]
+        label=title[:90] + (" — " + preview[:80] if preview and preview[:80].lower()!=title[:80].lower() else "")
+        items.append((int(r.get('id') or 0), 'article', r.get('folder') or '', label[:180], f"https://t.me/{BOT_USERNAME_RUNTIME or BOT_USERNAME.lstrip('@')}?start=article_{r.get('deep_token','')}"))
+    items.sort(key=lambda x:x[0], reverse=True)
+    items=items[:30]
+    label='همه' if folder=='all' else FOLDER_NAMES.get(folder,folder)
+    if not items:
+        text=f"💾 <b>ذخیره‌های من</b>\n\n📂 پوشه: <b>{html.escape(label)}</b>\n\nفعلاً مطلبی در این بخش ذخیره نکردی."
     else:
-        lines=["📰 <b>مقالات اتوماسیون ذخیره‌شده</b>"]
-        for r in rows:
-            lines.append(f"\n• <a href=\"https://t.me/{BOT_USERNAME_RUNTIME or BOT_USERNAME.lstrip('@')}?start=article_{r.get('deep_token','')}\">{html.escape(str(r.get('title') or 'مطلب')[:90])}</a>")
-        txt=''.join(lines)
-    await call.message.edit_text(txt,parse_mode="HTML",disable_web_page_preview=True,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 ذخیره‌های من",callback_data="user_saves")]]))
+        lines=[f"💾 <b>ذخیره‌های من</b> — {html.escape(label)}\n"]
+        for i,(_,ctype,_,title,url) in enumerate(items,1):
+            icon='📰' if ctype=='article' else '📌'
+            lines.append(f"{i}. {icon} <a href=\"{html.escape(url,quote=True)}\">{html.escape(title or 'مطلب بدون عنوان')}</a>")
+        text='\n'.join(lines)
+    await call.message.edit_text(text,parse_mode='HTML',disable_web_page_preview=True,reply_markup=unified_saved_kb(folder))
     await call.answer()
 
+@router.callback_query(F.data.startswith("saved_folder_"))
+async def saved_folder(call: CallbackQuery, db: D1Database):
+    folder=call.data.split("saved_folder_",1)[1] or 'all'
+    await _render_unified_saves(call,db,folder)
 
 @router.callback_query(F.data == "user_profile")
 async def user_profile(call: CallbackQuery, db: D1Database):
     uid = call.from_user.id
     rows = await db.execute("SELECT joined_at, role FROM users WHERE id=?", [uid])
-    joined = rows[0].get('joined_at') if rows else '-'
-    saves = (await db.execute("SELECT COUNT(*) c FROM saves WHERE user=?", [uid]))[0].get('c',0)
-    likes = (await db.execute("SELECT COUNT(*) c FROM votes WHERE user_id=? AND vote_type='like'", [uid]))[0].get('c',0)
+    joined = rows[0].get('joined_at') if rows else ''
     role = rows[0].get('role') if rows else 'user'
-    text = f"👤 پروفایل\n\n📅 عضویت: {html.escape(str(joined))}\n💾 ذخیره‌ها: {saves}\n👍 لایک: {likes}\n🔰 سطح: {'مدیر' if role=='admin' else 'کاربر'}"
-    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔙 منوی اصلی', callback_data='user_home')]]))
+    try:
+        joined_dt=datetime.fromisoformat(str(joined).replace('Z','+00:00'))
+        if joined_dt.tzinfo is None: joined_dt=joined_dt.replace(tzinfo=timezone.utc)
+        days=max(0,(datetime.now(timezone.utc)-joined_dt).days)
+    except Exception:
+        days=0
+    legacy_saves=(await db.execute("SELECT COUNT(*) c FROM saves WHERE user=?",[uid]))[0].get('c',0)
+    article_saves=(await db.execute("SELECT COUNT(*) c FROM article_saves WHERE user_id=?",[uid]))[0].get('c',0)
+    likes_legacy=(await db.execute("SELECT COUNT(*) c FROM votes WHERE user_id=? AND vote_type='like'",[uid]))[0].get('c',0)
+    likes_article=(await db.execute("SELECT COUNT(*) c FROM article_votes WHERE user_id=? AND vote_type='like'",[uid]))[0].get('c',0)
+    dislikes_legacy=(await db.execute("SELECT COUNT(*) c FROM votes WHERE user_id=? AND vote_type='dislike'",[uid]))[0].get('c',0)
+    dislikes_article=(await db.execute("SELECT COUNT(*) c FROM article_votes WHERE user_id=? AND vote_type='dislike'",[uid]))[0].get('c',0)
+    total_saves=legacy_saves+article_saves; total_likes=likes_legacy+likes_article; total_dislikes=dislikes_legacy+dislikes_article
+    role_display='مدیر 🌟' if role=='admin' else 'کاربر 🟢'
+    name=html.escape(call.from_user.first_name or 'دوست عزیز')
+    text=(f"👤 <b>پروفایل {name}</b>\n\n"
+          f"🗓 <b>عضویت:</b> {days} روز پیش\n"
+          f"🔰 <b>نوع حساب:</b> {role_display}\n\n"
+          f"💾 <b>ذخیره‌ها:</b> {total_saves}\n"
+          f"👍 <b>لایک‌ها:</b> {total_likes}\n"
+          f"👎 <b>دیس‌لایک‌ها:</b> {total_dislikes}\n\n"
+          "✨ اینجا آمار ساده و کاربردی فعالیتت را می‌بینی.")
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💾 ذخیره‌های من",callback_data="user_saves")],
+        [InlineKeyboardButton(text="🔙 منوی اصلی",callback_data="user_home")]
+    ])
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=kb)
     await call.answer()
 
 
 @router.callback_query(F.data == "user_help")
 async def user_help(call: CallbackQuery):
-    await call.message.edit_text("🌐 /help • راهنما\n📞 /man • تماس با مدیر\n🚀 /start • شروع", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="user_home")]]))
-    await call.answer()
-
-
-@router.callback_query(F.data == "user_contact")
-async def user_contact(call: CallbackQuery, state: FSMContext):
-    await state.set_state(BotStates.user_chat_admin)
-    await call.message.edit_text("📞 پیام خود را برای مدیریت ارسال کن.\n\nپیام تو مستقیم برای مدیر فرستاده می‌شود.", reply_markup=get_exit_menu())
+    await call.message.edit_text("❓ <b>راهنما</b>\n\n/start • شروع\n/help • راهنما\n/man • تماس با مدیر", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="user_home")]]))
     await call.answer()
 
 
@@ -4825,31 +4841,39 @@ async def process_article_voting(call: CallbackQuery, db: D1Database):
 @router.callback_query(F.data.startswith("asave_"))
 async def process_article_save_action(call: CallbackQuery):
     article_id=int(call.data.split("_")[1])
-    await call.message.answer("📂 این مطلب را در کدام پوشه ذخیره کنم؟",reply_markup=get_save_to_article_folder_kb(article_id))
+    try:
+        await call.message.edit_reply_markup(reply_markup=get_save_to_folder_kb("article",article_id,f"article_actions_{article_id}"))
+    except Exception:
+        await call.message.edit_text("📂 این مطلب را در کدام پوشه ذخیره کنم؟",reply_markup=get_save_to_folder_kb("article",article_id,f"article_actions_{article_id}"))
     await call.answer()
 
-@router.callback_query(F.data.startswith("afsave_"))
-async def process_article_folder_save(call: CallbackQuery, db: D1Database):
-    parts=call.data.split("_"); article_id=int(parts[1]); folder=parts[2]; user_id=call.from_user.id
+@router.callback_query(F.data.startswith("usave_"))
+async def process_unified_folder_save(call: CallbackQuery, db: D1Database):
+    parts=call.data.split("_")
+    if len(parts)!=4: return await call.answer("❌ خطا",show_alert=True)
+    _,ctype,cid_str,folder=parts
+    cid=int(cid_str); user_id=call.from_user.id
     try:
-        await db.execute("INSERT OR IGNORE INTO article_saves(user_id,article_id,folder) VALUES(?,?,?)",[user_id,article_id,folder])
-        await call.answer(f"✅ در {FOLDER_NAMES.get(folder,folder)} ذخیره شد",show_alert=True)
-        try: await call.message.delete()
-        except Exception: pass
+        if ctype=="article":
+            await db.execute("INSERT OR IGNORE INTO article_saves(user_id,article_id,folder) VALUES(?,?,?)",[user_id,cid,folder])
+            msg="✅ مطلب در آرشیو ذخیره شد"
+            back_cb=f"article_actions_{cid}"
+        else:
+            await db.execute("INSERT OR IGNORE INTO saves(user,post,folder) VALUES(?,?,?)",[user_id,cid,folder])
+            msg="✅ مطلب در آرشیو ذخیره شد"
+            back_cb=f"post_actions_{cid}"
+        await call.answer(msg,show_alert=True)
+        if ctype=="article":
+            rows=await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='like'",[cid]); likes=rows[0].get('c',0) if rows else 0
+            rows=await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='dislike'",[cid]); dislikes=rows[0].get('c',0) if rows else 0
+            kb=get_article_inline_kb(cid,likes,dislikes,True)
+            await call.message.edit_reply_markup(reply_markup=kb)
+        else:
+            rows=await db.execute("SELECT likes,dislikes FROM posts WHERE id=?",[cid])
+            p=rows[0] if rows else {}
+            await call.message.edit_reply_markup(reply_markup=get_post_inline_kb(cid,p.get('likes',0),p.get('dislikes',0),True))
     except Exception:
-        await call.answer("❌ خطا در ذخیره",show_alert=True)
-
-@router.callback_query(F.data.startswith("aunsave_"))
-async def process_article_unsave(call: CallbackQuery, db: D1Database):
-    article_id=int(call.data.split("_")[1]); user_id=call.from_user.id
-    try:
-        await db.execute("DELETE FROM article_saves WHERE user_id=? AND article_id=?",[user_id,article_id])
-        row=await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='like'",[article_id])
-        drow=await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='dislike'",[article_id])
-        await call.message.edit_reply_markup(reply_markup=get_article_inline_kb(article_id,row[0].get('c',0),drow[0].get('c',0),False))
-        await call.answer("🗑️ از ذخیره‌ها حذف شد",show_alert=True)
-    except Exception:
-        await call.answer("❌ خطا در حذف",show_alert=True)
+        await call.answer("❌ ذخیره‌سازی انجام نشد",show_alert=True)
 
 @router.callback_query(F.data.startswith("article_actions_"))
 async def article_actions(call: CallbackQuery, db: D1Database):
@@ -4909,26 +4933,24 @@ async def process_post_voting(call: CallbackQuery, db: D1Database):
 @router.callback_query(F.data.startswith("save_"))
 async def process_save_action(call: CallbackQuery):
     post_id = int(call.data.split("_")[1])
-    await call.message.answer("📂 این مطلب ارزشمند رو تو کدوم پوشه بذارم؟ 👇", reply_markup=get_save_to_folder_kb(post_id))
+    try:
+        await call.message.edit_reply_markup(reply_markup=get_save_to_folder_kb("post",post_id,f"post_actions_{post_id}"))
+    except Exception:
+        pass
     await call.answer()
 
 @router.callback_query(F.data.startswith("fsave_"))
 async def process_folder_save(call: CallbackQuery, db: D1Database):
-    parts = call.data.split("_")
-    post_id = int(parts[1])
-    folder = parts[2]
-    user_id = call.from_user.id
-    
+    parts=call.data.split("_")
+    post_id=int(parts[1]); folder=parts[2]; user_id=call.from_user.id
     try:
-        await db.execute("INSERT OR IGNORE INTO saves(user, post, folder) VALUES(?, ?, ?)", [user_id, post_id, folder])
-        folder_display = FOLDER_NAMES.get(folder, folder)
-        await call.answer(f"✅ با موفقیت در {folder_display} ذخیره شد!", show_alert=True)
-        try:
-            await call.message.delete()
-        except Exception:
-            pass
+        await db.execute("INSERT OR IGNORE INTO saves(user,post,folder) VALUES(?,?,?)",[user_id,post_id,folder])
+        p_rows=await db.execute("SELECT likes,dislikes FROM posts WHERE id=?",[post_id])
+        p=p_rows[0] if p_rows else {}
+        await call.answer(f"✅ در {FOLDER_NAMES.get(folder,folder)} ذخیره شد",show_alert=True)
+        await call.message.edit_reply_markup(reply_markup=get_post_inline_kb(post_id,p.get('likes',0),p.get('dislikes',0),True))
     except Exception:
-        await call.answer("❌ خطا در ذخیره سازی", show_alert=True)
+        await call.answer("❌ خطا در ذخیره‌سازی",show_alert=True)
 
 @router.callback_query(F.data.startswith("unsave_"))
 async def process_unsave_action(call: CallbackQuery, db: D1Database):
