@@ -1,3 +1,4 @@
+# VERSION 10.13.0 — unified user archive, compact saved view, richer formatting, no active rate limiter
 import os
 import io
 import re
@@ -214,12 +215,10 @@ async def initialize_database(db: D1Database):
         {"sql": "CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT, file_id TEXT, media_type TEXT, likes INTEGER DEFAULT 0, dislikes INTEGER DEFAULT 0, views INTEGER DEFAULT 0, deleted INTEGER DEFAULT 0)"},
         {"sql": "CREATE INDEX IF NOT EXISTS idx_posts_deleted ON posts(deleted)"},
         {"sql": "CREATE INDEX IF NOT EXISTS idx_posts_text ON posts(text)"},
-        {"sql": "CREATE TABLE IF NOT EXISTS saves(user INTEGER, post INTEGER, folder TEXT, PRIMARY KEY(user, post))"},
-        {"sql": "CREATE TABLE IF NOT EXISTS votes(user_id INTEGER, post_id INTEGER, vote_type TEXT, PRIMARY KEY(user_id, post_id))"},
-        {"sql": "CREATE TABLE IF NOT EXISTS article_saves(user_id INTEGER, article_id INTEGER, folder TEXT, PRIMARY KEY(user_id, article_id))"},
-        {"sql": "CREATE TABLE IF NOT EXISTS article_votes(user_id INTEGER, article_id INTEGER, vote_type TEXT, PRIMARY KEY(user_id, article_id))"},
-        {"sql": "CREATE INDEX IF NOT EXISTS idx_article_votes_article ON article_votes(article_id)"},
-        {"sql": "CREATE INDEX IF NOT EXISTS idx_article_saves_article ON article_saves(article_id)"},
+        {"sql": "CREATE TABLE IF NOT EXISTS user_content_saves(user_id INTEGER NOT NULL, content_type TEXT NOT NULL, content_id INTEGER NOT NULL, folder TEXT NOT NULL, created_at TEXT, PRIMARY KEY(user_id, content_type, content_id))"},
+        {"sql": "CREATE INDEX IF NOT EXISTS idx_user_content_saves_user_folder ON user_content_saves(user_id, folder)"},
+        {"sql": "CREATE TABLE IF NOT EXISTS user_content_votes(user_id INTEGER NOT NULL, content_type TEXT NOT NULL, content_id INTEGER NOT NULL, vote_type TEXT NOT NULL, created_at TEXT, PRIMARY KEY(user_id, content_type, content_id))"},
+        {"sql": "CREATE INDEX IF NOT EXISTS idx_user_content_votes_content ON user_content_votes(content_type, content_id)"},
         {"sql": "CREATE TABLE IF NOT EXISTS user_states(user_id INTEGER PRIMARY KEY, state TEXT, data TEXT)"},
         {"sql": "CREATE TABLE IF NOT EXISTS processed_updates(update_id INTEGER PRIMARY KEY, processed_at TEXT)"}
     ]
@@ -238,6 +237,24 @@ async def initialize_database(db: D1Database):
         pass
 
 
+
+async def migrate_unified_user_interactions(db: D1Database):
+    rows=await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('saves','votes','article_saves','article_votes')")
+    existing={str(r.get('name') or '') for r in rows}
+    statements=[]
+    if 'saves' in existing:
+        statements.append("INSERT OR IGNORE INTO user_content_saves(user_id,content_type,content_id,folder,created_at) SELECT user, 'post', post, folder, NULL FROM saves")
+    if 'article_saves' in existing:
+        statements.append("INSERT OR IGNORE INTO user_content_saves(user_id,content_type,content_id,folder,created_at) SELECT user_id, 'article', article_id, folder, NULL FROM article_saves")
+    if 'votes' in existing:
+        statements.append("INSERT OR IGNORE INTO user_content_votes(user_id,content_type,content_id,vote_type,created_at) SELECT user_id, 'post', post_id, vote_type, NULL FROM votes")
+    if 'article_votes' in existing:
+        statements.append("INSERT OR IGNORE INTO user_content_votes(user_id,content_type,content_id,vote_type,created_at) SELECT user_id, 'article', article_id, vote_type, NULL FROM article_votes")
+    for legacy in ('saves','votes','article_saves','article_votes'):
+        if legacy in existing: statements.append(f"DROP TABLE IF EXISTS {legacy}")
+    for sql in statements:
+        try: await db.execute(sql)
+        except Exception: pass
 
 # ============================================================
 # زیرسیستم اتوماسیون محتوا (Content Automation)
@@ -1372,66 +1389,48 @@ def _format_technical_tokens(text: str) -> str:
         out=re.sub(pat, lambda m: f"<code>{m.group(0)}</code>", out, flags=re.I)
     return out
 
+def _normalize_text_blocks(value: str) -> str:
+    value=(value or "").replace("\r\n","\n").replace("\r","\n")
+    value=re.sub(r"<br\s*/?>","\n",value,flags=re.I)
+    value=re.sub(r"[ \t]+"," ",value)
+    value=re.sub(r"\n{3,}","\n\n",value)
+    return value.strip()
+
 def _visualize_plain_paragraphs(title: str, value: str, category: str, article: bool=False) -> str:
-    """Normalize and enrich Telegram formatting without inventing factual content."""
-    clean=dedupe_adjacent_emojis(sanitize_telegram_html(value or ""))
+    clean=dedupe_adjacent_emojis(sanitize_telegram_html(_normalize_text_blocks(value or "")))
     plain=strip_html_text(clean)
-    if not plain:
-        return ""
-    emoji_map={
-        "ai":["🤖","🧠","⚡","🔬","🧩"],
-        "cyber":["🛡️","🔐","🚨","🧩","⚠️"],
-        "tech":["💻","⚙️","🚀","🔎","🧪"],
-        "edu":["📚","💡","🧭","📝","🎓"],
-        "general":["🌐","✨","📌","🔭","🧭"]
-    }
+    if not plain: return ""
+    emoji_map={"ai":["🤖","🧠","⚡","🔬","🧩","🚀"],"cyber":["🛡️","🔐","🚨","🧩","⚠️","🔎"],"tech":["💻","⚙️","🚀","🔎","🧪","📱"],"edu":["📚","💡","🧭","📝","🎓","🔍"],"general":["🌐","✨","📌","🔭","🧭","💡"]}
     icons=emoji_map.get(category,emoji_map["tech"])
-    # Work paragraph-by-paragraph on the plain structure, while preserving any
-    # meaningful HTML tags already emitted by the model.
-    paragraphs=[x.strip() for x in re.split(r"\n\s*\n+", clean) if strip_html_text(x).strip()]
-    if not paragraphs:
-        paragraphs=[clean]
-
-    out=[]
-    title_clean=html.escape(strip_html_text(title)[:220])
-    out.append(f"<b>{icons[0]} {title_clean}</b>")
-
+    paragraphs=[x.strip() for x in re.split(r"\n\s*\n+",clean) if strip_html_text(x).strip()] or [clean]
+    out=[f"<b>{icons[0]} {html.escape(strip_html_text(title)[:220])}</b>"]
+    last_icon=None
     for i,para in enumerate(paragraphs[:10]):
-        pplain=strip_html_text(para)
-        if not pplain:
-            continue
-        # Avoid repeating a model-generated title as the first body paragraph.
-        if i==0 and SequenceMatcher(None, pplain.lower(), strip_html_text(title).lower()).ratio() > 0.86:
-            continue
-        has_rich = any(tag in para.lower() for tag in ("<b>","<strong>","<i>","<em>","<u>","<s>","<del>","<a ","<blockquote>","<pre>","<code>"))
+        pplain=strip_html_text(para).strip()
+        if not pplain or (i==0 and SequenceMatcher(None,pplain.lower(),strip_html_text(title).lower()).ratio()>0.86): continue
+        icon=icons[i%len(icons)]
+        if icon==last_icon: icon=icons[(i+1)%len(icons)]
+        last_icon=icon
+        has_rich=any(tag in para.lower() for tag in ("<b>","<strong>","<i>","<em>","<u>","<s>","<a ","<blockquote>","<pre>","<code>"))
         if has_rich:
-            formatted=para
-            if article and i in {1,3} and "<blockquote>" not in para.lower() and len(pplain)>=70:
-                formatted=f"<blockquote>{formatted}</blockquote>"
-            elif not formatted.lstrip().startswith(("<b>","<i>","<u>","<s>","<blockquote>","<pre>","<code>")):
-                formatted=f"{icons[i % len(icons)]} {formatted}"
+            formatted=para.strip()
+            if not formatted.startswith(("<b>","<i>","<u>","<s>","<blockquote>","<pre>","<code>")): formatted=f"{icon} {formatted}"
+            if article and i in (2,5) and len(pplain)>=80 and "<blockquote>" not in formatted.lower(): formatted=f"<blockquote>{formatted}</blockquote>"
         else:
-            formatted=_format_technical_tokens(html.escape(pplain, quote=False))
-            icon=icons[i % len(icons)]
-            if article and i in {1,3} and len(pplain)>=70:
-                formatted=f"<blockquote>{formatted}</blockquote>"
-            elif i==0:
-                formatted=f"{icon} <i>{formatted}</i>"
-            elif i % 4 == 0:
-                formatted=f"{icon} <b>{formatted}</b>"
-            else:
-                formatted=f"{icon} {formatted}"
+            formatted=_format_technical_tokens(html.escape(pplain,quote=False))
+            if i in (0,4,8): formatted=f"{icon} <b>{formatted}</b>"
+            elif article and i in (2,5) and len(pplain)>=80: formatted=f"<blockquote>{formatted}</blockquote>"
+            elif i==1: formatted=f"{icon} <i>{formatted}</i>"
+            else: formatted=f"{icon} {formatted}"
         out.append(formatted)
+    return dedupe_adjacent_emojis("\n\n".join(out))
 
-    result="\n\n".join(out)
-    # Give the full article a second quote when the source content has enough material.
-    if article:
-        plain_parts=[x.strip() for x in re.split(r"\n\s*\n+", strip_html_text(result)) if x.strip()]
-        if len(plain_parts)>=5 and "<blockquote>" not in result.lower():
-            idx=3
-            q=html.escape(plain_parts[idx][:420],quote=False)
-            result=result.replace(html.escape(plain_parts[idx],quote=False), f"<blockquote>{q}</blockquote>", 1)
-    return result
+def remove_article_metadata_blocks(value: str) -> str:
+    text=_normalize_text_blocks(value or "")
+    text=re.sub(r"(?:<u>)?\s*🔗\s*لینک(?:‌| )های مرتبط.*$","",text,flags=re.I|re.S)
+    text=re.sub(r"\n+.*?تاریخ انتشار\s*:.+?(?=\n|$)","",text,flags=re.I)
+    text=re.sub(r"\n+<i>⏱.*?پیش</i>","",text,flags=re.I|re.S)
+    return _normalize_text_blocks(text)
 
 def dedupe_adjacent_emojis(text: str) -> str:
     """Collapse directly repeated visual emojis while preserving intentional variety."""
@@ -1472,7 +1471,7 @@ def relative_time_label(value: str) -> str:
         return "زمان نامشخص"
 
 def ensure_rich_channel_format(title: str, value: str, category: str = "tech") -> str:
-    clean=dedupe_adjacent_emojis(sanitize_telegram_html(value or ""))
+    clean=dedupe_adjacent_emojis(sanitize_telegram_html(_normalize_text_blocks(value or "")))
     if not strip_html_text(clean):
         return rich_channel_fallback(title, "اطلاعات قابل انتشار از منبع دریافت شد.")
     return _visualize_plain_paragraphs(title, clean, category, article=False)
@@ -1500,16 +1499,16 @@ def sanitize_resource_links(raw_links):
     return out[:5]
 
 def append_resource_links(article_html: str, resource_links, source_url: str = "") -> str:
-    links=sanitize_resource_links(resource_links); rendered=[]
-    main=normalize_url(source_url or "")
-    if main:
-        rendered.append(f'<a href="{html.escape(main,quote=True)}">🔗 منبع اصلی</a>')
-    for x in links:
-        if x["url"] == main:
-            continue
-        rendered.append(f'<a href="{html.escape(x["url"],quote=True)}">🔗 {html.escape(x["label"])}</a>')
-    if not rendered: return article_html
-    return article_html.rstrip()+"\n\n<u>🔗 لینک‌های مرتبط</u>\n"+"\n".join(rendered)
+    clean=remove_article_metadata_blocks(article_html)
+    rendered=[]; main=normalize_url(source_url or "")
+    if main: rendered.append(f'<a href="{html.escape(main,quote=True)}">منبع اصلی</a>')
+    for x in sanitize_resource_links(resource_links):
+        label=x["label"]
+        if not re.search(r"ثبت[-‌ ]?نام|عضویت|دانلود|دریافت|مستندات|docs|register|signup|خرید|قیمت|demo|دمو|مشاهده",label,re.I): continue
+        if x["url"]==main: continue
+        rendered.append(f'<a href="{html.escape(x["url"],quote=True)}">{html.escape(label)}</a>')
+        if len(rendered)>=2: break
+    return clean.rstrip()+"\n\n"+" · ".join(rendered) if rendered else clean
 
 async def resolve_article_image(db: D1Database, article: dict) -> str:
     # Image URLs are transient transport data. Never persist them in D1.
@@ -1927,13 +1926,11 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                     title_out=strip_html_text(out.get('title') or title)[:500]
                     article_text=ensure_rich_article_format(title_out,out.get('article_html') or out.get('article_text') or '',url)
                     article_text=append_resource_links(article_text,out.get('resource_links'),url)
+                    article_text=remove_article_metadata_blocks(article_text)
                     channel_text=ensure_rich_channel_format(title_out,out.get('channel_html') or out.get('channel_text') or '',str(out.get('category') or source.get('category') or 'tech'))
                     if plain_len(channel_text)>780: channel_text=rich_channel_fallback(title_out,channel_text)
                     if plain_len(article_text)<1200: article_text=rich_article_fallback(title_out,article_text,url)
                     if plain_len(article_text)>4200: article_text=ensure_rich_article_format(title_out,strip_html_text(article_text)[:4200],url)
-                    source_date=format_source_publication_date(item.get('published_at') or '')
-                    if source_date:
-                        article_text=article_text.rstrip()+f'\n\n<i>تاریخ انتشار: {source_date}</i>'
                     if plain_len(article_text)<900:
                         if item_id: await db.execute("UPDATE source_items SET status='rejected',last_error='article too short' WHERE id=?",[item_id])
                         return {'processed':1,'rejected':1,'reason':'article too short'}
@@ -1991,9 +1988,6 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                             channel_text=ensure_rich_channel_format(title_out,out.get('channel_html') or out.get('channel_text') or '',str(out.get('category') or source.get('category') or 'tech'))
                             article_text=ensure_rich_article_format(title_out,out.get('article_html') or out.get('article_text') or '',u)
                             article_text=append_resource_links(article_text,out.get('resource_links'),u)
-                            source_date=format_source_publication_date(raw.get('published_at') or '')
-                            if source_date:
-                                article_text=article_text.rstrip()+f'\n\n<i>تاریخ انتشار: {source_date}</i>'
                             if plain_len(article_text)<900: continue
                             art=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at,source_published_at) VALUES(?,?,?,?,?,?,?,?,'ready',?,?) RETURNING id",[item_id,title_out,channel_text,article_text[:18000],u,'',out.get('category') or source.get('category','tech'),score,now.isoformat(),raw.get('published_at','')[:100]])
                             aid=art[0].get('id') if art else 0
@@ -2358,8 +2352,12 @@ async def reset_database(db: D1Database):
         {"sql": "DROP TABLE IF EXISTS users"},
         {"sql": "DROP TABLE IF EXISTS posts"},
         {"sql": "DROP TABLE IF EXISTS saves"},
-        {"sql": "DROP TABLE IF EXISTS user_states"},
         {"sql": "DROP TABLE IF EXISTS votes"},
+        {"sql": "DROP TABLE IF EXISTS article_saves"},
+        {"sql": "DROP TABLE IF EXISTS article_votes"},
+        {"sql": "DROP TABLE IF EXISTS user_content_saves"},
+        {"sql": "DROP TABLE IF EXISTS user_content_votes"},
+        {"sql": "DROP TABLE IF EXISTS user_states"},
         {"sql": "DROP TABLE IF EXISTS processed_updates"},
         {"sql": "DROP TABLE IF EXISTS sources"},
         {"sql": "DROP TABLE IF EXISTS source_items"},
@@ -2373,6 +2371,7 @@ async def reset_database(db: D1Database):
     ]
     await db.execute_batch(queries)
     await initialize_database(db)
+    await migrate_unified_user_interactions(db)
     await initialize_automation_database(db)
 
 # ============================================================
@@ -2464,15 +2463,12 @@ def get_save_to_folder_kb(content_type: str, content_id: int, back_cb: str = "us
     )
 
 def unified_saved_kb(folder: str = "all") -> InlineKeyboardMarkup:
-    rows=[
-        [InlineKeyboardButton(text="🗂 همه", callback_data="saved_folder_all"),
-         InlineKeyboardButton(text=FOLDER_NAMES["cyber"], callback_data="saved_folder_cyber")],
-        [InlineKeyboardButton(text=FOLDER_NAMES["tech"], callback_data="saved_folder_tech"),
-         InlineKeyboardButton(text=FOLDER_NAMES["ai"], callback_data="saved_folder_ai")],
-        [InlineKeyboardButton(text=FOLDER_NAMES["edu"], callback_data="saved_folder_edu")],
-        [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="user_home")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=FOLDER_NAMES["tech"],callback_data="saved_folder_tech"),InlineKeyboardButton(text=FOLDER_NAMES["ai"],callback_data="saved_folder_ai")],
+        [InlineKeyboardButton(text=FOLDER_NAMES["cyber"],callback_data="saved_folder_cyber"),InlineKeyboardButton(text=FOLDER_NAMES["edu"],callback_data="saved_folder_edu")],
+        [InlineKeyboardButton(text="🗂 همه",callback_data="saved_folder_all")],
+        [InlineKeyboardButton(text="🏠 منوی اصلی",callback_data="user_home")]
+    ])
 
 def get_post_inline_kb(post_id: int, likes: int, dislikes: int, is_saved: bool) -> InlineKeyboardMarkup:
     save_text = "❌ حذف از ذخیره‌ها" if is_saved else "💾 ذخیره"
@@ -2489,13 +2485,12 @@ def get_post_inline_kb(post_id: int, likes: int, dislikes: int, is_saved: bool) 
     )
 
 def get_article_inline_kb(article_id: int, likes: int, dislikes: int, is_saved: bool) -> InlineKeyboardMarkup:
-    save_text = "❌ حذف از ذخیره‌ها" if is_saved else "💾 ذخیره"
-    save_cb = f"aunsave_{article_id}" if is_saved else f"asave_{article_id}"
+    save_text="❌ حذف از ذخیره‌ها" if is_saved else "💾 ذخیره"
+    save_cb=f"aunsave_{article_id}" if is_saved else f"asave_{article_id}"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"👍 {likes}", callback_data=f"alike_{article_id}"),
-         InlineKeyboardButton(text=f"👎 {dislikes}", callback_data=f"adis_{article_id}")],
-        [InlineKeyboardButton(text=save_text, callback_data=save_cb)],
-        [InlineKeyboardButton(text="❓ راهنما", callback_data="user_help"), InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="user_home")]
+        [InlineKeyboardButton(text=f"👍 {likes}",callback_data=f"alike_{article_id}"),InlineKeyboardButton(text=f"👎 {dislikes}",callback_data=f"adis_{article_id}")],
+        [InlineKeyboardButton(text=save_text,callback_data=save_cb)],
+        [InlineKeyboardButton(text="🏠 منوی اصلی",callback_data="user_home")]
     ])
 
 def get_saved_folder_pagination_kb(post_id: int, folder: str, index: int) -> InlineKeyboardMarkup:
@@ -2749,19 +2744,17 @@ async def deliver_article_by_token(message: Message, bot: Bot, db: D1Database, t
     except Exception: pass
 
     title=html.escape(str(article.get('title') or 'مطلب'))
-    body=dedupe_adjacent_emojis(sanitize_telegram_html(article.get('body') or ''))
+    body=remove_article_metadata_blocks(dedupe_adjacent_emojis(sanitize_telegram_html(article.get('body') or '')))
     source_url=normalize_url(article.get('source_url') or '')
-    # Exactly one short source link inside the full article; no author and no related-links section.
-    if source_url and html.escape(source_url,quote=True) not in body:
+    if source_url and 'منبع اصلی' not in strip_html_text(body):
         body=f"{body.rstrip()}\n\n<a href=\"{html.escape(source_url,quote=True)}\">منبع اصلی</a>"
     relative=relative_time_label(article.get('source_published_at') or article.get('published_at') or article.get('created_at') or '')
-    if 'پیش' not in strip_html_text(body)[-80:]:
-        body=body.rstrip()+f"\n\n<i>⏱ {relative}</i>"
+    body=body.rstrip()+f"\n\n<i>⏱ {relative}</i>"
     full=f"<b>📖 {title}</b>\n\n{body}"
 
-    like_rows=await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='like'",[article_id])
-    dislike_rows=await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='dislike'",[article_id])
-    save_rows=await db.execute("SELECT folder FROM article_saves WHERE user_id=? AND article_id=?",[message.from_user.id,article_id])
+    like_rows=await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='like'",[article_id])
+    dislike_rows=await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='dislike'",[article_id])
+    save_rows=await db.execute("SELECT folder FROM user_content_saves WHERE user_id=? AND content_type='article' AND content_id=?",[message.from_user.id,article_id])
     kb=get_article_inline_kb(article_id,like_rows[0].get('c',0) if like_rows else 0,dislike_rows[0].get('c',0) if dislike_rows else 0,bool(save_rows))
 
     image=await resolve_article_image(db,article)
@@ -2813,7 +2806,7 @@ async def cmd_start(message: Message, state: FSMContext, db: D1Database, bot: Bo
             if post_rows:
                 post = post_rows[0]
                 await db.execute("UPDATE posts SET views = views + 1 WHERE id = ?", [post_id])
-                save_rows = await db.execute("SELECT folder FROM saves WHERE user = ? AND post = ?", [user_id, post_id])
+                save_rows = await db.execute("SELECT folder FROM user_content_saves WHERE user_id = ? AND content_type='post' AND content_id = ?", [user_id, post_id])
                 is_saved = len(save_rows) > 0
                 
                 kb = get_post_inline_kb(post_id, post.get("likes", 0), post.get("dislikes", 0), is_saved)
@@ -3086,8 +3079,8 @@ async def process_user_search_folder(message: Message, state: FSMContext, db: D1
     await state.update_data(search_count=search_count, search_window_start=window_start)
     
     rows = await db.execute(
-        """SELECT posts.id FROM saves JOIN posts ON saves.post = posts.id
-           WHERE saves.user = ? AND saves.folder = ? AND posts.text LIKE ? AND posts.deleted = 0
+        """SELECT posts.id FROM user_content_saves s JOIN posts ON s.content_id = posts.id AND s.content_type='post'
+           WHERE s.user_id = ? AND s.folder = ? AND posts.text LIKE ? AND posts.deleted = 0
            ORDER BY posts.id DESC LIMIT 30""",
         [message.from_user.id, folder, f"%{query_text}%"]
     )
@@ -3181,14 +3174,14 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
             except Exception:
                 pass
                 
-        saves_count = (await db.execute("SELECT COUNT(*) as c FROM saves WHERE user = ?", [user_id]))[0].get("c", 0)
-        likes_count = (await db.execute("SELECT COUNT(*) as c FROM votes WHERE user_id = ? AND vote_type = 'like'", [user_id]))[0].get("c", 0)
-        dislikes_count = (await db.execute("SELECT COUNT(*) as c FROM votes WHERE user_id = ? AND vote_type = 'dislike'", [user_id]))[0].get("c", 0)
+        saves_count = (await db.execute("SELECT COUNT(*) as c FROM user_content_saves WHERE user_id = ?", [user_id]))[0].get("c", 0)
+        likes_count = (await db.execute("SELECT COUNT(*) as c FROM user_content_votes WHERE user_id = ? AND vote_type = 'like'", [user_id]))[0].get("c", 0)
+        dislikes_count = (await db.execute("SELECT COUNT(*) as c FROM user_content_votes WHERE user_id = ? AND vote_type = 'dislike'", [user_id]))[0].get("c", 0)
         
         role_display = "مدیر 🌟" if user_role_db == "admin" else "کاربر عادی 🟢"
         first_name_clean = message.from_user.first_name or "عزیز"
-        article_saves_count=(await db.execute("SELECT COUNT(*) as c FROM article_saves WHERE user_id=?",[user_id]))[0].get("c",0)
-        article_likes_count=(await db.execute("SELECT COUNT(*) as c FROM article_votes WHERE user_id=? AND vote_type='like'",[user_id]))[0].get("c",0)
+        article_saves_count=0
+        article_likes_count=0
         profile_text = f"""👤 <b>پروفایل</b> · {html.escape(first_name_clean)}
 
 🗓 <b>عضویت</b>
@@ -3636,23 +3629,18 @@ async def user_saves(call: CallbackQuery, db: D1Database):
 
 async def _render_unified_saves(call: CallbackQuery, db: D1Database, folder: str = "all"):
     uid=call.from_user.id
-    params_post=[uid]; params_article=[uid]
-    folder_sql_post=""; folder_sql_article=""
-    if folder != "all":
-        folder_sql_post=" AND s.folder=?"; params_post.append(folder)
-        folder_sql_article=" AND s.folder=?"; params_article.append(folder)
-    posts=await db.execute(f"SELECT p.id,p.text,p.media_type,s.folder FROM saves s JOIN posts p ON p.id=s.post WHERE s.user=? AND p.deleted=0{folder_sql_post} ORDER BY p.id DESC LIMIT 50",params_post)
-    articles=await db.execute(f"SELECT a.id,a.title,a.body,a.deep_token,s.folder FROM article_saves s JOIN articles a ON a.id=s.article_id WHERE s.user_id=? AND a.status IN ('ready','published','test'){folder_sql_article} ORDER BY a.id DESC LIMIT 50",params_article)
+    folder_clause=""; base=[uid]
+    if folder != "all": folder_clause=" AND s.folder=?"; base.append(folder)
+    posts=await db.execute(f"SELECT p.id,p.text,p.media_type,s.folder FROM user_content_saves s JOIN posts p ON p.id=s.content_id AND s.content_type='post' WHERE s.user_id=? AND p.deleted=0{folder_clause} ORDER BY s.rowid DESC LIMIT 50",base)
+    articles=await db.execute(f"SELECT a.id,a.title,a.deep_token,s.folder FROM user_content_saves s JOIN articles a ON a.id=s.content_id AND s.content_type='article' WHERE s.user_id=? AND a.status IN ('ready','published','test'){folder_clause} ORDER BY s.rowid DESC LIMIT 50",base)
     items=[]
     for r in posts:
         txt=strip_html_text(r.get('text') or '').strip().replace('\n',' ')
-        items.append((int(r.get('id') or 0), 'post', r.get('folder') or '', txt[:160], f"https://t.me/{BOT_USERNAME_RUNTIME or BOT_USERNAME.lstrip('@')}?start={int(r.get('id') or 0)}"))
+        items.append((int(r.get('id') or 0), 'post', r.get('folder') or '', txt[:80], f"https://t.me/{BOT_USERNAME_RUNTIME or BOT_USERNAME.lstrip('@')}?start={int(r.get('id') or 0)}"))
     for r in articles:
         title=strip_html_text(r.get('title') or '').strip().replace('\n',' ')
-        body=strip_html_text(r.get('body') or '').strip().replace('\n',' ')
-        preview=(body if body and body.lower()!=title.lower() else title)[:180]
-        label=title[:90] + (" — " + preview[:80] if preview and preview[:80].lower()!=title[:80].lower() else "")
-        items.append((int(r.get('id') or 0), 'article', r.get('folder') or '', label[:180], f"https://t.me/{BOT_USERNAME_RUNTIME or BOT_USERNAME.lstrip('@')}?start=article_{r.get('deep_token','')}"))
+        label=title[:90]
+        items.append((int(r.get('id') or 0), 'article', r.get('folder') or '', label, f"https://t.me/{BOT_USERNAME_RUNTIME or BOT_USERNAME.lstrip('@')}?start=article_{r.get('deep_token','')}"))
     items.sort(key=lambda x:x[0], reverse=True)
     items=items[:30]
     label='همه' if folder=='all' else FOLDER_NAMES.get(folder,folder)
@@ -3684,12 +3672,12 @@ async def user_profile(call: CallbackQuery, db: D1Database):
         days=max(0,(datetime.now(timezone.utc)-joined_dt).days)
     except Exception:
         days=0
-    legacy_saves=(await db.execute("SELECT COUNT(*) c FROM saves WHERE user=?",[uid]))[0].get('c',0)
-    article_saves=(await db.execute("SELECT COUNT(*) c FROM article_saves WHERE user_id=?",[uid]))[0].get('c',0)
-    likes_legacy=(await db.execute("SELECT COUNT(*) c FROM votes WHERE user_id=? AND vote_type='like'",[uid]))[0].get('c',0)
-    likes_article=(await db.execute("SELECT COUNT(*) c FROM article_votes WHERE user_id=? AND vote_type='like'",[uid]))[0].get('c',0)
-    dislikes_legacy=(await db.execute("SELECT COUNT(*) c FROM votes WHERE user_id=? AND vote_type='dislike'",[uid]))[0].get('c',0)
-    dislikes_article=(await db.execute("SELECT COUNT(*) c FROM article_votes WHERE user_id=? AND vote_type='dislike'",[uid]))[0].get('c',0)
+    legacy_saves=(await db.execute("SELECT COUNT(*) c FROM user_content_saves WHERE user_id=?",[uid]))[0].get('c',0)
+    article_saves=0
+    likes_legacy=(await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE user_id=? AND vote_type='like'",[uid]))[0].get('c',0)
+    likes_article=0
+    dislikes_legacy=(await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE user_id=? AND vote_type='dislike'",[uid]))[0].get('c',0)
+    dislikes_article=0
     total_saves=legacy_saves+article_saves; total_likes=likes_legacy+likes_article; total_dislikes=dislikes_legacy+dislikes_article
     role_display='مدیر 🌟' if role=='admin' else 'کاربر 🟢'
     name=html.escape(call.from_user.first_name or 'دوست عزیز')
@@ -4291,8 +4279,12 @@ async def quality_weights(call:CallbackQuery,db:D1Database):
     await call.answer()
     items=[("global","🌍 اهمیت جهانی"),("technology","💻 فناوری"),("ai","🤖 هوش مصنوعی"),("cyber","🔐 امنیت سایبری"),("education","📚 آموزش"),("iran","🇮🇷 ایران/فارسی"),("freshness","🆕 تازگی"),("source","✅ اعتبار منبع"),("novelty","♻️ عدم تکرار")]
     text="🎯 <b>وزن معیارها</b>\nعدد بالاتر = اهمیت بیشتر.\n\n"; rows=[]
+    pairs=[]
     for k,label in items:
-        text+=f"{label}: <b>{await get_setting(db,'weight_'+k,'10')}</b>\n"; rows.append([InlineKeyboardButton(text=label,callback_data='weight_'+k)])
+        text+=f"{label}: <b>{await get_setting(db,'weight_'+k,'10')}</b>\n"; pairs.append((k,label))
+    rows=[]
+    for i in range(0,len(pairs),2):
+        rows.append([InlineKeyboardButton(text=label,callback_data='weight_'+k) for k,label in pairs[i:i+2]])
     rows.append([InlineKeyboardButton(text="🔙 کیفیت محتوا",callback_data="auto_quality")])
     await call.message.edit_text(text,parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)); await call.answer()
 
@@ -4507,9 +4499,7 @@ async def health_test_publish(call:CallbackQuery,db:D1Database,bot:Bot):
         ch=ensure_rich_channel_format(out.get('title') or item.get('title') or '',sanitize_telegram_html(out.get('channel_html') or ''),str(out.get('category') or 'tech'))
         ar=ensure_rich_article_format(out.get('title') or item.get('title') or '',sanitize_telegram_html(out.get('article_html') or ''),item.get('url') or '')
         ar=append_resource_links(ar,out.get('resource_links'),item.get('url') or '')
-        source_date=format_source_publication_date(item.get('published_at') or '')
-        if source_date:
-            ar=ar.rstrip()+f"\n\n<i>تاریخ انتشار: {source_date}</i>"
+        ar=remove_article_metadata_blocks(ar)
         await edit_health_progress(call.message,health_progress_block(3,6,'محتوا و Formatting آماده شد','در حال ذخیره مقاله تست و ساخت Deep Link…'))
         now=datetime.now(timezone.utc).isoformat()
         ins=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at,source_published_at) VALUES(NULL,?,?,?,?,?,?,?,'test',?,?) RETURNING id",
@@ -4815,74 +4805,62 @@ async def on_channel_post(message: Message, db: D1Database):
 # ============================================================
 @router.callback_query(F.data.startswith("alike_") | F.data.startswith("adis_"))
 async def process_article_voting(call: CallbackQuery, db: D1Database):
-    parts=call.data.split("_")
-    new_vote="like" if parts[0]=="alike" else "dislike"
-    article_id=int(parts[1]); user_id=call.from_user.id
+    parts=call.data.split("_"); new_vote="like" if parts[0]=="alike" else "dislike"; article_id=int(parts[1]); uid=call.from_user.id
     try:
-        existing=await db.execute("SELECT vote_type FROM article_votes WHERE user_id=? AND article_id=?",[user_id,article_id])
-        old=existing[0].get("vote_type") if existing else None
-        if old==new_vote:
-            await db.execute("DELETE FROM article_votes WHERE user_id=? AND article_id=?",[user_id,article_id])
-            msg="رأی شما برداشته شد"
-        elif old:
-            await db.execute("UPDATE article_votes SET vote_type=? WHERE user_id=? AND article_id=?",[new_vote,user_id,article_id])
-            msg="رأی شما تغییر کرد"
+        existing=await db.execute("SELECT vote_type FROM user_content_votes WHERE user_id=? AND content_type='article' AND content_id=?",[uid,article_id])
+        if existing and existing[0].get('vote_type')==new_vote:
+            await db.execute("DELETE FROM user_content_votes WHERE user_id=? AND content_type='article' AND content_id=?",[uid,article_id]); msg="🔄 رأی حذف شد"
+        elif existing:
+            await db.execute("UPDATE user_content_votes SET vote_type=? WHERE user_id=? AND content_type='article' AND content_id=?",[new_vote,uid,article_id]); msg="🔄 رأی تغییر کرد"
         else:
-            await db.execute("INSERT INTO article_votes(user_id,article_id,vote_type) VALUES(?,?,?)",[user_id,article_id,new_vote])
-            msg="رأی شما ثبت شد"
-        likes=(await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='like'",[article_id]))[0].get("c",0)
-        dislikes=(await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='dislike'",[article_id]))[0].get("c",0)
-        saved=bool(await db.execute("SELECT folder FROM article_saves WHERE user_id=? AND article_id=?",[user_id,article_id]))
-        await call.message.edit_reply_markup(reply_markup=get_article_inline_kb(article_id,likes,dislikes,saved))
-        await call.answer(msg,show_alert=True)
-    except Exception as e:
-        await call.answer("❌ خطا در ثبت رأی",show_alert=True)
+            await db.execute("INSERT INTO user_content_votes(user_id,content_type,content_id,vote_type,created_at) VALUES(?,?,?,?,?)",[uid,'article',article_id,new_vote,datetime.now(timezone.utc).isoformat()]); msg="✅ ثبت شد"
+        likes=(await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='like'",[article_id]))[0].get('c',0)
+        dislikes=(await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='dislike'",[article_id]))[0].get('c',0)
+        saved=bool(await db.execute("SELECT 1 FROM user_content_saves WHERE user_id=? AND content_type='article' AND content_id=?",[uid,article_id]))
+        await call.message.edit_reply_markup(reply_markup=get_article_inline_kb(article_id,likes,dislikes,saved)); await call.answer(msg)
+    except Exception as exc:
+        logger.exception("article vote failed: %s",exc); await call.answer("❌ ثبت واکنش انجام نشد",show_alert=True)
 
 @router.callback_query(F.data.startswith("asave_"))
 async def process_article_save_action(call: CallbackQuery):
-    article_id=int(call.data.split("_")[1])
+    article_id=int(call.data.split("_")[1]); await call.answer(); await call.message.edit_reply_markup(reply_markup=get_save_to_folder_kb("article",article_id,f"article_actions_{article_id}"))
+
+@router.callback_query(F.data.startswith("aunsave_"))
+async def process_article_unsave_action(call: CallbackQuery, db: D1Database):
+    article_id=int(call.data.split("_")[1]); uid=call.from_user.id
     try:
-        await call.message.edit_reply_markup(reply_markup=get_save_to_folder_kb("article",article_id,f"article_actions_{article_id}"))
-    except Exception:
-        await call.message.edit_text("📂 این مطلب را در کدام پوشه ذخیره کنم؟",reply_markup=get_save_to_folder_kb("article",article_id,f"article_actions_{article_id}"))
-    await call.answer()
+        await db.execute("DELETE FROM user_content_saves WHERE user_id=? AND content_type='article' AND content_id=?",[uid,article_id])
+        likes=(await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='like'",[article_id]))[0].get('c',0)
+        dislikes=(await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='dislike'",[article_id]))[0].get('c',0)
+        await call.message.edit_reply_markup(reply_markup=get_article_inline_kb(article_id,likes,dislikes,False)); await call.answer("🗑️ از ذخیره‌ها حذف شد")
+    except Exception as exc:
+        logger.exception("article unsave failed: %s",exc); await call.answer("❌ حذف نشد",show_alert=True)
 
 @router.callback_query(F.data.startswith("usave_"))
 async def process_unified_folder_save(call: CallbackQuery, db: D1Database):
     parts=call.data.split("_")
     if len(parts)!=4: return await call.answer("❌ خطا",show_alert=True)
-    _,ctype,cid_str,folder=parts
-    cid=int(cid_str); user_id=call.from_user.id
+    _,ctype,cid_str,folder=parts; cid=int(cid_str); uid=call.from_user.id
     try:
-        if ctype=="article":
-            await db.execute("INSERT OR IGNORE INTO article_saves(user_id,article_id,folder) VALUES(?,?,?)",[user_id,cid,folder])
-            msg="✅ مطلب در آرشیو ذخیره شد"
-            back_cb=f"article_actions_{cid}"
+        await db.execute("INSERT OR REPLACE INTO user_content_saves(user_id,content_type,content_id,folder,created_at) VALUES(?,?,?,?,?)",[uid,ctype,cid,folder,datetime.now(timezone.utc).isoformat()])
+        if ctype=='article':
+            likes=(await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='like'",[cid]))[0].get('c',0)
+            dislikes=(await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='dislike'",[cid]))[0].get('c',0)
+            await call.message.edit_reply_markup(reply_markup=get_article_inline_kb(cid,likes,dislikes,True))
         else:
-            await db.execute("INSERT OR IGNORE INTO saves(user,post,folder) VALUES(?,?,?)",[user_id,cid,folder])
-            msg="✅ مطلب در آرشیو ذخیره شد"
-            back_cb=f"post_actions_{cid}"
-        await call.answer(msg,show_alert=True)
-        if ctype=="article":
-            rows=await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='like'",[cid]); likes=rows[0].get('c',0) if rows else 0
-            rows=await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='dislike'",[cid]); dislikes=rows[0].get('c',0) if rows else 0
-            kb=get_article_inline_kb(cid,likes,dislikes,True)
-            await call.message.edit_reply_markup(reply_markup=kb)
-        else:
-            rows=await db.execute("SELECT likes,dislikes FROM posts WHERE id=?",[cid])
-            p=rows[0] if rows else {}
+            rows=await db.execute("SELECT likes,dislikes FROM posts WHERE id=?",[cid]); p=rows[0] if rows else {}
             await call.message.edit_reply_markup(reply_markup=get_post_inline_kb(cid,p.get('likes',0),p.get('dislikes',0),True))
-    except Exception:
-        await call.answer("❌ ذخیره‌سازی انجام نشد",show_alert=True)
+        await call.answer(f"✅ در {FOLDER_NAMES.get(folder,folder)} ذخیره شد")
+    except Exception as exc:
+        logger.exception("save failed: %s",exc); await call.answer("❌ ذخیره‌سازی انجام نشد",show_alert=True)
 
 @router.callback_query(F.data.startswith("article_actions_"))
 async def article_actions(call: CallbackQuery, db: D1Database):
-    article_id=int(call.data.split("_")[2]); user_id=call.from_user.id
-    likes=(await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='like'",[article_id]))[0].get('c',0)
-    dislikes=(await db.execute("SELECT COUNT(*) c FROM article_votes WHERE article_id=? AND vote_type='dislike'",[article_id]))[0].get('c',0)
-    saved=bool(await db.execute("SELECT folder FROM article_saves WHERE user_id=? AND article_id=?",[user_id,article_id]))
-    await call.message.edit_reply_markup(reply_markup=get_article_inline_kb(article_id,likes,dislikes,saved))
-    await call.answer()
+    article_id=int(call.data.split("_")[2]); uid=call.from_user.id
+    likes=(await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='like'",[article_id]))[0].get('c',0)
+    dislikes=(await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='dislike'",[article_id]))[0].get('c',0)
+    saved=bool(await db.execute("SELECT 1 FROM user_content_saves WHERE user_id=? AND content_type='article' AND content_id=?",[uid,article_id]))
+    await call.message.edit_reply_markup(reply_markup=get_article_inline_kb(article_id,likes,dislikes,saved)); await call.answer()
 
 @router.callback_query(F.data.startswith("like_") | F.data.startswith("dis_"))
 async def process_post_voting(call: CallbackQuery, db: D1Database):
@@ -4891,13 +4869,13 @@ async def process_post_voting(call: CallbackQuery, db: D1Database):
     post_id = int(parts[1])
     user_id = call.from_user.id
     
-    vote_rows = await db.execute("SELECT vote_type FROM votes WHERE user_id = ? AND post_id = ?", [user_id, post_id])
+    vote_rows = await db.execute("SELECT vote_type FROM user_content_votes WHERE user_id = ? AND content_type='post' AND content_id = ?", [user_id, post_id])
     response_text = ""
     
     try:
         if not vote_rows:
             await db.execute_batch([
-                {"sql": "INSERT INTO votes(user_id, post_id, vote_type) VALUES(?, ?, ?)", "params": [user_id, post_id, new_vote]},
+                {"sql": "INSERT INTO user_content_votes(user_id,content_type,content_id,vote_type,created_at) VALUES(?,?,?,?,?)", "params": [user_id, "post", post_id, new_vote, datetime.now(timezone.utc).isoformat()]},
                 {"sql": f"UPDATE posts SET {new_vote}s = {new_vote}s + 1 WHERE id = ?", "params": [post_id]}
             ])
             response_text = "✅ رأی خفنت ثبت شد! 😎"
@@ -4905,13 +4883,13 @@ async def process_post_voting(call: CallbackQuery, db: D1Database):
             current_vote = vote_rows[0].get("vote_type")
             if current_vote == new_vote:
                 await db.execute_batch([
-                    {"sql": "DELETE FROM votes WHERE user_id = ? AND post_id = ?", "params": [user_id, post_id]},
+                    {"sql": "DELETE FROM user_content_votes WHERE user_id = ? AND content_type='post' AND content_id = ?", "params": [user_id, post_id]},
                     {"sql": f"UPDATE posts SET {new_vote}s = {new_vote}s - 1 WHERE id = ?", "params": [post_id]}
                 ])
                 response_text = "🔄 رأیت رو پس گرفتی! 🔙"
             else:
                 await db.execute_batch([
-                    {"sql": "UPDATE votes SET vote_type = ? WHERE user_id = ? AND post_id = ?", "params": [new_vote, user_id, post_id]},
+                    {"sql": "UPDATE user_content_votes SET vote_type = ? WHERE user_id = ? AND content_type='post' AND content_id = ?", "params": [new_vote, user_id, post_id]},
                     {"sql": f"UPDATE posts SET {new_vote}s = {new_vote}s + 1, {current_vote}s = {current_vote}s - 1 WHERE id = ?", "params": [post_id]}
                 ])
                 response_text = "🔄 رأیت با موفقیت تغییر کرد!"
@@ -4923,7 +4901,7 @@ async def process_post_voting(call: CallbackQuery, db: D1Database):
     p_rows = await db.execute("SELECT likes, dislikes FROM posts WHERE id = ?", [post_id])
     if p_rows:
         p = p_rows[0]
-        s_rows = await db.execute("SELECT folder FROM saves WHERE user = ? AND post = ?", [user_id, post_id])
+        s_rows = await db.execute("SELECT folder FROM user_content_saves WHERE user_id = ? AND content_type='post' AND content_id = ?", [user_id, post_id])
         kb = get_post_inline_kb(post_id, p.get("likes", 0), p.get("dislikes", 0), len(s_rows) > 0)
         try:
             await call.message.edit_reply_markup(reply_markup=kb)
@@ -4944,7 +4922,7 @@ async def process_folder_save(call: CallbackQuery, db: D1Database):
     parts=call.data.split("_")
     post_id=int(parts[1]); folder=parts[2]; user_id=call.from_user.id
     try:
-        await db.execute("INSERT OR IGNORE INTO saves(user,post,folder) VALUES(?,?,?)",[user_id,post_id,folder])
+        await db.execute("INSERT OR REPLACE INTO user_content_saves(user_id,content_type,content_id,folder,created_at) VALUES(?,?,?,?,?)",[user_id,"post",post_id,folder,datetime.now(timezone.utc).isoformat()])
         p_rows=await db.execute("SELECT likes,dislikes FROM posts WHERE id=?",[post_id])
         p=p_rows[0] if p_rows else {}
         await call.answer(f"✅ در {FOLDER_NAMES.get(folder,folder)} ذخیره شد",show_alert=True)
@@ -4958,7 +4936,7 @@ async def process_unsave_action(call: CallbackQuery, db: D1Database):
     user_id = call.from_user.id
     
     try:
-        await db.execute("DELETE FROM saves WHERE user = ? AND post = ?", [user_id, post_id])
+        await db.execute("DELETE FROM user_content_saves WHERE user_id = ? AND content_type='post' AND content_id = ?", [user_id, post_id])
         await call.answer("🗑️ مطلب از ذخیره‌هات پاک شد!", show_alert=True)
         
         p_rows = await db.execute("SELECT likes, dislikes FROM posts WHERE id = ?", [post_id])
@@ -4989,8 +4967,8 @@ async def process_view_saved_folder(call: CallbackQuery, state: FSMContext, db: 
         return
         
     rows = await db.execute(
-        """SELECT posts.id FROM saves JOIN posts ON saves.post = posts.id
-           WHERE saves.user = ? AND saves.folder = ? AND posts.deleted = 0
+        """SELECT posts.id FROM user_content_saves s JOIN posts ON s.content_id = posts.id AND s.content_type='post'
+           WHERE s.user_id = ? AND s.folder = ? AND posts.deleted = 0
            ORDER BY posts.id DESC LIMIT 30""",
         [user_id, folder]
     )
@@ -5145,8 +5123,8 @@ async def process_cancel_deletion(call: CallbackQuery, state: FSMContext, db: D1
     else:
         user_id = call.from_user.id
         rows = await db.execute(
-            """SELECT posts.id FROM saves JOIN posts ON saves.post = posts.id
-               WHERE saves.user = ? AND saves.folder = ? AND posts.deleted = 0
+            """SELECT posts.id FROM user_content_saves s JOIN posts ON s.content_id = posts.id AND s.content_type='post'
+               WHERE s.user_id = ? AND s.folder = ? AND posts.deleted = 0
                ORDER BY posts.id DESC LIMIT 30""",
             [user_id, folder]
         )
@@ -5165,7 +5143,7 @@ async def process_f_del_save(call: CallbackQuery, state: FSMContext, db: D1Datab
     user_id = call.from_user.id
     
     try:
-        await db.execute("DELETE FROM saves WHERE user = ? AND post = ?", [user_id, post_id])
+        await db.execute("DELETE FROM user_content_saves WHERE user_id = ? AND content_type='post' AND content_id = ?", [user_id, post_id])
         await call.answer("🗑️ مطلب با موفقیت حذف شد!", show_alert=True)
         try:
             await call.message.delete()
@@ -5173,8 +5151,8 @@ async def process_f_del_save(call: CallbackQuery, state: FSMContext, db: D1Datab
             pass
             
         rows = await db.execute(
-            """SELECT posts.id FROM saves JOIN posts ON saves.post = posts.id
-               WHERE saves.user = ? AND saves.folder = ? AND posts.deleted = 0
+            """SELECT posts.id FROM user_content_saves s JOIN posts ON s.content_id = posts.id AND s.content_type='post'
+               WHERE s.user_id = ? AND s.folder = ? AND posts.deleted = 0
                ORDER BY posts.id DESC LIMIT 30""",
             [user_id, folder]
         )
@@ -5484,10 +5462,9 @@ async def main():
     dp["db"] = db
     
     await initialize_database(db)
+    await migrate_unified_user_interactions(db)
     await initialize_automation_database(db)
     
-    router.message.outer_middleware(RateLimitMiddleware(ADMIN_ID))
-    router.callback_query.outer_middleware(RateLimitMiddleware(ADMIN_ID))
     dp.include_router(router)
     
     automation_task = asyncio.create_task(automation_loop(db, bot))
