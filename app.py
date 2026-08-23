@@ -314,7 +314,6 @@ async def initialize_automation_database(db: D1Database):
         "news_freshness_max_hours": str(int(NEWS_FRESHNESS_MAX_HOURS) if NEWS_FRESHNESS_MAX_HOURS.is_integer() else NEWS_FRESHNESS_MAX_HOURS),
         "news_priority_hours": str(int(NEWS_PRIORITY_HOURS) if NEWS_PRIORITY_HOURS.is_integer() else NEWS_PRIORITY_HOURS),
         "ai_verify_mode": "auto",
-        "ai_web_scout_enabled": "0",
         "last_cleanup_at": "",
         "last_manual_channel_post_at": "",
         "channel_id": CHANNEL_ID,
@@ -1191,54 +1190,6 @@ class AIProviderManager:
             "diagnostics":diagnostics,
         }
 
-    async def gemini_web_scout(self, site_url:str, max_items:int=5) -> Dict[str,Any]:
-        await self.start()
-        rows=await self.db.execute("SELECT * FROM ai_providers WHERE enabled=1 ORDER BY priority ASC,id ASC")
-        providers=[p for p in rows if "generativelanguage.googleapis.com" in str(p.get("base_url") or "") and p.get("status") not in {"invalid","cooldown"}]
-        if not providers: return {"ok":False,"error":"هیچ Provider بومی Gemini برای Web Scout فعال نیست."}
-        domain=urllib.parse.urlsplit(site_url).netloc
-        scout_schema = {"items":[{"title":"...","url":"https://...","description":"خلاصه factual کوتاه","published_at":"","image_url":"https://..."}]}
-        prompt = (
-            "یک Source Scout کنترل‌شده برای یک کانال فارسی فناوری هستی.\n"
-            f"URL منبع: {site_url}\nدامنه: {domain}\n\n"
-            f"با ابزارهای وب خودت سایت/دامنه را بررسی کن و حداکثر {max_items} مطلب جدید و واقعاً مرتبط پیدا کن. حوزه‌ها: فناوری، هوش مصنوعی، مدل‌ها، ابزارها، امنیت سایبری، آموزش و اخبار مهم جهان. ایران/فارسی‌زبان بودن امتیاز است ولی شرط اجباری نیست. فقط مقاله/خبر مشخص را برگردان، نه صفحه دسته‌بندی یا صفحه اصلی. اگر تاریخ دقیق را نمی‌دانی خالی بگذار؛ حدس نزن.\n\n"
-            f"خروجی فقط JSON معتبر با این ساختار: {json.dumps(scout_schema, ensure_ascii=False)}\n\n"
-            "محتوا را تحلیل یا قضاوت نکن؛ فقط candidateهای واقعی را پیدا و اطلاعات قابل مشاهده را استخراج کن."
-        )
-
-        for p in providers[:4]:
-            key=decrypt_secret(p.get("encrypted_api_key") or ""); model=p.get("model_name") or ""
-            endpoint=self.endpoint(p.get("base_url") or "https://generativelanguage.googleapis.com/v1beta","gemini",model)
-            headers={"x-goog-api-key":key,"Content-Type":"application/json","User-Agent":HTTP_USER_AGENT}
-            payload={"contents":[{"role":"user","parts":[{"text":prompt}]}],"generationConfig":{"temperature":0.1,"maxOutputTokens":1800},"tools":[{"url_context":{}},{"google_search":{}}]}
-            try:
-                async with self._session.post(endpoint,headers=headers,json=payload,timeout=aiohttp.ClientTimeout(total=45)) as resp:
-                    raw=await resp.text()
-                    if resp.status!=200:
-                        if resp.status in {400,404}:
-                            payload["tools"]=[{"url_context":{}}]
-                            async with self._session.post(endpoint,headers=headers,json=payload,timeout=aiohttp.ClientTimeout(total=45)) as r2:
-                                raw2=await r2.text()
-                                if r2.status!=200: raise RuntimeError(f"HTTP {r2.status}: {raw2[:900]}")
-                                data=json.loads(raw2)
-                        else: raise RuntimeError(f"HTTP {resp.status}: {raw[:900]}")
-                    else: data=json.loads(raw)
-                    content=self._extract_content("gemini",data)
-                    if not content: raise RuntimeError(self._empty_response_reason("gemini",data))
-                    obj=parse_json_object(content); items=obj.get("items") if isinstance(obj,dict) else None
-                    if not isinstance(items,list): raise RuntimeError("Scout JSON فاقد items است")
-                    clean=[]
-                    for it in items[:max_items]:
-                        if not isinstance(it,dict): continue
-                        u=normalize_url(str(it.get("url") or "")); t=strip_html_text(str(it.get("title") or ""))[:500]
-                        if not u or not t or not same_domain(u,site_url): continue
-                        clean.append({"title":t,"url":u,"description":strip_html_text(str(it.get("description") or ""))[:2000],"published_at":str(it.get("published_at") or "")[:100],"image_url":normalize_url(str(it.get("image_url") or ""))})
-                    if clean: return {"ok":True,"items":clean,"provider":p.get("name"),"model":model}
-                    raise RuntimeError("Scout پاسخ داد ولی candidate معتبر پیدا نشد")
-            except Exception as e:
-                await log_automation(self.db,"WARN","gemini_web_scout_failed",f"source={site_url} provider={p.get('id')} {str(e)[:1000]}")
-        return {"ok":False,"error":"Gemini Web Scout برای این منبع candidate قابل استفاده برنگرداند."}
-
     async def test_provider(self, provider_id:int):
         rows=await self.db.execute("SELECT * FROM ai_providers WHERE id=?",[provider_id])
         if not rows: return {"ok":False,"error":"Provider یافت نشد"}
@@ -1462,13 +1413,18 @@ def _remove_duplicate_title_from_body(title: str, value: str) -> str:
     if not text or not title_plain: return text
     blocks=[x.strip() for x in re.split(r"\n\s*\n+", text) if strip_html_text(x).strip()]
     if not blocks: return text
-    # Remove a repeated title in the first two blocks, including when wrapped in HTML tags/emojis.
-    for idx in range(min(2,len(blocks))):
-        plain=strip_html_text(blocks[idx]).strip()
-        if SequenceMatcher(None, plain.lower(), title_plain.lower()).ratio() >= 0.72 or title_plain.lower() in plain.lower() and len(plain) <= len(title_plain)*1.8:
-            blocks.pop(idx)
-            break
-    return "\n\n".join(blocks)
+    kept=[]
+    # Remove every duplicated title-like leading block, not only the first one.
+    skipping=True
+    for block in blocks:
+        plain=strip_html_text(block).strip()
+        sim=SequenceMatcher(None, plain.lower(), title_plain.lower()).ratio() if plain else 0
+        looks_like_title=(sim >= 0.72 or (title_plain.lower() in plain.lower() and len(plain) <= max(40,len(title_plain)*1.8)))
+        if skipping and looks_like_title:
+            continue
+        skipping=False
+        kept.append(block)
+    return "\n\n".join(kept)
 
 def _visualize_plain_paragraphs(title: str, value: str, category: str, article: bool=False) -> str:
     value=_remove_duplicate_title_from_body(title, value or "")
@@ -1785,7 +1741,7 @@ URL: {item.get('url')}
 
 اگر accept=true، همزمان محتوای نهایی را تولید کن:
 1) channel_html: حدود 450 تا 650 کاراکتر «خودِ خبر»؛ نه teaser و نه صرفاً معرفی لینک. ساختار بصری داشته باشد: تیتر/شروع با <b>، حداکثر 1 بخش کوتاه با <i> یا <blockquote> فقط وقتی طبیعی است، پاراگراف‌های کوتاه و 1 تا 3 ایموجی دقیق و مرتبط.
-2) article_html: حدود 1600 تا 2600 کاراکتر و در صورت نیاز بیشتر؛ مستقل و غنی‌تر از متن کانال. از تیترهای کوتاه با <b>، پاراگراف‌های کوتاه و در صورت مناسب یک <blockquote> استفاده کن. متن باید برای خواندن در موبایل خوش‌خوان باشد و صرفاً کپی/تکرار channel_html نباشد.
+2) article_html: طول ثابت ندارد؛ بسته به غنای منبع کوتاه یا بلند باشد (تقریباً 400 تا 3000 کاراکتر کافی است). اگر منبع کوتاه است، کوتاه و دقیق بمان؛ برای رسیدن به طول مشخص جزئیات نساز. مستقل و غنی‌تر از متن کانال باشد. از تیترهای کوتاه با <b>، پاراگراف‌های کوتاه و در صورت مناسب یک <blockquote> استفاده کن. متن باید برای خواندن در موبایل خوش‌خوان باشد و صرفاً کپی/تکرار channel_html نباشد.
 3) title: کوتاه، جذاب و غیرکلیک‌بیتی.
 4) category و facts.
 
@@ -1804,7 +1760,7 @@ URL: {item.get('url')}
 - چیزی را که در منبع نیست به عنوان واقعیت نساز.
 - channel_html و article_html را با HTML سازگار با Telegram بده؛ Markdown استفاده نکن.
 - اگر متن یک سایت، ثبت‌نام، دوره، ابزار، مستندات یا صفحه مشخصی را معرفی کرده و URL آن در «لینک‌های داخل صفحه» وجود دارد، آن را در resource_links برگردان. URL را حدس نزن.
-- لینک Deep Link مقاله توسط برنامه اضافه می‌شود.
+- لینک Deep Link مقاله توسط برنامه اضافه می‌شود؛ در متن کانال هیچ عبارت «ادامه مطلب را از لینک زیر بخوانید» یا مشابه آن ننویس.
 
 فقط JSON معتبر:
 {json.dumps(editorial_schema, ensure_ascii=False)}"""
@@ -2029,17 +1985,30 @@ async def get_runtime_bot_username(bot: Bot) -> str:
         BOT_USERNAME_RUNTIME=BOT_USERNAME.lstrip("@")
     return BOT_USERNAME_RUNTIME
 
+def _trim_rich_blocks_to_limit(value: str, max_plain_chars: int = 760) -> str:
+    clean=sanitize_telegram_html(clean_channel_copy(value or ''))
+    if plain_len(clean) <= max_plain_chars:
+        return clean
+    blocks=[b.strip() for b in re.split(r"\n\s*\n+", clean) if strip_html_text(b).strip()]
+    while len(blocks) > 1 and plain_len("\n\n".join(blocks)) > max_plain_chars:
+        blocks.pop()
+    trimmed="\n\n".join(blocks)
+    if plain_len(trimmed) > max_plain_chars:
+        plain=strip_html_text(trimmed)[:max_plain_chars].rsplit(' ',1)[0]+"…"
+        return html.escape(plain,quote=False)
+    return trimmed
+
 def publication_caption(title: str, channel_html: str, deep_link: str) -> str:
-    clean=sanitize_telegram_html(channel_html or '')
-    # Reserve space for the deep-link anchor so it can never be truncated out of a photo caption.
-    if plain_len(clean) > 760:
-        clean=rich_channel_fallback(title, clean)
+    clean=_trim_rich_blocks_to_limit(channel_html, 760)
     link=f'<a href="{html.escape(deep_link,quote=True)}">📖 بیشتر بخوانید</a>'
     caption=(clean.strip()+"\n\n"+link).strip()
     if len(caption) <= 1024:
         return caption
-    clean=rich_channel_fallback(title, clean)
-    return (clean[:700]+"\n\n"+link)[:1024]
+    # Preserve rich formatting as far as possible; only fall back to plain text as a last resort.
+    plain=strip_html_text(clean)
+    budget=max(120, 1024-len(strip_html_text(link))-8)
+    plain=plain[:budget].rsplit(' ',1)[0]+"…"
+    return html.escape(plain,quote=False)+"\n\n"+link
 
 async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> bool:
     if force:
@@ -2718,12 +2687,13 @@ async def deliver_article_by_token(message: Message, bot: Bot, db: D1Database, t
     except Exception: pass
 
     title=html.escape(str(article.get('title') or 'مطلب'))
-    body=remove_article_metadata_blocks(dedupe_adjacent_emojis(sanitize_telegram_html(article.get('body') or '')))
+    body=_remove_duplicate_title_from_body(article.get('title') or '', remove_article_metadata_blocks(dedupe_adjacent_emojis(sanitize_telegram_html(article.get('body') or ''))))
     source_url=normalize_url(article.get('source_url') or '')
     if source_url and 'منبع اصلی' not in strip_html_text(body):
         body=f"{body.rstrip()}\n\n<a href=\"{html.escape(source_url,quote=True)}\">منبع اصلی</a>"
-    relative=relative_time_label(article.get('source_published_at') or article.get('published_at') or article.get('created_at') or '')
-    body=body.rstrip()+f"\n\n<i>⏱ {relative}</i>"
+    relative=relative_time_label(article.get('source_published_at') or article.get('published_at') or '')
+    if relative != 'زمان نامشخص':
+        body=body.rstrip()+f"\n\n<i>⏱ {relative}</i>"
     full=f"<b>📖 {title}</b>\n\n{body}"
 
     like_rows=await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='like'",[article_id])
@@ -3793,11 +3763,25 @@ async def source_test(call: CallbackQuery, db: D1Database):
     await call.answer("در حال بررسی...", show_alert=True)
     # برای تست دستی، از یک provider واقعی استفاده می‌کنیم ولی در DB فقط state منبع ثبت می‌شود.
     try:
-        diag=await discover_source_items(rows[0],return_diagnostics=True)
-        if diag.get("items"):
-            text=f"✅ <b>تست منبع موفق بود.</b>\n\nروش: <code>{html.escape(str(diag.get('method')))}</code>\nآیتم قابل بررسی: {len(diag.get('items',[]))}"
+        diag=await discover_source_items(rows[0],return_diagnostics=True,use_sitemap=False)
+        raw_items=list(diag.get("items") or [])
+        now=datetime.now(timezone.utc)
+        fresh_items, fresh_diag, _, _ = select_latest_fresh_items(raw_items, now=now)
+        titles=[strip_html_text(str(x.get("title") or ""))[:90] for x in fresh_items[:3] if x.get("title")]
+        method=str(diag.get('method') or 'none')
+        if raw_items:
+            marker='🟢' if fresh_items else '🟡'
+            text=(f"{marker} <b>تست واقعی منبع</b>\n\n"
+                  f"روش: <code>{html.escape(method)}</code>\n"
+                  f"پیدا شد: <b>{len(raw_items)}</b>\n"
+                  f"تازه در ۲۴ ساعت: <b>{len(fresh_items)}</b>")
+            if titles:
+                text += "\n\n📰 <b>نمونه:</b>\n" + "\n".join(f"• {html.escape(t)}" for t in titles)
+            if fresh_diag:
+                text += "\n\nℹ️ " + html.escape(fresh_diag[-1][:500])
         else:
-            text="❌ <b>منبع فعلاً قابل دریافت نیست.</b>\n\n"+html.escape(str(diag.get('error','بدون نتیجه'))[:1800])
+            details='؛ '.join((diag.get('diagnostics') or [])[-4:]) or diag.get('error') or 'بدون نتیجه'
+            text="🔴 <b>تست واقعی منبع</b>\n\n"+html.escape(str(details)[:1800])
         await call.message.edit_text(text,parse_mode='HTML',reply_markup=get_admin_back_kb(f"source_view_{source_id}"))
     except Exception as e:
         await db.execute("UPDATE sources SET last_error=? WHERE id=?", [str(e)[:1000], source_id])
@@ -4314,7 +4298,7 @@ async def health_test_ai(call:CallbackQuery,db:D1Database):
 
 @router.callback_query(F.data == "health_test_source")
 async def health_test_source(call:CallbackQuery,db:D1Database,bot:Bot):
-    rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC LIMIT ?", [MAX_AUTOMATION_SOURCES])
+    rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC")
     if not rows:
         await call.message.edit_text("❌ هیچ منبع فعالی نیست.",reply_markup=get_admin_back_kb("auto_health")); return
     await call.answer("تست همه منابع شروع شد…")
@@ -4355,7 +4339,7 @@ async def choose_test_candidate(db, ai, progress=None):
     Manual tests bypass the source cursor/retry cooldown so a rejected recent article can be retested
     after the manager changes criteria. Freshness allows the last 24 hours; the first 6 hours are prioritized.
     """
-    rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC LIMIT 20")
+    rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC")
     recent_tested_hashes={str(r.get('content_hash') or '') for r in await db.execute("SELECT content_hash FROM test_history ORDER BY id DESC LIMIT 200") if r.get('content_hash')}
     recent_article_rows=await db.execute("SELECT source_url,body,title FROM articles WHERE status IN ('published','ready','test') ORDER BY id DESC LIMIT 300")
     recent_article_urls={normalize_url(r.get('source_url') or '') for r in recent_article_rows if r.get('source_url')}
@@ -4457,7 +4441,7 @@ async def health_run_cycle(call:CallbackQuery,db:D1Database,bot:Bot):
     await call.answer('چرخه واقعی شروع شد؛ این بار واقعاً منابع و AI را اجرا می‌کنم…')
     await log_automation(db,"INFO","real_cycle_started","manual real pipeline test")
     await edit_health_progress(call.message,health_progress_block(0,5,'▶️ اجرای یک چرخه واقعی','این همان Pipeline اتوماتیک است؛ داده ساختگی استفاده نمی‌شود.'))
-    ai=AIProviderManager(db,bot); rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC LIMIT ?", [MAX_AUTOMATION_SOURCES])
+    ai=AIProviderManager(db,bot); rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC")
     results=[]
     try:
         sem=asyncio.Semaphore(max(1,min(4,int(await get_setting(db,'max_workers','2')))))
