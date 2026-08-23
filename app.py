@@ -49,7 +49,7 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "10.21.0-canonical-content-pipeline-db-reset-safe-final"
+BUILD_VERSION = "10.22.0-manager-soft-gate-fresh-failover-unified-format"
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_AI_WORKERS = 3
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -71,7 +71,8 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "")
 AUTOMATION_ENABLED_DEFAULT = os.getenv("AUTOMATION_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 DEFAULT_SOURCE_INTERVAL_MINUTES = int(os.getenv("DEFAULT_SOURCE_INTERVAL_MINUTES", "15"))
 DEFAULT_MAX_DAILY_POSTS = int(os.getenv("MAX_DAILY_POSTS", "6"))
-DEFAULT_MIN_CONTENT_SCORE = float(os.getenv("MIN_CONTENT_SCORE", "75"))
+DEFAULT_MIN_CONTENT_SCORE = float(os.getenv("MIN_CONTENT_SCORE", "65"))
+MANAGER_SCORE_TOLERANCE = float(os.getenv("MANAGER_SCORE_TOLERANCE", "8"))
 DEFAULT_MIN_HOURS_BETWEEN_POSTS = float(os.getenv("MIN_HOURS_BETWEEN_POSTS", "2"))
 DEFAULT_MIN_POST_GAP_MINUTES = max(1, int(round(DEFAULT_MIN_HOURS_BETWEEN_POSTS * 60)))
 DEFAULT_PUBLISH_START_HOUR = int(os.getenv("PUBLISH_START_HOUR", "8"))
@@ -733,14 +734,48 @@ def select_latest_fresh_items(items: List[Dict[str, Any]], now: Optional[datetim
     return fresh[:max_items], diagnostics[-10:], newest_dt, newest_url
 
 async def discover_source_items(source: Dict[str, Any], return_diagnostics: bool = False, use_sitemap: bool = True) -> Any:
+    """Discover real articles through several direct methods before giving up.
+
+    Important: a successful feed response is NOT treated as a successful discovery
+    if it only contains old items. All direct methods get a chance to contribute,
+    then the freshness layer chooses the newest 24h items (0-6h first).
+    """
     base = normalize_url(source.get("url", ""))
     session = await get_http_session()
     diagnostics = []
+    collected = []
     seen_urls = set()
 
-    def done(items, method):
-        result = {"items": items[:MAX_SOURCE_ITEMS_PER_CYCLE], "method": method, "diagnostics": diagnostics}
-        return result if return_diagnostics else result["items"]
+    def add_items(items, method):
+        added = 0
+        for item in items or []:
+            u = normalize_url(item.get("url") or item.get("canonical_url") or "")
+            if not u or u in seen_urls:
+                continue
+            seen_urls.add(u)
+            item = dict(item)
+            item["url"] = u
+            collected.append(item)
+            added += 1
+        if added:
+            diagnostics.append(f"✅ {method}: {added} مورد دریافت شد")
+        return added
+
+    def has_fresh_collected(max_hours: float = NEWS_FRESHNESS_MAX_HOURS) -> bool:
+        now=datetime.now(timezone.utc)
+        for item in collected:
+            dt=parse_publication_datetime(item.get("published_at") or "")
+            if dt:
+                age=(now-dt).total_seconds()/3600.0
+                if -0.5 <= age <= max_hours:
+                    return True
+        return False
+
+    def result(method="direct"):
+        # Keep enough raw items so freshness sorting can choose the best 5 later.
+        items = collected[:max(20, MAX_SOURCE_ITEMS_PER_CYCLE * 4)]
+        out = {"items": items, "method": method if items else "none", "diagnostics": diagnostics}
+        return out if return_diagnostics else out["items"]
 
     if not base:
         raise RuntimeError("آدرس منبع خالی یا نامعتبر است")
@@ -749,125 +784,137 @@ async def discover_source_items(source: Dict[str, Any], return_diagnostics: bool
     if configured:
         try:
             feed_text, _ = await http_get(configured, session)
-            items = parse_feed(feed_text, base)
-            if items:
-                diagnostics.append("✅ feed سفارشی")
-                return done(items, "configured_feed")
-            diagnostics.append("⚠️ feed سفارشی آیتمی نداشت")
+            add_items(parse_feed(feed_text, base), "feed سفارشی")
+            if has_fresh_collected():
+                return result("configured_feed")
         except Exception as e:
             diagnostics.append(f"⚠️ feed سفارشی: {e}")
 
-    # Homepage: use alternate feeds if advertised, otherwise extract links.
+    # Always inspect the homepage and every advertised RSS/Atom feed. We do not
+    # return early here: an advertised feed may be cached/stale while the homepage
+    # or another feed already contains a newer article.
     try:
         homepage_html, _ = await http_get(base, session)
         parsed = extract_html_page(homepage_html, base)
         alternate_feeds = []
         for m in re.finditer(r'<link\b[^>]*>', homepage_html, flags=re.I):
-            tag=m.group(0)
-            href=re.search(r'href=["\']([^"\']+)',tag,flags=re.I)
-            typ=re.search(r'type=["\']([^"\']+)',tag,flags=re.I)
-            rel=re.search(r'rel=["\']([^"\']+)',tag,flags=re.I)
-            if href and ((typ and any(x in typ.group(1).lower() for x in ("rss","atom"))) or (rel and "alternate" in rel.group(1).lower())):
-                alternate_feeds.append(urllib.parse.urljoin(base,href.group(1)))
+            tag = m.group(0)
+            href = re.search(r'href=["\']([^"\']+)', tag, flags=re.I)
+            typ = re.search(r'type=["\']([^"\']+)', tag, flags=re.I)
+            rel = re.search(r'rel=["\']([^"\']+)', tag, flags=re.I)
+            if href and ((typ and any(x in typ.group(1).lower() for x in ("rss", "atom"))) or (rel and "alternate" in rel.group(1).lower())):
+                alternate_feeds.append(urllib.parse.urljoin(base, href.group(1)))
         for feed_url in list(dict.fromkeys(alternate_feeds))[:4]:
             try:
-                feed_text,_=await http_get(feed_url,session); items=parse_feed(feed_text,feed_url)
-                if items:
-                    diagnostics.append(f"✅ alternate feed: {feed_url}")
-                    return done(items,"alternate_feed")
+                feed_text, _ = await http_get(feed_url, session)
+                add_items(parse_feed(feed_text, feed_url), "alternate feed")
             except Exception as e:
-                diagnostics.append(f"⚠️ alternate feed {feed_url}: {e}")
-        html_candidates=article_candidates_from_html(parsed,base)
-        if html_candidates:
-            diagnostics.append(f"✅ HTML homepage ({len(html_candidates)} candidate)")
-            return done(html_candidates,"homepage_html")
-        diagnostics.append("⚠️ صفحه اصلی باز شد ولی لینک مقاله قابل استفاده پیدا نشد")
+                diagnostics.append(f"⚠️ alternate feed: {e}")
+        add_items(article_candidates_from_html(parsed, base), "صفحه اصلی")
+        if has_fresh_collected():
+            return result("homepage_or_alternate_feed")
     except Exception as e:
         diagnostics.append(f"⚠️ صفحه اصلی: {e}")
 
-    for feed_path in ["/feed","/rss","/rss.xml","/feed.xml","/atom.xml","/index.xml"]:
-        candidate=urllib.parse.urljoin(base+"/",feed_path.lstrip("/"))
+    # Common feeds are cheap fallbacks and must be checked even when another
+    # method already returned something, because that something may be stale.
+    for feed_path in ["/feed", "/rss", "/rss.xml", "/feed.xml", "/atom.xml", "/index.xml"]:
+        candidate = urllib.parse.urljoin(base + "/", feed_path.lstrip("/"))
         try:
-            text,_=await http_get(candidate,session); items=parse_feed(text,candidate)
-            if items:
-                diagnostics.append(f"✅ common feed: {feed_path}")
-                return done(items,"common_feed")
-        except Exception as e:
-            diagnostics.append(f"⚠️ {feed_path}: {e}")
+            text, _ = await http_get(candidate, session)
+            add_items(parse_feed(text, candidate), f"feed {feed_path}")
+            if has_fresh_collected():
+                return result(f"common_feed:{feed_path}")
+        except Exception:
+            # A 404 here is normal; keep the user-facing diagnostics short.
+            pass
 
-    wp_url=urllib.parse.urljoin(base+"/","wp-json/wp/v2/posts?per_page=8&_fields=link,title,excerpt,date,jetpack_featured_media_url")
+    wp_url = urllib.parse.urljoin(base + "/", "wp-json/wp/v2/posts?per_page=8&_fields=link,title,excerpt,date,jetpack_featured_media_url")
     try:
-        text,_=await http_get(wp_url,session); data=json.loads(text)
-        if isinstance(data,list) and data:
-            items=[]
+        text, _ = await http_get(wp_url, session)
+        data = json.loads(text)
+        if isinstance(data, list) and data:
+            items = []
             for post in data:
-                title=strip_html_text(((post.get("title") or {}).get("rendered") or ""))
-                url=post.get("link") or ""
+                title = strip_html_text(((post.get("title") or {}).get("rendered") or ""))
+                url = post.get("link") or ""
                 if title and url:
-                    items.append({"title":title,"url":url,"description":strip_html_text(((post.get("excerpt") or {}).get("rendered") or "")),"published_at":post.get("date") or "","image_url":post.get("jetpack_featured_media_url") or ""})
-            if items:
-                diagnostics.append("✅ WordPress REST API")
-                return done(items,"wordpress_api")
-    except Exception as e:
-        diagnostics.append(f"⚠️ WordPress API: {e}")
+                    items.append({
+                        "title": title,
+                        "url": url,
+                        "description": strip_html_text(((post.get("excerpt") or {}).get("rendered") or "")),
+                        "published_at": post.get("date") or "",
+                        "image_url": post.get("jetpack_featured_media_url") or ""
+                    })
+            add_items(items, "WordPress API")
+            if has_fresh_collected():
+                return result("wordpress_api")
+    except Exception:
+        pass
 
-    if not use_sitemap:
-        message="؛ ".join(diagnostics[-10:]) or "هیچ روش مستقیم سریع برای دریافت محتوا موفق نشد"
-        if return_diagnostics:
-            return {"items":[],"method":"none","diagnostics":diagnostics,"error":message}
-        raise RuntimeError("source fetch failed: "+message)
-
-    sitemap=urllib.parse.urljoin(base+"/","sitemap.xml")
-    try:
-        sm_text,_=await http_get(sitemap,session)
+    if use_sitemap:
+        sitemap = urllib.parse.urljoin(base + "/", "sitemap.xml")
         try:
-            root=ET.fromstring(sm_text)
-            locs=[normalize_url(loc.text.strip()) for loc in root.iter() if local_name(loc.tag)=="loc" and loc.text]
-            is_index=(local_name(root.tag)=="sitemapindex" or any(local_name(e.tag)=="sitemap" for e in root))
-        except Exception as xml_error:
-            locs=extract_xml_locs_resilient(sm_text)
-            is_index=bool(re.search(r"<sitemap(?:index)?\b",sm_text,re.I))
-            diagnostics.append(f"⚠️ XML ناقص بود؛ استخراج مقاوم loc انجام شد: {xml_error}")
-        if is_index:
-            child_urls=locs[:6]; expanded=[]
-            for child in child_urls:
-                try:
-                    ctext,_=await http_get(child,session)
-                    try:
-                        cr=ET.fromstring(ctext)
-                        expanded.extend(normalize_url(loc.text.strip()) for loc in cr.iter() if local_name(loc.tag)=="loc" and loc.text)
-                    except Exception as child_error:
-                        fallback_locs=extract_xml_locs_resilient(ctext)
-                        expanded.extend(fallback_locs)
-                        diagnostics.append(f"⚠️ child sitemap {child}: XML ناقص؛ fallback فعال شد ({child_error})")
-                except Exception as e:
-                    diagnostics.append(f"⚠️ child sitemap {child}: {e}")
-            locs=expanded or locs
-        candidate_urls=[]
-        for u in locs:
-            if u and same_domain(u,base) and u not in seen_urls:
-                seen_urls.add(u); candidate_urls.append(u)
-            if len(candidate_urls)>=MAX_SOURCE_ITEMS_PER_CYCLE: break
-        async def read_one(u):
+            sm_text, _ = await http_get(sitemap, session)
             try:
-                text,_=await http_get(u,session); parsed=extract_html_page(text,u)
-                if parsed.get("title"):
-                    return {"title":parsed["title"],"url":parsed["canonical_url"] or u,"description":parsed["description"],"body":parsed["body"][:12000],"image_url":parsed["image_url"],"published_at":parsed.get("published_at", "")}
-            except Exception as e:
-                diagnostics.append(f"⚠️ sitemap URL {u}: {e}")
-            return None
-        results=[x for x in await asyncio.gather(*(read_one(u) for u in candidate_urls)) if x]
-        if results:
-            diagnostics.append(f"✅ sitemap ({len(results)} article)")
-            return done(results,"sitemap")
-        diagnostics.append("⚠️ sitemap باز شد ولی مقاله قابل استفاده پیدا نشد")
-    except Exception as e:
-        diagnostics.append(f"⚠️ sitemap: {e}")
+                root = ET.fromstring(sm_text)
+                locs = [normalize_url(loc.text.strip()) for loc in root.iter() if local_name(loc.tag) == "loc" and loc.text]
+                is_index = local_name(root.tag) == "sitemapindex" or any(local_name(e.tag) == "sitemap" for e in root)
+            except Exception as xml_error:
+                locs = extract_xml_locs_resilient(sm_text)
+                is_index = bool(re.search(r"<sitemap(?:index)?\b", sm_text, re.I))
+                diagnostics.append(f"⚠️ XML ناقص بود؛ fallback فعال شد: {xml_error}")
+            if is_index:
+                child_urls = locs[:6]
+                expanded = []
+                for child in child_urls:
+                    try:
+                        ctext, _ = await http_get(child, session)
+                        try:
+                            cr = ET.fromstring(ctext)
+                            expanded.extend(normalize_url(loc.text.strip()) for loc in cr.iter() if local_name(loc.tag) == "loc" and loc.text)
+                        except Exception:
+                            expanded.extend(extract_xml_locs_resilient(ctext))
+                    except Exception as e:
+                        diagnostics.append(f"⚠️ child sitemap: {e}")
+                locs = expanded or locs
+            # Read more than five sitemap URLs, then let the freshness sorter choose.
+            candidate_urls = [u for u in locs if u and same_domain(u, base) and u not in seen_urls][:12]
 
-    message="؛ ".join(diagnostics[-10:]) or "هیچ روش دریافت محتوا موفق نشد"
-    if return_diagnostics:
-        return {"items":[],"method":"none","diagnostics":diagnostics,"error":message}
-    raise RuntimeError("source fetch failed: "+message)
+            async def read_one(u):
+                try:
+                    text, _ = await http_get(u, session)
+                    parsed = extract_html_page(text, u)
+                    if parsed.get("title"):
+                        return {
+                            "title": parsed["title"],
+                            "url": parsed["canonical_url"] or u,
+                            "description": parsed["description"],
+                            "body": parsed["body"][:12000],
+                            "image_url": parsed["image_url"],
+                            "published_at": parsed.get("published_at", "")
+                        }
+                except Exception:
+                    return None
+                return None
+
+            sitemap_results = [x for x in await asyncio.gather(*(read_one(u) for u in candidate_urls)) if x]
+            add_items(sitemap_results, "sitemap")
+        except Exception:
+            pass
+
+    if not collected:
+        diagnostics.append("🔴 هیچ محتوای مستقیمی از منبع دریافت نشد")
+        if return_diagnostics:
+            return {"items": [], "method": "none", "diagnostics": diagnostics, "error": "؛ ".join(diagnostics[-8:])}
+        raise RuntimeError("source fetch failed: " + ("؛ ".join(diagnostics[-8:]) or "هیچ روش دریافت محتوا موفق نشد"))
+
+    methods = []
+    for d in diagnostics:
+        if d.startswith("✅"):
+            methods.append(d.split(":", 1)[0].replace("✅ ", ""))
+    method = "+".join(dict.fromkeys(methods)) or "direct"
+    return result(method)
 
 async def enrich_candidate_content(item: Dict[str, Any]) -> Dict[str, Any]:
     if item.get("body") and len(item["body"]) >= 700:
@@ -1426,42 +1473,54 @@ def _remove_duplicate_title_from_body(title: str, value: str) -> str:
         kept.append(block)
     return "\n\n".join(kept)
 
+def _mandatory_quote_block(paragraphs: List[str], start_index: int = 1) -> Tuple[str, int]:
+    """Return one short Telegram-safe quote and the paragraph it replaces."""
+    if not paragraphs:
+        return "", -1
+    order=list(range(start_index,len(paragraphs)))+list(range(0,start_index))
+    for idx in order:
+        plain=strip_html_text(paragraphs[idx]).strip()
+        if len(plain) < 20:
+            continue
+        sentences=[x.strip() for x in re.split(r"(?<=[.!?؟])\s+", plain) if x.strip()]
+        excerpt=next((x for x in sentences if 20 <= len(x) <= 220), "")
+        if not excerpt:
+            excerpt=plain[:180].rsplit(" ",1)[0]+("…" if len(plain)>180 else "")
+        return f"<blockquote>🔎 {html.escape(excerpt, quote=False)}</blockquote>", idx
+    return "", -1
+
+
 def _visualize_plain_paragraphs(title: str, value: str, category: str, article: bool=False) -> str:
     value=_remove_duplicate_title_from_body(title, value or "")
-    # The renderer controls Quote placement; remove model-provided wrappers so one long paragraph
-    # cannot accidentally turn the whole article into a quote.
     value=re.sub(r"</?blockquote[^>]*>", "", value, flags=re.I)
     clean=sanitize_telegram_html(_normalize_text_blocks(value))
     plain=strip_html_text(clean)
     if not plain: return ""
-    emoji_map={"ai":["🤖","🧠","⚡","🔬","🧩","🚀"],"cyber":["🛡️","🔐","🚨","🧩","⚠️","🔎"],"tech":["💻","⚙️","🚀","🔎","🧪","📱"],"edu":["📚","💡","🧭","📝","🎓","🔍"],"general":["🌐","✨","📌","🔭","🧭","💡"]}
+    emoji_map={"ai":["🤖","🧠","🔬","⚡","🧩"],"cyber":["🛡️","🔐","🚨","⚠️","🔎"],"tech":["💻","⚙️","🚀","🔎","🧪"],"edu":["📚","💡","🧭","📝","🎓"],"general":["🌐","✨","📌","🔭","🧭"]}
     icons=emoji_map.get(category,emoji_map["tech"])
     paragraphs=_split_readable_paragraphs(clean, max_chars=430 if not article else 560) or [clean]
     out=[f"<b>{icons[0]} {html.escape(strip_html_text(title)[:220])}</b>"]
+    quote, quote_index = _mandatory_quote_block(paragraphs, start_index=1)
     last_icon=None
     for i,para in enumerate(paragraphs[:12]):
         pplain=strip_html_text(para).strip()
         title_similarity=SequenceMatcher(None,pplain.lower(),strip_html_text(title).lower()).ratio()
-        if not pplain or title_similarity>0.82:
+        if not pplain or title_similarity>0.82: continue
+        if i==quote_index:
+            out.append(quote)
             continue
         icon=icons[i%len(icons)]
         if icon==last_icon: icon=icons[(i+1)%len(icons)]
         last_icon=icon
-        has_rich=any(tag in para.lower() for tag in ("<b>","<strong>","<i>","<em>","<u>","<s>","<a ","<blockquote>","<pre>","<code>"))
+        has_rich=any(tag in para.lower() for tag in ("<b>","<strong>","<i>","<em>","<u>","<s>","<a ","<pre>","<code>"))
         if has_rich:
             formatted=_protect_bidi_latin(para.strip())
         else:
             formatted=_format_technical_tokens(_protect_bidi_latin(html.escape(pplain,quote=False)))
         if i==1:
             formatted=f"{icon} <b>{formatted}</b>"
-        elif i==2 and 60 <= len(pplain) <= 240:
-            formatted=f"<blockquote>{icon} {formatted}</blockquote>"
-        elif article and i in (4,8) and 70 <= len(pplain) <= 220:
-            formatted=f"<blockquote>{icon} {formatted}</blockquote>"
         elif i==3 and len(pplain)<=140:
             formatted=f"{icon} <i>{formatted}</i>"
-        elif i==0:
-            formatted=f"{icon} {formatted}"
         else:
             formatted=f"{icon} {formatted}"
         out.append(formatted)
@@ -1624,7 +1683,7 @@ def extract_xml_locs_resilient(text: str) -> List[str]:
     return [u for u in dict.fromkeys(found) if u]
 
 
-async def discover_for_processing(db: D1Database, source: Dict[str,Any], ai: AIProviderManager, allow_scout=False, include_old=False) -> Dict[str,Any]:
+async def discover_for_processing(db: D1Database, source: Dict[str,Any], ai: AIProviderManager, allow_scout=False, include_old=False, advance_cursor=True) -> Dict[str,Any]:
     """Single direct-discovery path used by tests and automation.
 
     Design goals:
@@ -1634,7 +1693,7 @@ async def discover_for_processing(db: D1Database, source: Dict[str,Any], ai: AIP
     - when a source has never been seen before, current fresh items are eligible;
     - after a content-table wipe, the source cursor in `sources` remains the durable boundary.
     """
-    direct = await discover_source_items(source, return_diagnostics=True, use_sitemap=False)
+    direct = await discover_source_items(source, return_diagnostics=True, use_sitemap=True)
     raw_items=list(direct.get('items') or [])
     diagnostics=list(direct.get('diagnostics') or [])
     now=datetime.now(timezone.utc)
@@ -1702,7 +1761,7 @@ async def discover_for_processing(db: D1Database, source: Dict[str,Any], ai: AIP
 
     # Advance the durable cursor to the newest item actually discovered, even if it was not queued.
     # This prevents a later DB cleanup from resurrecting the same historical feed window.
-    if newest_dt and newest_url and not include_old:
+    if newest_dt and newest_url and not include_old and advance_cursor:
         try:
             await db.execute('UPDATE sources SET last_seen_published_at=?, last_seen_url=? WHERE id=?',[newest_dt.isoformat(),newest_url,source_id])
         except Exception:
@@ -1739,6 +1798,21 @@ def format_source_publication_date(raw: str) -> str:
         if m:
             return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
         return ""
+
+def manager_accepts_score(score: float, min_score: float) -> bool:
+    """Manager-first gate with a small tolerance, never a hidden quality veto.
+    0/1 remains the intentional "accept all fresh, non-duplicate" mode.
+    For normal thresholds we allow a small 8-point margin so one borderline
+    score does not unnecessarily starve the queue.
+    """
+    try:
+        score=float(score or 0); minimum=float(min_score or 0)
+    except Exception:
+        return False
+    if minimum <= 1:
+        return True
+    return score >= max(0.0, minimum - MANAGER_SCORE_TOLERANCE)
+
 
 async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:Dict[str,Any],recent_titles:List[str],weights:Dict[str,float],manager_prompts:Optional[Dict[str,str]]=None):
     body=(item.get("body") or item.get("description") or "")[:14000]
@@ -1790,10 +1864,10 @@ URL: {item.get('url')}
 
 قواعد نگارش:
 - فارسی روان، دوستانه، عامیانه و خوش‌خوان؛ رسمی و خشک نباش.
-- اگر اصطلاح فنی لازم است، معادل فارسی + اصطلاح انگلیسی را بیاور و بخش انگلیسی را با فاصله‌گذاری درست از متن فارسی جدا کن تا RTL/LTR به‌هم نریزد.
+- اگر اصطلاح فنی لازم است، معادل فارسی را اول بیاور و اصطلاح انگلیسی را فقط داخل پرانتز یا <code>...</code> قرار بده. پاراگراف کامل انگلیسی ممنوع است؛ فقط نام مدل‌ها، شرکت‌ها، محصولات و اصطلاح‌های فنی شناخته‌شده می‌توانند انگلیسی بمانند.
 - در هر پاراگراف اصلی حداکثر یک ایموجی مرتبط داشته باش؛ دو یا چند ایموجی کنار هم نگذار و ایموجی تکراری پشت‌سرهم هم استفاده نکن.
 - نسخه کانال باید فاصله‌گذاری طبیعی موبایلی داشته باشد، چند پاراگراف کوتاه داشته باشد و در صورت مناسب یک بخش Quote کوتاه داشته باشد.
-- نسخه کامل باید تیترهای کوتاه Bold و در بخش‌های مهم 2 تا 3 Quote کوتاه داشته باشد؛ Quoteها را فقط از جمله‌های موجود در منبع انتخاب کن و جمله جدید به‌عنوان نقل‌قول نساز.
+- نسخه کانال و نسخه کامل باید حتماً حداقل یک Quote کوتاه و واقعی داشته باشند؛ اگر منبع جمله مستقیمی برای نقل‌قول ندارد، یک جمله عیناً از متن منبع را به‌صورت Quote بیاور، نه اینکه نقل‌قول ساختگی بسازی. نسخه کامل در صورت داشتن متن کافی می‌تواند 2 Quote کوتاه داشته باشد. Quote هرگز نباید کل مقاله یا یک پاراگراف بسیار بزرگ باشد.
 - متن را با تیترهای کوتاه Bold، Italic فقط برای کلمه/عبارت کوتاه، Underline در موارد محدود، Code و Quote در جاهای طبیعی خوش‌خوان کن؛ روی یک جمله طولانی Italic نزن و از فرمت‌ها افراطی استفاده نکن.
 - اگر کد، دستور، نام API یا عبارت فنی دقیق وجود دارد از <code>...</code> استفاده کن؛ اگر متن شامل قطعه‌کد واقعی است از <pre>...</pre> استفاده کن.
 - هیچ‌وقت کاراکترهای متنی "\\n" را برای فاصله‌گذاری خروجی نده؛ برای خط جدید از newline واقعی استفاده کن.
@@ -1870,6 +1944,8 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
         items=discovery.get('items') or []
         stats.update({'found':discovery.get('direct_count',0),'seen':discovery.get('seen_count',0),'candidates':len(items),'method':discovery.get('method') or ''})
         stats['diagnostics']=discovery.get('diagnostics')[-10:]
+        if progress:
+            await progress('discovered',f"🌐 {source.get('name')}: پیدا {stats['found']} · تازه/جدید {stats['candidates']} · مسیر {stats['method'] or 'مستقیم'}")
         if not items:
             next_check=(now+timedelta(minutes=int(source.get('interval_minutes') or DEFAULT_SOURCE_INTERVAL_MINUTES))).isoformat()
             await db.execute('UPDATE sources SET last_checked_at=?,next_check_at=?,last_error=? WHERE id=?',[now.isoformat(),next_check,'; '.join(stats['diagnostics'][-4:])[:1200],source_id])
@@ -1935,8 +2011,7 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                     # Manager controls the gate. Special low-threshold mode is intentional: when the
                     # manager sets the minimum to 0/1, every fresh, non-duplicate item is eligible.
                     # The AI is still used for extraction/formatting; it is not a hidden veto.
-                    low_threshold_mode = min_score <= 1
-                    accept = True if low_threshold_mode else (score >= min_score)
+                    accept = manager_accepts_score(score, min_score)
                     if not accept:
                         if item_id: await db.execute("UPDATE source_items SET status='rejected',score=?,category=?,last_error=?,retry_after=? WHERE id=?",[score,out.get('category',source.get('category','tech')),str(out.get('why') or 'score below threshold')[:1000],(now+timedelta(minutes=15)).isoformat(),item_id])
                         return {'processed':1,'rejected':1,'score':score,'reason':str(out.get('why') or 'score below threshold')[:220]}
@@ -2093,9 +2168,7 @@ async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> b
         title_out=str(row.get("title") or "مطلب")
         channel_text=sanitize_telegram_html(row.get("channel_text") or "")
         source_url=normalize_url(row.get("source_url") or "")
-        # The channel contains exactly one navigation link: the article Deep Link.
-        # The real source link lives inside the full article behind that Deep Link.
-        channel_text += f"\n\n<a href=\"{html.escape(deep_link,quote=True)}\">📖 بیشتر بخوانید</a>"
+        # publication_caption adds exactly one navigation link. Keep channel_text itself clean.
         image_url=await resolve_article_image(db,row)
         sent=None
         if image_url:
@@ -4360,9 +4433,9 @@ async def health_test_ai(call:CallbackQuery,db:D1Database):
 
 @router.callback_query(F.data == "health_test_source")
 async def health_test_source(call:CallbackQuery,db:D1Database,bot:Bot):
-    rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC")
+    rows=await db.execute("SELECT * FROM sources ORDER BY priority ASC,id ASC")
     if not rows:
-        await call.message.edit_text("❌ هیچ منبع فعالی نیست.",reply_markup=get_admin_back_kb("auto_health")); return
+        await call.message.edit_text("❌ هیچ منبعی ثبت نشده است.",reply_markup=get_admin_back_kb("auto_health")); return
     await call.answer("تست همه منابع شروع شد…")
     await log_automation(db,"INFO","health_test_sources_started",f"sources={len(rows)}")
     await edit_health_progress(call.message,health_progress_block(0,max(1,len(rows)),"تست همه منابع","در حال بررسی واقعی هر منبع…"))
@@ -4371,16 +4444,20 @@ async def health_test_source(call:CallbackQuery,db:D1Database,bot:Bot):
         for i,src in enumerate(rows,1):
             await edit_health_progress(call.message,health_progress_block(i,len(rows),"تست همه منابع",f"🌐 {i}/{len(rows)} · {src.get('name')} → کشف"))
             try:
-                r=await discover_for_processing(db,src,ai,allow_scout=False,include_old=False)
-                n=len(r.get('items') or []); found=int(r.get('direct_count',0) or 0); method=r.get('method') or 'مستقیم'
-                if 'sitemap' in method.lower(): method='direct'
-                if n:
-                    marker='🟢 قابل بررسی'
+                r=await discover_for_processing(db,src,ai,allow_scout=False,include_old=False,advance_cursor=False)
+                found=int(r.get('direct_count',0) or 0)
+                fresh=int(r.get('fresh_count',0) or 0)
+                new_count=int(r.get('new_count',0) or 0)
+                method=r.get('method') or 'مستقیم'
+                if new_count:
+                    marker='🟢 آماده بررسی'
+                elif fresh:
+                    marker='🟡 تازه هست، قبلاً دیده شده'
                 elif found:
-                    marker='🟡 محتوا هست، گزینه تازه/جدید ندارد'
+                    marker='🟠 محتوا هست، ولی تازه نیست'
                 else:
-                    marker='🔴 دریافت محتوا ناموفق'
-                results.append(f"{marker} · {src.get('name')}: پیدا {found} · تازه {n} · مسیر: {method}")
+                    marker='🔴 دریافت نشد'
+                results.append(f"{marker} · {src.get('name')}: پیدا {found} · تازه‌۲۴ساعت {fresh} · جدید {new_count} · مسیر {method}")
             except Exception as e:
                 results.append(f"❌ {src.get('name')}: {html.escape(str(e)[:180])}")
     finally: await ai.close()
@@ -4410,7 +4487,7 @@ async def choose_test_candidate(db, ai, progress=None):
     diagnostics=[]
     total=len(rows)
     for idx,src in enumerate(rows,1):
-        name=str(src.get('name') or src.get('url') or f'منبع {idx}')
+        name=str(src.get('name') or src.get('url') or f'منبع {idx}') + (" · خاموش" if not src.get("enabled") else "")
         try:
             if progress: await progress(f"🌐 {idx}/{total} · {name} → کشف مستقیم")
             r=await discover_for_processing(db,src,ai,allow_scout=False,include_old=True)
@@ -4501,18 +4578,25 @@ async def health_run_cycle(call:CallbackQuery,db:D1Database,bot:Bot):
     if call.from_user.id!=ADMIN_ID:return
     await call.answer('چرخه واقعی شروع شد؛ این بار واقعاً منابع و AI را اجرا می‌کنم…')
     await log_automation(db,"INFO","real_cycle_started","manual real pipeline test")
-    await edit_health_progress(call.message,health_progress_block(0,5,'▶️ اجرای یک چرخه واقعی','این همان Pipeline اتوماتیک است؛ داده ساختگی استفاده نمی‌شود.'))
     ai=AIProviderManager(db,bot); rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC")
+    await edit_health_progress(call.message,health_progress_block(0,max(1,len(rows)),'▶️ اجرای یک چرخه واقعی','این همان Pipeline اتوماتیک است؛ داده ساختگی استفاده نمی‌شود.'))
     results=[]
     try:
-        sem=asyncio.Semaphore(max(1,min(4,int(await get_setting(db,'max_workers','2')))))
-        async def one(src):
-            async with sem: return await fetch_source_cycle(db,src,ai)
-        tasks=[]
-        for i,src in enumerate(rows):
-            await edit_health_progress(call.message,health_progress_block(min(1+i,4),5,'▶️ اجرای یک چرخه واقعی',f'در حال بررسی: {src.get("name")}'))
-            tasks.append(asyncio.create_task(one(src)))
-        if tasks: results=await asyncio.gather(*tasks,return_exceptions=True)
+        total=len(rows)
+        for i,src in enumerate(rows,1):
+            name=str(src.get('name') or src.get('url') or f'منبع {i}')
+            await edit_health_progress(call.message,health_progress_block(i-1,max(1,total),'▶️ اجرای یک چرخه واقعی',f'🌐 {i}/{total} · {name} → در حال بررسی عمیق…'))
+            await log_automation(db,'INFO','source_check_started',f'{i}/{total} · {name} → شروع بررسی')
+            try:
+                r=await fetch_source_cycle(db,src,ai)
+                results.append(r)
+                await log_automation(db,'INFO','source_check_result',f'{i}/{total} · {name} → پیدا {r.get("found",0)} · تازه {r.get("candidates",0)} · AI {r.get("processed",0)} · صف {r.get("queued",0)} · رد {r.get("rejected",0)} · خطا {r.get("errors",0)}')
+                await edit_health_progress(call.message,health_progress_block(i,max(1,total),'▶️ اجرای یک چرخه واقعی',f'🌐 {i}/{total} · {name} → پایان: پیدا {r.get("found",0)} | تازه {r.get("candidates",0)} | صف {r.get("queued",0)}'))
+            except Exception as exc:
+                r={'errors':1,'found':0,'candidates':0,'processed':0,'queued':0,'rejected':0}
+                results.append(r)
+                await log_automation(db,'ERROR','source_check_result',f'{i}/{total} · {name} → خطا: {type(exc).__name__}: {str(exc)[:180]}')
+                await edit_health_progress(call.message,health_progress_block(i,max(1,total),'▶️ اجرای یک چرخه واقعی',f'🌐 {i}/{total} · {name} → خطا؛ منبع بعدی'))
         published=await publish_next_article(db,bot)
         total_found=sum((r.get('found',0) if isinstance(r,dict) else 0) for r in results)
         total_new=sum((r.get('candidates',0) if isinstance(r,dict) else 0) for r in results)
@@ -4561,8 +4645,8 @@ async def health_test_publish(call:CallbackQuery,db:D1Database,bot:Bot):
         if out.get('error'): raise RuntimeError(out['error'])
         # Test publication obeys only the manager's numeric threshold.
         min_score=float(await get_setting(db,'min_content_score',str(DEFAULT_MIN_CONTENT_SCORE)))
-        if min_score > 1 and float(out.get('score',0) or 0) < min_score:
-            raise RuntimeError(f"امتیاز {out.get('score','-')} کمتر از حداقل امتیاز مدیر {min_score:g} است")
+        if not manager_accepts_score(float(out.get('score',0) or 0), min_score):
+            raise RuntimeError(f"امتیاز {out.get('score','-')} با حد مدیر {min_score:g} و دامنه انعطاف {MANAGER_SCORE_TOLERANCE:g} همخوان نیست")
         ch=sanitize_telegram_html(out.get('channel_html') or out.get('channel_text') or '')
         ar=sanitize_telegram_html(out.get('article_html') or out.get('article_text') or '')
         ar=append_resource_links(ar,out.get('resource_links'),item.get('url') or '')
@@ -4577,15 +4661,15 @@ async def health_test_publish(call:CallbackQuery,db:D1Database,bot:Bot):
         if not username: raise RuntimeError('Username ربات پیدا نشد.')
         deep=f'https://t.me/{username}?start=article_{token}'
         await edit_health_progress(call.message,health_progress_block(4,6,'Deep Link آماده شد','ارسال همان محتوای تولیدشده به کانال…'))
-        channel_html=ch+f"\n\n<a href=\"{html.escape(deep,quote=True)}\">📖 ادامه مطلب</a>"
+        channel_html=sanitize_telegram_html(ch)
         photo=item.get('image_url') or ''
         sent=None
         if photo:
-            try: sent=await bot.send_photo(channel,photo=photo,caption=channel_html[:1000],parse_mode='HTML')
+            try: sent=await bot.send_photo(channel,photo=photo,caption=publication_caption(str(out.get('title') or item.get('title') or 'مطلب'),channel_html,deep),parse_mode='HTML')
             except Exception: sent=None
         if sent is None:
-            # Real test must use the real generated content; never attach a fake placeholder image.
-            sent=await bot.send_message(channel,text=channel_html[:4096],parse_mode='HTML',disable_web_page_preview=True)
+            final_text=sanitize_telegram_html(channel_html + f"\n\n<a href=\"{html.escape(deep,quote=True)}\">📖 بیشتر بخوانید</a>")
+            sent=await bot.send_message(channel,text=final_text[:4096],parse_mode='HTML',disable_web_page_preview=True)
         await db.execute("UPDATE articles SET published_message_id=?,published_at=? WHERE id=?",[getattr(sent,'message_id',0),now,aid])
         await edit_health_progress(call.message,health_progress_block(5,6,'✅ انتشار انجام شد','در حال نهایی‌کردن نتیجه و لینک تست…'))
         result=("✅ <b>تست انتشار واقعی موفق شد.</b>\n\n"
@@ -4620,12 +4704,17 @@ async def health_deployment(call:CallbackQuery,db:D1Database):
 @router.callback_query(F.data == "health_logs")
 async def health_logs(call:CallbackQuery,db:D1Database):
     await call.answer()
-    rows=await db.execute("SELECT level,event,details,created_at FROM automation_logs ORDER BY id DESC LIMIT 15")
-    text='📜 <b>آخرین لاگ‌های اتوماسیون</b>\n\n'
+    rows=await db.execute("SELECT level,event,details,created_at FROM automation_logs ORDER BY id DESC LIMIT 20")
+    names={"source_check_started":"شروع بررسی منبع","source_check_result":"نتیجه منبع","source_cycle":"چرخه منبع","source_cycle_failed":"خطای منبع","real_cycle_started":"شروع چرخه واقعی","real_cycle_finished":"پایان چرخه واقعی","publication_failed":"خطای انتشار","published":"انتشار موفق","test_candidate_exhausted":"پایان جستجوی گزینه تست","health_test_sources_started":"شروع تست منابع","health_test_sources_finished":"پایان تست منابع"}
+    text='📜 <b>لاگ کوتاه و زنده اتوماسیون</b>\n\n'
     if not rows: text+='هنوز لاگی ثبت نشده است.'
     else:
         for r in rows:
-            text+=f"<b>{html.escape(str(r.get('event')))}</b> · {html.escape(str(r.get('created_at')))[11:19]}\n{html.escape(str(r.get('details') or '')[:300])}\n\n"
+            ev=str(r.get('event') or '')
+            label=names.get(ev,ev)
+            tm=html.escape(str(r.get('created_at') or ''))[11:19]
+            detail=html.escape(str(r.get('details') or '')[:420])
+            text+=f"<b>{tm} · {html.escape(label)}</b>\n{detail}\n\n"
     await call.message.edit_text(text[:4000],parse_mode='HTML',reply_markup=get_admin_back_kb('auto_health')); await call.answer()
 
 
