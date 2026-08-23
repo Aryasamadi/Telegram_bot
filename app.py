@@ -313,8 +313,7 @@ async def initialize_automation_database(db: D1Database):
         "news_freshness_max_hours": str(int(NEWS_FRESHNESS_MAX_HOURS) if NEWS_FRESHNESS_MAX_HOURS.is_integer() else NEWS_FRESHNESS_MAX_HOURS),
         "news_priority_hours": str(int(NEWS_PRIORITY_HOURS) if NEWS_PRIORITY_HOURS.is_integer() else NEWS_PRIORITY_HOURS),
         "ai_verify_mode": "auto",
-        "ai_web_scout_enabled": "1",
-        "ai_web_scout_max_items": "5",
+        "ai_web_scout_enabled": "0",
         "last_cleanup_at": "",
         "last_manual_channel_post_at": "",
         "channel_id": CHANNEL_ID,
@@ -1382,6 +1381,7 @@ class TelegramHTMLSanitizer(HTMLParser):
 
 def sanitize_telegram_html(value: str) -> str:
     value = normalize_model_text(value)
+    value = re.sub(r"<[^>]+>", lambda m: re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", m.group(0)), value)
     if not value: return ""
     try:
         p=TelegramHTMLSanitizer(); p.feed(value); p.close()
@@ -1418,16 +1418,15 @@ def _normalize_text_blocks(value: str) -> str:
     return value.strip()
 
 def _protect_bidi_latin(text: str) -> str:
-    """Keep Latin/number runs readable inside RTL Persian text without altering URLs/HTML tags."""
+    """Protect RTL/LTR runs without ever inserting direction marks inside HTML tags."""
     if not text: return text
-    parts=re.split(r"(<a\b[^>]*>.*?</a>|<code>.*?</code>|<pre>.*?</pre>)", text, flags=re.I|re.S)
+    parts=re.split(r"(<[^>]+>)", text, flags=re.I|re.S)
     out=[]
     for part in parts:
-        if re.match(r"<a\b|<code>|<pre>", part, flags=re.I):
-            out.append(part); continue
-        # Add LRM around compact Latin/number runs that are likely to reorder inside Persian.
-        part=re.sub(r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9@._+/#:-]{1,64})(?![A-Za-z0-9])", lambda m: "\u200e" + m.group(1) + "\u200e", part)
-        out.append(part)
+        if part.startswith("<") and part.endswith(">"):
+            out.append(re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", part))
+        else:
+            out.append(re.sub(r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9@._+/#:-]{1,64})(?![A-Za-z0-9])", lambda m: "\u200e"+m.group(1)+"\u200e", part))
     return "".join(out)
 
 def _split_readable_paragraphs(value: str, max_chars: int = 520) -> List[str]:
@@ -1465,7 +1464,9 @@ def _visualize_plain_paragraphs(title: str, value: str, category: str, article: 
     last_icon=None
     for i,para in enumerate(paragraphs[:12]):
         pplain=strip_html_text(para).strip()
-        if not pplain or (i==0 and SequenceMatcher(None,pplain.lower(),strip_html_text(title).lower()).ratio()>0.86): continue
+        title_similarity=SequenceMatcher(None,pplain.lower(),strip_html_text(title).lower()).ratio()
+        if not pplain or title_similarity>0.82:
+            continue
         icon=icons[i%len(icons)]
         if icon==last_icon: icon=icons[(i+1)%len(icons)]
         last_icon=icon
@@ -1476,10 +1477,9 @@ def _visualize_plain_paragraphs(title: str, value: str, category: str, article: 
             formatted=_format_technical_tokens(_protect_bidi_latin(html.escape(pplain,quote=False)))
         if i==1:
             formatted=f"{icon} <b>{formatted}</b>"
-        elif i==2 and len(pplain)>=60:
-            # A real paragraph is used as a visual quote; wording is untouched.
+        elif i==2 and 60 <= len(pplain) <= 240:
             formatted=f"<blockquote>{icon} {formatted}</blockquote>"
-        elif article and i in (2,5,8) and len(pplain)>=55:
+        elif article and i in (4,8) and 70 <= len(pplain) <= 220:
             formatted=f"<blockquote>{icon} {formatted}</blockquote>"
         elif i==3 and len(pplain)<=140:
             formatted=f"{icon} <i>{formatted}</i>"
@@ -1491,7 +1491,7 @@ def _visualize_plain_paragraphs(title: str, value: str, category: str, article: 
     return dedupe_adjacent_emojis("\n\n".join(out))
 
 def ensure_rich_channel_format(title: str, value: str, category: str = "tech") -> str:
-    return _visualize_plain_paragraphs(title, value or "", category, article=False)
+    return _visualize_plain_paragraphs(title, clean_channel_copy(value or ""), category, article=False)
 
 def ensure_rich_article_format(title: str, value: str, source_url: str) -> str:
     clean=_normalize_text_blocks(value or "")
@@ -1515,6 +1515,12 @@ def dedupe_adjacent_emojis(text: str) -> str:
         while f"{e}{e}" in text:
             text = text.replace(f"{e}{e}", e)
     return text
+
+def clean_channel_copy(value: str) -> str:
+    text=normalize_model_text(value or "")
+    for pat in [r"(?:📖\s*)?(?:بیشتر بخوانید|ادامه مطلب|برای ادامه(?: متن| مطلب)?(?: روی| از) لینک(?: زیر)? کلیک کنید)\s*", r"(?:روی لینک|از طریق لینک) (?:زیر|بالا) کلیک کنید", r"لینک ادامه مطلب\s*"]:
+        text=re.sub(pat,"",text,flags=re.I)
+    return re.sub(r"\n{3,}","\n\n",text).strip()
 
 def relative_time_label(value: str) -> str:
     """Human-friendly relative age, calculated every time the article is opened."""
@@ -1590,19 +1596,24 @@ def sanitize_resource_links(raw_links):
     return out[:5]
 
 def append_resource_links(article_html: str, resource_links, source_url: str = "") -> str:
+    """One primary source link + at most one necessary action link; idempotent."""
     clean=remove_article_metadata_blocks(article_html)
     main=normalize_url(source_url or "")
+    if main:
+        clean=re.sub(r'<a\s+href=["\']'+re.escape(main)+r'["\'][^>]*>.*?</a>', '', clean, flags=re.I|re.S)
+    clean=re.sub(r'(?:<u>|<b>|<strong>|<i>|<em>)?\s*🔗?\s*(?:لینک(?:‌| )های مرتبط|منبع اصلی|منبع)\s*(?:</u>|</b>|</strong>|</i>|</em>)?', '', clean, flags=re.I)
+    clean=re.sub(r'\n{3,}','\n\n',clean).strip()
     rendered=[]
     if main:
         rendered.append(f'<a href="{html.escape(main,quote=True)}">منبع اصلی</a>')
     for x in sanitize_resource_links(resource_links):
-        label=x["label"]
-        if not re.search(r"ثبت[-‌ ]?نام|عضویت|دانلود|دریافت|مستندات|docs|register|signup|خرید|قیمت|demo|دمو|مشاهده",label,re.I): continue
-        if normalize_url(x["url"])==main: continue
-        rendered.append(f'<a href="{html.escape(x["url"],quote=True)}">{html.escape(label)}</a>')
-        if len(rendered)>=2: break
-    # Only one compact source line + at most one necessary action link.
+        label=x["label"]; url=normalize_url(x["url"])
+        if url==main or not re.search(r"ثبت[-‌ ]?نام|عضویت|دانلود|دریافت|مستندات|docs|register|signup|خرید|قیمت|demo|دمو|مشاهده",label,re.I):
+            continue
+        rendered.append(f'<a href="{html.escape(url,quote=True)}">{html.escape(label)}</a>')
+        break
     return clean.rstrip()+"\n\n"+" · ".join(rendered) if rendered else clean
+
 
 async def resolve_article_image(db: D1Database, article: dict) -> str:
     # Image URLs are transient transport data. Never persist them in D1.
@@ -1622,20 +1633,9 @@ async def resolve_article_image(db: D1Database, article: dict) -> str:
         return ""
 
 def make_article_png(width=1280,height=720):
-    # Deprecated: placeholder images are intentionally disabled.
-    raw=bytearray()
-    for y in range(height):
-        raw.append(0)
-        for x in range(width):
-            t=x/(width-1); u=y/(height-1)
-            r=int(18+38*t); g=int(24+50*u); b=int(55+95*(1-t))
-            # الگوی نرم و جذاب برای جلوگیری از پست بدون تصویر
-            glow=max(0,1-(((x-width*.78)/(width*.35))**2+((y-height*.28)/(height*.45))**2))
-            r=min(255,int(r+45*glow)); g=min(255,int(g+30*glow)); b=min(255,int(b+55*glow))
-            raw.extend((r,g,b))
-    def chunk(tag,data):
-        return struct.pack('>I',len(data))+tag+data+struct.pack('>I',zlib.crc32(tag+data)&0xffffffff)
-    return b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',width,height,8,2,0,0,0))+chunk(b'IDAT',zlib.compress(bytes(raw),6))+chunk(b'IEND',b'')
+    # Kept only for backward compatibility; placeholder images are not generated or stored.
+    return b""
+
 
 def extract_xml_locs_resilient(text: str) -> List[str]:
     # بعض سایت‌ها XML ناقص/بزرگ تحویل می‌دهند؛ در این حالت فقط locها را با regex بیرون می‌کشیم.
@@ -1646,115 +1646,7 @@ def extract_xml_locs_resilient(text: str) -> List[str]:
     return [u for u in dict.fromkeys(found) if u]
 
 
-async def universal_web_scout(ai: AIProviderManager, site_url: str, max_items: int = 5) -> Dict[str, Any]:
-    """Try web-capable AI providers in priority order. Gemini uses native URL Context/Search.
-    Other providers are attempted only if their endpoint returns a structured candidate list;
-    this keeps the fallback generic for compatible gateways that expose web tools."""
-    rows = await ai.db.execute("SELECT * FROM ai_providers WHERE enabled=1 AND (web_enabled=1 OR status='healthy') ORDER BY web_enabled DESC, priority ASC, id ASC")
-    domain = urllib.parse.urlsplit(site_url).netloc
-    scout_schema = {"items":[{"title":"...","url":"https://...","description":"...","published_at":"","image_url":""}]}
-    prompt = (
-        "You are a controlled web scout for a Persian technology channel.\n"
-        f"Source URL: {site_url}\n"
-        f"Domain: {domain}\n\n"
-        f"Find up to {max_items} of the NEWEST articles published on this exact site within the last {int(NEWS_FRESHNESS_MAX_HOURS)} hours about technology, AI, AI models/tools, cybersecurity, education, or important technology news. "
-        "Freshness is mandatory within the last 24 hours. Strongly prefer articles published in the last 6 hours, but items from 6-24 hours are still valid. Do not return older articles just because they are relevant. "
-        "Iran/Persian language or geography must NOT be used as a source priority. Do not return the homepage or category pages. Do not invent dates or URLs. "
-        "Every returned item MUST include a verifiable published_at timestamp; if the timestamp cannot be established, do not return the item. "
-        f"Return only valid JSON matching this schema: {json.dumps(scout_schema, ensure_ascii=False)}"
-    )
-    attempts=[]
-    for p in rows[:8]:
-        status=str(p.get('status') or '')
-        if status in {'invalid','cooldown'}:
-            cooldown=p.get('cooldown_until') or ''
-            if cooldown:
-                try:
-                    if datetime.fromisoformat(cooldown.replace('Z','+00:00')) > datetime.now(timezone.utc):
-                        continue
-                except Exception:
-                    pass
-        name=str(p.get('name') or p.get('model_name') or f"provider-{p.get('id')}")
-        base=str(p.get('base_url') or '')
-        key=decrypt_secret(p.get('encrypted_api_key') or '')
-        model=str(p.get('model_name') or '')
-        # Native Gemini web tooling.
-        if 'generativelanguage.googleapis.com' in base.lower():
-            try:
-                endpoint=AIProviderManager.endpoint(base if '/v1beta' in base else 'https://generativelanguage.googleapis.com/v1beta','gemini',model)
-                headers={'x-goog-api-key':key,'Content-Type':'application/json','User-Agent':HTTP_USER_AGENT}
-                payload={'contents':[{'role':'user','parts':[{'text':prompt}]}],
-                         'generationConfig':{'temperature':0.1,'maxOutputTokens':1800},
-                         'tools':[{'url_context':{}},{'google_search':{}}]}
-                async with ai._session.post(endpoint,headers=headers,json=payload,timeout=aiohttp.ClientTimeout(total=45)) as resp:
-                    raw=await resp.text()
-                    if resp.status != 200:
-                        attempts.append(f"{name}: Gemini HTTP {resp.status}")
-                        # one simpler URL-context-only attempt
-                        if resp.status in {400,404}:
-                            payload['tools']=[{'url_context':{}}]
-                            async with ai._session.post(endpoint,headers=headers,json=payload,timeout=aiohttp.ClientTimeout(total=45)) as r2:
-                                raw=await r2.text()
-                                if r2.status != 200:
-                                    attempts.append(f"{name}: Gemini retry HTTP {r2.status}")
-                                    continue
-                                resp_data=json.loads(raw)
-                        else:
-                            continue
-                    else:
-                        resp_data=json.loads(raw)
-                    content=ai._extract_content('gemini',resp_data)
-                    obj=parse_json_object(content)
-                    items=obj.get('items') if isinstance(obj,dict) else None
-                    clean=[]
-                    if isinstance(items,list):
-                        for it in items[:max_items]:
-                            if not isinstance(it,dict): continue
-                            u=normalize_url(str(it.get('url') or ''))
-                            t=strip_html_text(str(it.get('title') or ''))[:500]
-                            if u and t and same_domain(u,site_url):
-                                clean.append({'title':t,'url':u,'description':strip_html_text(str(it.get('description') or ''))[:2000],
-                                              'published_at':str(it.get('published_at') or '')[:100],
-                                              'image_url':normalize_url(str(it.get('image_url') or ''))})
-                    if clean:
-                        await log_automation(ai.db,'INFO','web_scout_success',f"source={site_url} provider={name} items={len(clean)}")
-                        return {'ok':True,'items':clean,'provider':name,'model':model,'attempts':attempts}
-                    attempts.append(f"{name}: پاسخ وب معتبر نداشت")
-            except Exception as e:
-                attempts.append(f"{name}: {type(e).__name__}: {str(e)[:240]}")
-            continue
-        # Generic OpenAI-compatible web-capable gateway. We only accept it if it actually returns candidate URLs;
-        # the prompt explicitly asks the provider to use its web/browse capability when available.
-        try:
-            endpoint=AIProviderManager.endpoint(base,'openai',model)
-            headers={'Authorization':f'Bearer {key}','Content-Type':'application/json','User-Agent':HTTP_USER_AGENT}
-            payload={'model':model,'messages':[{'role':'system','content':'Use your available web/browsing tools if the endpoint provides them. Return JSON only.'},{'role':'user','content':prompt}], 'temperature':0.1, 'max_tokens':1800}
-            async with ai._session.post(endpoint,headers=headers,json=payload,timeout=aiohttp.ClientTimeout(total=45)) as resp:
-                raw=await resp.text()
-                if resp.status != 200:
-                    attempts.append(f"{name}: HTTP {resp.status}")
-                    continue
-                data=json.loads(raw)
-                content=ai._extract_content('openai',data)
-                obj=parse_json_object(content); items=obj.get('items') if isinstance(obj,dict) else None
-                clean=[]
-                if isinstance(items,list):
-                    for it in items[:max_items]:
-                        if not isinstance(it,dict): continue
-                        u=normalize_url(str(it.get('url') or '')); t=strip_html_text(str(it.get('title') or ''))[:500]
-                        if u and t and same_domain(u,site_url):
-                            clean.append({'title':t,'url':u,'description':strip_html_text(str(it.get('description') or ''))[:2000],
-                                          'published_at':str(it.get('published_at') or '')[:100],
-                                          'image_url':normalize_url(str(it.get('image_url') or ''))})
-                if clean:
-                    await log_automation(ai.db,'INFO','web_scout_success',f"source={site_url} provider={name} items={len(clean)}")
-                    return {'ok':True,'items':clean,'provider':name,'model':model,'attempts':attempts}
-                attempts.append(f"{name}: endpoint پاسخ داد ولی candidate وب معتبر نداشت")
-        except Exception as e:
-            attempts.append(f"{name}: {type(e).__name__}: {str(e)[:240]}")
-    return {'ok':False,'error':'همه Web Scoutهای موجود نتوانستند برای این سایت candidate معتبر پیدا کنند.','attempts':attempts}
-
-async def discover_for_processing(db: D1Database, source: Dict[str,Any], ai: AIProviderManager, allow_scout=True, include_old=False) -> Dict[str,Any]:
+async def discover_for_processing(db: D1Database, source: Dict[str,Any], ai: AIProviderManager, allow_scout=False, include_old=False) -> Dict[str,Any]:
     """Primary discovery is cheap/direct. Only fresh items are eligible for automation.
     AI Web Scout is a controlled fallback when direct discovery cannot supply a fresh/new item.
     include_old is reserved for explicit tests and never used by autonomous cycles."""
@@ -1806,31 +1698,7 @@ async def discover_for_processing(db: D1Database, source: Dict[str,Any], ai: AIP
             await db.execute('UPDATE sources SET last_seen_published_at=?, last_seen_url=? WHERE id=?',[newest_dt.isoformat(),newest_url,source_id])
         except Exception:
             pass
-    # If direct source discovery does not produce a usable fresh/new item, use AI Web Scout as controlled fallback.
-    if allow_scout and not unseen and await get_setting(db,'ai_web_scout_enabled','1')=='1':
-        scout=await universal_web_scout(ai, source.get('url') or '', int(await get_setting(db,'ai_web_scout_max_items','5')))
-        diagnostics.extend([f"🤖 Scout: {x}" for x in (scout.get('attempts') or [])[-5:]])
-        if scout.get('ok'):
-            scout_items, scout_diag, scout_newest_dt, scout_newest_url=select_latest_fresh_items(scout.get('items') or [], now=now)
-            diagnostics.extend(scout_diag)
-            for raw in scout_items:
-                u=normalize_url(raw.get('url') or '')
-                if not u: continue
-                pub_dt=parse_publication_datetime(raw.get('published_at') or '')
-                if not include_old and last_seen and pub_dt:
-                    last_url=normalize_url(source.get('last_seen_url') or '')
-                    if pub_dt < last_seen or (pub_dt == last_seen and u <= last_url):
-                        continue
-                exists=await db.execute('SELECT id FROM source_items WHERE source_id=? AND canonical_url=?',[source_id,u]) if source_id else []
-                if not exists or include_old:
-                    unseen.append(raw)
-            if scout_newest_dt and scout_newest_url and not include_old:
-                try:
-                    await db.execute('UPDATE sources SET last_seen_published_at=?, last_seen_url=? WHERE id=?',[scout_newest_dt.isoformat(),scout_newest_url,source_id])
-                except Exception:
-                    pass
-        else:
-            diagnostics.append(f"🤖 Scout شکست خورد: {scout.get('error','')}")
+    # Web Scout intentionally disabled in 10.18; direct discovery only.
     method=direct.get('method') or ''
     if not unseen and raw_items and not fresh_items:
         method=(method or 'direct')+'+freshness_gate'
@@ -1932,9 +1800,6 @@ URL: {item.get('url')}
     ar=ensure_rich_article_format(title, obj.get("article_html") or obj.get("article_text") or "", item.get("url") or "")
     resource_links=sanitize_resource_links(obj.get("resource_links"))
     ar=append_resource_links(ar, resource_links, item.get("url") or "")
-    if resource_links:
-        first=resource_links[0]
-        ch += f'\n\n<a href="{html.escape(first["url"],quote=True)}">🔗 {html.escape(first["label"])}</a>'
     obj["title"]=title; obj["channel_html"]=ch; obj["article_html"]=ar; obj["resource_links"]=resource_links
     # امتیاز نهایی را خود ربات از وزن‌های مدیر محاسبه می‌کند؛ بنابراین تغییر وزن واقعاً اثر دارد.
     dims={
@@ -1980,7 +1845,7 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
     stats={'source':source.get('name') or source.get('url'), 'found':0,'seen':0,'candidates':0,'processed':0,'accepted':0,'rejected':0,'errors':0,'queued':0,'method':'','diagnostics':[]}
     try:
         if progress: await progress('discover',f"🔎 {source.get('name')}: در حال بررسی مستقیم سایت و منابع آن…")
-        discovery=await discover_for_processing(db,source,ai,allow_scout=True,include_old=allow_old_test)
+        discovery=await discover_for_processing(db,source,ai,allow_scout=False,include_old=allow_old_test)
         items=discovery.get('items') or []
         stats.update({'found':discovery.get('direct_count',0),'seen':discovery.get('seen_count',0),'candidates':len(items),'method':discovery.get('method') or ''})
         stats['diagnostics']=discovery.get('diagnostics')[-10:]
@@ -2087,60 +1952,7 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
             else:
                 for k in ('processed','accepted','rejected','errors','queued','seen'):
                     stats[k]+=int(r.get(k,0) or 0)
-        # If every direct candidate was rejected, give the dedicated Web Scout one more chance.
-        # This prevents a good source from becoming permanently "0 queued" just because its first feed batch was unsuitable.
-        if stats.get('accepted',0)==0 and await get_setting(db,'ai_web_scout_enabled','1')=='1':
-            scout=await universal_web_scout(ai,source.get('url') or '',int(await get_setting(db,'ai_web_scout_max_items','5')))
-            if scout.get('ok'):
-                fresh=[]
-                for raw in scout.get('items') or []:
-                    u=normalize_url(raw.get('url') or '')
-                    if not u: continue
-                    ex=await db.execute('SELECT id FROM source_items WHERE source_id=? AND canonical_url=?',[source_id,u])
-                    if not ex: fresh.append(raw)
-                if fresh:
-                    stats['candidates'] += len(fresh)
-                    # Re-run the same pipeline on scout candidates, without recursive scouting.
-                    scout_results=[]
-                    for raw in fresh[:MAX_SOURCE_ITEMS_PER_CYCLE]:
-                        try:
-                            if not allow_old_test:
-                                fresh_ok, fresh_reason, _fresh_dt = candidate_is_fresh(raw, now=now)
-                                if NEWS_FRESHNESS_STRICT and not fresh_ok:
-                                    continue
-                            body=(raw.get('body') or raw.get('description') or '').strip()
-                            if len(body)<120:
-                                enriched=await enrich_candidate_content(dict(raw)); body=(enriched.get('body') or enriched.get('description') or '').strip(); raw=enriched
-                            if not body: continue
-                            u=normalize_url(raw.get('url') or '')
-                            title=strip_html_text(raw.get('title') or '')[:500]
-                            chash=text_hash(title+' '+body)
-                            ins=await db.execute("INSERT OR IGNORE INTO source_items(source_id,canonical_url,title,description,content,image_url,published_at,discovered_at,content_hash,status,category) VALUES(?,?,?,?,?,?,?,?,?,'analyzing',?) RETURNING id",[source_id,u,title,str(raw.get('description') or '')[:2000],body[:14000],'',str(raw.get('published_at') or '')[:100],now.isoformat(),chash,source.get('category','tech')])
-                            if not ins: continue
-                            item_id=ins[0].get('id')
-                            out=await ai_editorial_process(ai,raw,source,recent_titles,weights,await get_manager_editorial_prompts(db))
-                            if out.get('error'): continue
-                            score=float(out.get('score',0) or 0); min_score=float(await get_setting(db,'min_content_score',str(DEFAULT_MIN_CONTENT_SCORE)))
-                            if score<min_score: continue
-                            title_out=strip_html_text(out.get('title') or title)[:500]
-                            channel_text=ensure_rich_channel_format(title_out,out.get('channel_html') or out.get('channel_text') or '',str(out.get('category') or source.get('category') or 'tech'))
-                            article_text=ensure_rich_article_format(title_out,out.get('article_html') or out.get('article_text') or '',u)
-                            article_text=append_resource_links(article_text,out.get('resource_links'),u)
-                            if plain_len(article_text)<120:
-                                article_text=rich_article_fallback(title_out, article_text or body or title_out, u)
-                            if plain_len(article_text)<60: continue
-                            art=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at,source_published_at) VALUES(?,?,?,?,?,?,?,?,'ready',?,?) RETURNING id",[item_id,title_out,channel_text,article_text[:18000],u,'',out.get('category') or source.get('category','tech'),score,now.isoformat(),raw.get('published_at','')[:100]])
-                            aid=art[0].get('id') if art else 0
-                            if not aid: continue
-                            token=make_deep_token(int(aid)); await db.execute('UPDATE articles SET deep_token=? WHERE id=?',[token,aid])
-                            await db.execute("UPDATE source_items SET status='ready',article_id=?,score=? WHERE id=?",[aid,score,item_id])
-                            await db.execute("INSERT OR IGNORE INTO publication_queue(article_id,scheduled_at,status,attempts,created_at) VALUES(?,?, 'queued',0,?)",[aid,now.isoformat(),now.isoformat()])
-                            stats['accepted']+=1; stats['queued']+=1; stats['processed']+=1
-                        except Exception as scout_error:
-                            stats['errors']+=1
-                            stats['diagnostics'].append(f"Scout process: {str(scout_error)[:180]}")
-            else:
-                stats['diagnostics'].append('🤖 Web Scout پس از رد مستقیم‌ها نیز نتیجه‌ای نداد.')
+        # Web Scout intentionally disabled in 10.18; no secondary AI-web crawl.
         finished=datetime.now(timezone.utc)
         next_check=(finished+timedelta(minutes=int(source.get('interval_minutes') or DEFAULT_SOURCE_INTERVAL_MINUTES))).isoformat()
         await db.execute('UPDATE sources SET last_checked_at=?,next_check_at=?,last_error=NULL WHERE id=?',[finished.isoformat(),next_check,source_id])
@@ -4491,7 +4303,7 @@ async def health_test_source(call:CallbackQuery,db:D1Database,bot:Bot):
         for i,src in enumerate(rows,1):
             await edit_health_progress(call.message,health_progress_block(i,len(rows),"تست همه منابع",f"🌐 {i}/{len(rows)} · {src.get('name')} → کشف"))
             try:
-                r=await discover_for_processing(db,src,ai,allow_scout=True,include_old=False)
+                r=await discover_for_processing(db,src,ai,allow_scout=False,include_old=False)
                 n=len(r.get('items') or []); found=int(r.get('direct_count',0) or 0); method=r.get('method') or 'مستقیم'
                 status='✅' if n else '⚠️'
                 results.append(f"{status} {src.get('name')}: پیدا {found} · تازه {n} · {method}")
@@ -4527,7 +4339,7 @@ async def choose_test_candidate(db, ai, progress=None):
         name=str(src.get('name') or src.get('url') or f'منبع {idx}')
         try:
             if progress: await progress(f"🌐 {idx}/{total} · {name} → کشف مستقیم")
-            r=await discover_for_processing(db,src,ai,allow_scout=True,include_old=True)
+            r=await discover_for_processing(db,src,ai,allow_scout=False,include_old=True)
             raw_items=list(r.get('items') or [])
             method=r.get('method') or 'مستقیم'
             if progress: await progress(f"🌐 {idx}/{total} · {name} → {len(raw_items)} گزینه ({method})")
