@@ -1,3 +1,5 @@
+# VERSION 1.0 — richer source context + strict Persian paragraph guard
+# Based directly on the existing bot.py; Telegram rendering/emoji/paragraph pipeline preserved.
 # VERSION 10.24.0 — fix insufficient content detection + remove placeholder fallback from publication
 import os
 import io
@@ -88,6 +90,9 @@ AI_PROVIDER_ENCRYPTION_KEY = os.getenv("AI_PROVIDER_ENCRYPTION_KEY", "")
 HTTP_USER_AGENT = os.getenv("HTTP_USER_AGENT", "TechNowAI/2.0 (+content automation)")
 HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
 MAX_HTTP_BYTES = int(os.getenv("MAX_HTTP_BYTES", "1500000"))
+# Maximum source text forwarded to the AI/editorial pipeline. This only expands the
+# available source context; it does not change the final Telegram formatting/rendering.
+SOURCE_CONTENT_MAX_CHARS = max(14000, int(os.getenv("SOURCE_CONTENT_MAX_CHARS", "30000")))
 MAX_SOURCE_ITEMS_PER_CYCLE = int(os.getenv("MAX_SOURCE_ITEMS_PER_CYCLE", "5"))
 MAX_AUTOMATION_SOURCES = max(1, int(os.getenv("MAX_AUTOMATION_SOURCES", "50")))
 
@@ -555,6 +560,94 @@ class SimpleHTMLParser(HTMLParser):
         return re.sub(r"\s+", " ", " ".join(self._body_parts)).strip()
 
 
+class RichContentParser(HTMLParser):
+    """Extract as much article/main text as possible while skipping site chrome.
+
+    This parser is deliberately isolated from Telegram rendering/formatting. It only
+    improves the source text handed to the AI.
+    """
+    SKIP_TAGS = {"script", "style", "noscript", "svg", "nav", "header", "footer", "aside", "form", "dialog"}
+    BLOCK_TAGS = {"article", "main", "section", "div", "p", "li", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "table", "tr"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self._skip_depth = 0
+        self._semantic_depth = 0
+        self._paragraph_depth = 0
+        self._paragraph_buf = []
+        self._has_semantic_container = False
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if self._skip_depth:
+            if tag in self.SKIP_TAGS:
+                self._skip_depth += 1
+            return
+        if tag in self.SKIP_TAGS:
+            self._skip_depth = 1
+            return
+        if tag in {"article", "main"}:
+            self._semantic_depth += 1
+            self._has_semantic_container = True
+        if tag in self.BLOCK_TAGS:
+            if self._paragraph_buf:
+                self._flush_paragraph()
+            if tag in {"p", "li", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "tr"}:
+                self._paragraph_depth += 1
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if self._skip_depth:
+            if tag in self.SKIP_TAGS:
+                self._skip_depth -= 1
+            return
+        if self._paragraph_depth and tag in {"p", "li", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "tr"}:
+            self._flush_paragraph()
+            self._paragraph_depth = max(0, self._paragraph_depth - 1)
+        elif tag in self.BLOCK_TAGS and self._paragraph_buf:
+            self._flush_paragraph()
+        if tag in {"article", "main"} and self._semantic_depth:
+            self._semantic_depth -= 1
+
+    def handle_data(self, data):
+        if self._skip_depth:
+            return
+        text = re.sub(r"\s+", " ", str(data or "")).strip()
+        if not text:
+            return
+        if self._semantic_depth or not self._has_semantic_container:
+            self._paragraph_buf.append(text)
+
+    def _flush_paragraph(self):
+        if not self._paragraph_buf:
+            return
+        text = " ".join(self._paragraph_buf).strip()
+        self._paragraph_buf = []
+        if len(text) >= 2:
+            self.parts.append(text)
+
+    @property
+    def body(self):
+        self._flush_paragraph()
+        out = []
+        for part in self.parts:
+            if not out or out[-1] != part:
+                out.append(part)
+        return "\n\n".join(out).strip()
+
+
+def extract_rich_source_body(html_text: str) -> str:
+    """Return the richest useful visible article text available in the raw HTML."""
+    parser = RichContentParser()
+    try:
+        parser.feed(html_text or "")
+        parser.close()
+    except Exception:
+        pass
+    return parser.body
+
+
 async def http_get(url: str, session: aiohttp.ClientSession) -> Tuple[str, str]:
     headers={"User-Agent":HTTP_USER_AGENT,"Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8","Accept-Language":"fa-IR,fa;q=0.9,en-US;q=0.8,en;q=0.7","Cache-Control":"no-cache"}
     timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
@@ -635,7 +728,7 @@ def extract_html_page(html_text: str, url: str) -> Dict[str, Any]:
     title = p.meta.get("og:title") or p.meta.get("twitter:title") or p.title
     image = p.meta.get("og:image") or p.meta.get("twitter:image") or ""
     desc = p.meta.get("og:description") or p.meta.get("description") or p.meta.get("twitter:description") or ""
-    body = p.body
+    body = extract_rich_source_body(html_text) or p.body
     links = []
     for href, text in p.links:
         full = normalize_url(urllib.parse.urljoin(url, href))
@@ -657,7 +750,7 @@ def article_candidates_from_html(parsed: Dict[str, Any], source_url: str) -> Lis
     path = urllib.parse.urlsplit(source_url).path.rstrip('/')
     # صفحه ریشه سایت معمولاً صفحه مقاله نیست؛ از آن فقط لینک‌های داخلی را استخراج می‌کنیم.
     if path and len(parsed.get("body", "")) > 700 and parsed.get("title"):
-        return [{"title": parsed["title"][:300], "url": parsed["canonical_url"] or source_url, "description": parsed["description"][:1000], "body": parsed["body"][:12000], "image_url": parsed.get("image_url", ""), "published_at": parsed.get("published_at", "")}]
+        return [{"title": parsed["title"][:300], "url": parsed["canonical_url"] or source_url, "description": parsed["description"][:1000], "body": parsed["body"][:SOURCE_CONTENT_MAX_CHARS], "image_url": parsed.get("image_url", ""), "published_at": parsed.get("published_at", "")}]
     out = []
     for url, title in parsed.get("links", [])[:MAX_SOURCE_ITEMS_PER_CYCLE]:
         if len(title) < 15:
@@ -944,7 +1037,7 @@ async def discover_source_items(source: Dict[str, Any], return_diagnostics: bool
                             "title": parsed["title"],
                             "url": parsed["canonical_url"] or u,
                             "description": parsed["description"],
-                            "body": parsed["body"][:12000],
+                            "body": parsed["body"][:SOURCE_CONTENT_MAX_CHARS],
                             "image_url": parsed["image_url"],
                             "published_at": parsed.get("published_at", "")
                         }
@@ -971,7 +1064,7 @@ async def discover_source_items(source: Dict[str, Any], return_diagnostics: bool
     return result(method)
 
 async def enrich_candidate_content(item: Dict[str, Any]) -> Dict[str, Any]:
-    if item.get("body") and len(item["body"]) >= 700:
+    if item.get("body") and len(item["body"]) >= SOURCE_CONTENT_MAX_CHARS:
         return item
     session = await get_http_session()
     try:
@@ -979,7 +1072,7 @@ async def enrich_candidate_content(item: Dict[str, Any]) -> Dict[str, Any]:
         parsed = extract_html_page(text, item["url"])
         item["title"] = item.get("title") or parsed["title"]
         item["description"] = item.get("description") or parsed["description"]
-        item["body"] = parsed["body"][:14000]
+        item["body"] = parsed["body"][:SOURCE_CONTENT_MAX_CHARS]
         item["image_url"] = item.get("image_url") or parsed["image_url"]
         item["links"] = parsed.get("links", [])[:25]
         item["published_at"] = item.get("published_at") or parsed.get("published_at") or ""
@@ -1364,7 +1457,7 @@ async def ai_analyze_candidate(ai: AIProviderManager, item: Dict[str, Any], sour
 
 
 async def ai_generate_content(ai: AIProviderManager, item: Dict[str, Any], analysis: Dict[str, Any], source: Dict[str, Any]) -> Dict[str, Any]:
-    source_text = (item.get("body") or item.get("description") or "")[:14000]
+    source_text = (item.get("body") or item.get("description") or "")[:SOURCE_CONTENT_MAX_CHARS]
     prompt = f"""برای یک کانال فارسی حرفه‌ای در حوزه تکنولوژی، هوش مصنوعی، ابزارها، مدل‌ها و امنیت سایبری محتوا تولید کن.\n\nمنبع: {source.get('name')}\nURL: {item.get('url')}\nعنوان منبع: {item.get('title')}\nتحلیل قبلی: {json.dumps(analysis, ensure_ascii=False)}\nمتن منبع:\n{source_text}\n\nخروجی فقط JSON معتبر باشد:\n{{\n  "title": "عنوان دقیق و جذاب بدون clickbait",\n  "channel_text": "متن غنی و مستقل برای کانال، ترجیحاً 400 تا 600 کاراکتر، که خود خبر را توضیح دهد و در انتها جای لینک بیشتر داشته باشد. لینک را خودت ننویس.",\n  "article_text": "مقاله عمیق‌تر و مستقل برای داخل ربات. فقط تکرار channel_text نباشد. زمینه، اتفاق اصلی، جزئیات، اهمیت، اثرات، کاربرد، وضعیت کاربران و ایران در صورت ارتباط، محدودیت‌ها و جمع‌بندی را پوشش بده. طول متناسب با موضوع باشد.",\n  "category": "ai|tech|cyber|edu|general",\n  "facts": ["..."],\n  "image_note": "brief reason if source image is suitable"\n}}\n\nدر article_text هیچ ادعای مهمی که از منبع یا تحلیل داده‌ها پشتیبانی نمی‌شود نساز. فارسی طبیعی و خوانا بنویس."""
     result = await ai.call([{"role": "system", "content": "You are an expert Persian technology editor. Output JSON only."}, {"role": "user", "content": prompt}], temperature=0.35, max_tokens=4500, purpose="content_generation")
     obj = parse_json_object(result.get("content", ""))
@@ -1883,12 +1976,26 @@ def _latin_ratio(text: str) -> float:
     latin=len(re.findall(r"[A-Za-z]", plain))
     return latin/max(1,len(re.sub(r"\s+","",plain)))
 
+def _is_english_paragraph(text: str) -> bool:
+    plain = strip_html_text(text or "").strip()
+    if len(plain) < 80:
+        return False
+    # Technical/code-only blocks are allowed to keep Latin text.
+    if re.fullmatch(r"(?:[A-Za-z0-9_./:+#=\-\s<>\[\]{}()]+)", plain or "") and not re.search(r"[\u0600-\u06ff]", plain):
+        return False
+    return _latin_ratio(plain) >= 0.55 and _persian_ratio(plain) < 0.30
+
+
 def _needs_persian_rewrite(title: str, channel: str, article: str) -> bool:
-    sample=" ".join([title or "", channel or "", article or ""])[:5000]
-    return _latin_ratio(sample) > 0.42 and _persian_ratio(sample) < 0.45
+    sample=" ".join([title or "", channel or "", article or ""])[:7000]
+    if _latin_ratio(sample) > 0.42 and _persian_ratio(sample) < 0.45:
+        return True
+    # Catch a single fully-English paragraph even when the overall document is mostly Persian.
+    blocks = [b for b in re.split(r"\n\s*\n+", sample) if strip_html_text(b).strip()]
+    return any(_is_english_paragraph(b) for b in blocks)
 
 async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:Dict[str,Any],recent_titles:List[str],weights:Dict[str,float],manager_prompts:Optional[Dict[str,str]]=None):
-    body=(item.get("body") or item.get("description") or "")[:14000]
+    body=(item.get("body") or item.get("description") or "")[:SOURCE_CONTENT_MAX_CHARS]
     manager_prompts=manager_prompts or {}
     channel_scope=manager_prompts.get("channel") or "تمرکز روی خبرهای فنی و ارزشمند؛ محتوای سطحی و کلیشه‌ای را کنار بگذار."
     article_scope=manager_prompts.get("article") or "نسخه کامل را فنی، غنی و مبتنی بر واقعیت‌های منبع بنویس."
@@ -1923,6 +2030,12 @@ URL: {item.get('url')}
 دستور محتوایی مدیر برای نسخه کامل داخل ربات (حدود 2000 کاراکتر):
 {article_scope}
 
+قانون مهم غنی‌سازی محتوا:
+- تا جایی که اطلاعات منبع داده‌شده اجازه می‌دهد، از همه جزئیات فنی، اعداد، قابلیت‌ها، مثال‌ها، زمینه، محدودیت‌ها، اثرات و نکات مهم استفاده کن.
+- نسخه کامل باید به‌وضوح غنی‌تر از نسخه کانال باشد؛ فقط بازنویسی چند جمله از channel_html ممنوع است.
+- از اطلاعات عمومی خارج از متن منبع برای پر کردن حجم استفاده نکن و چیزی را حدس نزن.
+- 2000 کاراکتر یک هدف تقریبی است، نه سقف سخت؛ اگر منبع برای یک متن عمیق‌تر اطلاعات کافی دارد، تا حدود 3000 کاراکتر از اطلاعات واقعی منبع استفاده کن. اگر اطلاعات منبع کمتر است، متن را مصنوعی کش نده.
+
 این دو دستور فقط مشخص می‌کنند چه اطلاعات و چه نوع محتوایی پوشش داده شود؛ به هیچ وجه قوانین Formatting را تغییر نده. قالب‌بندی وظیفه موتور تولید و ربات است.
 
 اول برای امتیازدهی داخلی، امتیاز 0 تا 100 بده. فیلد accept فقط توضیح داخلی است و دروازه مستقل انتشار نیست؛ تصمیم نهایی را معیارهای عددی مدیر می‌گیرند. صرفاً به‌دلیل کوتاه بودن متن accept=false نده.
@@ -1931,13 +2044,13 @@ URL: {item.get('url')}
 
 اگر accept=true، همزمان محتوای نهایی را تولید کن:
 1) channel_html: حدود 450 تا 650 کاراکتر «خودِ خبر»؛ نه teaser و نه صرفاً معرفی لینک. ساختار بصری داشته باشد: تیتر/شروع با <b>، حداکثر 1 بخش کوتاه با <i> یا <blockquote> فقط وقتی طبیعی است، پاراگراف‌های کوتاه و 1 تا 3 ایموجی دقیق و مرتبط.
-2) article_html: طول ثابت ندارد؛ بسته به غنای منبع کوتاه یا بلند باشد (تقریباً 400 تا 3000 کاراکتر کافی است). اگر منبع کوتاه است، کوتاه و دقیق بمان؛ برای رسیدن به طول مشخص جزئیات نساز. مستقل و غنی‌تر از متن کانال باشد. از تیترهای کوتاه با <b>، پاراگراف‌های کوتاه و در صورت مناسب یک <blockquote> استفاده کن. متن باید برای خواندن در موبایل خوش‌خوان باشد و صرفاً کپی/تکرار channel_html نباشد.
+2) article_html: نسخه کامل باید غنی و مستقل از channel_html باشد؛ هدف معمول حدود 2000 تا 3000 کاراکتر از اطلاعات واقعی منبع است. اگر منبع اطلاعات بیشتری دارد، از جزئیات مهم بیشتری استفاده کن؛ اگر منبع کوتاه است، کوتاه و دقیق بمان و چیزی نساز. از تیترهای کوتاه با <b>، پاراگراف‌های کوتاه و در صورت مناسب یک <blockquote> استفاده کن. متن باید برای خواندن در موبایل خوش‌خوان باشد و صرفاً کپی/تکرار channel_html نباشد.
 3) title: کوتاه، جذاب و غیرکلیک‌بیتی.
 4) category و facts.
 
 قواعد نگارش:
 - فارسی روان، دوستانه، عامیانه و خوش‌خوان؛ رسمی و خشک نباش.
-- اگر اصطلاح فنی لازم است، معادل فارسی را اول بیاور و اصطلاح انگلیسی را فقط داخل پرانتز یا <code>...</code> قرار بده. پاراگراف کامل انگلیسی ممنوع است؛ فقط نام مدل‌ها، شرکت‌ها، محصولات و اصطلاح‌های فنی شناخته‌شده می‌توانند انگلیسی بمانند.
+- اگر اصطلاح فنی لازم است، معادل فارسی را اول بیاور و اصطلاح انگلیسی را فقط داخل پرانتز یا <code>...</code> قرار بده. پاراگراف کامل انگلیسی ممنوع است؛ متن توضیحی باید فارسی باشد و فقط نام مدل‌ها، شرکت‌ها، محصولات، APIها و اصطلاح‌های فنی شناخته‌شده می‌توانند محدود و در جای لازم انگلیسی بمانند.
 - در هر پاراگراف اصلی حداکثر یک ایموجی مرتبط داشته باش؛ دو یا چند ایموجی کنار هم نگذار و ایموجی تکراری پشت‌سرهم هم استفاده نکن.
 - نسخه کانال باید فاصله‌گذاری طبیعی موبایلی داشته باشد، چند پاراگراف کوتاه داشته باشد و در صورت مناسب یک بخش Quote کوتاه داشته باشد.
 - نسخه کانال و نسخه کامل باید حتماً حداقل یک Quote کوتاه و واقعی داشته باشند؛ اگر منبع جمله مستقیمی برای نقل‌قول ندارد، یک جمله عیناً از متن منبع را به‌صورت Quote بیاور، نه اینکه نقل‌قول ساختگی بسازی. نسخه کامل در صورت داشتن متن کافی می‌تواند 2 Quote کوتاه داشته باشد. Quote هرگز نباید کل مقاله یا یک پاراگراف بسیار بزرگ باشد.
@@ -1967,8 +2080,9 @@ URL: {item.get('url')}
     raw_ar=str(obj.get("article_html") or obj.get("article_text") or "")
     if _needs_persian_rewrite(raw_title, raw_ch, raw_ar):
         repair=(
-            "متن زیر خروجی تحریریه است اما بخش زیادی انگلیسی شده. فقط بازنویسی فارسی انجام بده و هیچ واقعیتی را تغییر نده. "
-            "نام شرکت‌ها، مدل‌ها و اصطلاحات فنی شناخته‌شده را همان‌طور نگه دار. خروجی فقط JSON معتبر با سه کلید title, channel_html, article_html باشد. "
+            "متن زیر خروجی تحریریه است و حداقل یک بخش آن انگلیسیِ توضیحی شده است. آن را به فارسی روان بازنویسی کن و هیچ واقعیتی را تغییر نده. "
+            "هیچ پاراگراف توضیحی کامل انگلیسی باقی نگذار؛ نام شرکت‌ها، مدل‌ها، محصولات، APIها و اصطلاحات فنی شناخته‌شده را فقط در صورت نیاز همان‌طور نگه دار. "
+            "ساختار پاراگراف‌ها، تیترها، Quote و HTML مجاز را حفظ کن. خروجی فقط JSON معتبر با سه کلید title, channel_html, article_html باشد. "
             "قالب Telegram HTML مجاز است و یک Quote کوتاه هم نگه دار/ایجاد کن.\n\n"
             + json.dumps({"title":raw_title,"channel_html":raw_ch,"article_html":raw_ar},ensure_ascii=False)[:20000]
         )
@@ -2104,10 +2218,10 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                         item_id=int(hrow.get('id') or 0)
                     if item_id:
                         await db.execute("UPDATE source_items SET title=?,description=?,content=?,published_at=?,discovered_at=?,content_hash=?,status='analyzing',last_error=NULL,retry_after=NULL WHERE id=?",
-                                          [title,item.get('description','')[:2000],body[:14000],item.get('published_at','')[:100],now.isoformat(),content_hash,item_id])
+                                          [title,item.get('description','')[:2000],body[:SOURCE_CONTENT_MAX_CHARS],item.get('published_at','')[:100],now.isoformat(),content_hash,item_id])
                     else:
                         ins=await db.execute("INSERT INTO source_items(source_id,canonical_url,title,description,content,image_url,published_at,discovered_at,content_hash,status,category) VALUES(?,?,?,?,?,?,?,?,?,'analyzing',?) RETURNING id",
-                            [source_id,url,title,item.get('description','')[:2000],body[:14000],'',item.get('published_at','')[:100],now.isoformat(),content_hash,source.get('category','tech')])
+                            [source_id,url,title,item.get('description','')[:2000],body[:SOURCE_CONTENT_MAX_CHARS],'',item.get('published_at','')[:100],now.isoformat(),content_hash,source.get('category','tech')])
                         item_id=ins[0].get('id') if ins else 0
                     out=await ai_editorial_process(ai,item,source,recent_titles,weights,await get_manager_editorial_prompts(db))
                     if out.get('error'):
