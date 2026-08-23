@@ -79,7 +79,8 @@ DEFAULT_PUBLISH_END_HOUR = int(os.getenv("PUBLISH_END_HOUR", "23"))
 CONTENT_RETENTION_DAYS = int(os.getenv("CONTENT_RETENTION_DAYS", "1"))
 # News freshness policy: automation accepts only items with a verifiable publication
 # timestamp within this window. Tests may opt into archived items explicitly.
-NEWS_FRESHNESS_MAX_HOURS = float(os.getenv("NEWS_FRESHNESS_MAX_HOURS", "6"))
+NEWS_FRESHNESS_MAX_HOURS = float(os.getenv("NEWS_FRESHNESS_MAX_HOURS", "24"))
+NEWS_PRIORITY_HOURS = float(os.getenv("NEWS_PRIORITY_HOURS", "6"))
 NEWS_FRESHNESS_STRICT = os.getenv("NEWS_FRESHNESS_STRICT", "true").lower() in {"1", "true", "yes", "on"}
 LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "14"))
 AI_PROVIDER_ENCRYPTION_KEY = os.getenv("AI_PROVIDER_ENCRYPTION_KEY", "")
@@ -310,6 +311,7 @@ async def initialize_automation_database(db: D1Database):
         "publish_end_hour": str(DEFAULT_PUBLISH_END_HOUR),
         "default_source_interval": str(DEFAULT_SOURCE_INTERVAL_MINUTES),
         "news_freshness_max_hours": str(int(NEWS_FRESHNESS_MAX_HOURS) if NEWS_FRESHNESS_MAX_HOURS.is_integer() else NEWS_FRESHNESS_MAX_HOURS),
+        "news_priority_hours": str(int(NEWS_PRIORITY_HOURS) if NEWS_PRIORITY_HOURS.is_integer() else NEWS_PRIORITY_HOURS),
         "ai_verify_mode": "auto",
         "ai_web_scout_enabled": "1",
         "ai_web_scout_max_items": "5",
@@ -703,6 +705,15 @@ def candidate_is_fresh(item: Dict[str, Any], now: Optional[datetime] = None, max
     return (True, f"تازه ({max(0.0, age_hours):.1f} ساعت)", dt)
 
 
+def freshness_priority(item: Dict[str, Any], now: Optional[datetime] = None, priority_hours: float = NEWS_PRIORITY_HOURS) -> int:
+    now=now or datetime.now(timezone.utc)
+    dt=parse_publication_datetime(item.get('published_at') or item.get('source_published_at') or '')
+    if not dt:
+        return 1
+    age=(now-dt).total_seconds()/3600.0
+    return 0 if age <= priority_hours else 1
+
+
 def select_latest_fresh_items(items: List[Dict[str, Any]], now: Optional[datetime] = None, max_items: int = MAX_SOURCE_ITEMS_PER_CYCLE) -> Tuple[List[Dict[str, Any]], List[str], Optional[datetime], str]:
     """Keep only the newest items with verifiable timestamps; no geography/language bias."""
     now = now or datetime.now(timezone.utc)
@@ -717,7 +728,7 @@ def select_latest_fresh_items(items: List[Dict[str, Any]], now: Optional[datetim
             fresh.append(item)
         else:
             diagnostics.append(f"⏱️ {strip_html_text(str(item.get('title') or ''))[:90]}: {reason}")
-    fresh.sort(key=lambda x: x.get("_parsed_published_dt") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    fresh.sort(key=lambda x: (freshness_priority(x, now=now), -(x.get('_parsed_published_dt').timestamp() if x.get('_parsed_published_dt') else 0)))
     for item in fresh:
         item.pop("_parsed_published_dt", None)
     return fresh[:max_items], diagnostics[-10:], newest_dt, newest_url
@@ -1642,7 +1653,7 @@ async def universal_web_scout(ai: AIProviderManager, site_url: str, max_items: i
         f"Source URL: {site_url}\n"
         f"Domain: {domain}\n\n"
         f"Find up to {max_items} of the NEWEST articles published on this exact site within the last {int(NEWS_FRESHNESS_MAX_HOURS)} hours about technology, AI, AI models/tools, cybersecurity, education, or important technology news. "
-        "Freshness is mandatory. Prefer articles published in the last few hours. Do not return older articles just because they are relevant. "
+        "Freshness is mandatory within the last 24 hours. Strongly prefer articles published in the last 6 hours, but items from 6-24 hours are still valid. Do not return older articles just because they are relevant. "
         "Iran/Persian language or geography must NOT be used as a source priority. Do not return the homepage or category pages. Do not invent dates or URLs. "
         "Every returned item MUST include a verifiable published_at timestamp; if the timestamp cannot be established, do not return the item. "
         f"Return only valid JSON matching this schema: {json.dumps(scout_schema, ensure_ascii=False)}"
@@ -1984,8 +1995,8 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                     fresh_ok, fresh_reason, _fresh_dt = candidate_is_fresh(raw, now=now)
                     if NEWS_FRESHNESS_STRICT and not fresh_ok:
                         return {'processed':0,'rejected':1,'reason':f'freshness: {fresh_reason}'}
-                if not raw_url or not raw_title or not heuristic_topic_match(raw_title,raw_desc,source.get('category','tech')):
-                    return {'processed':0,'rejected':1,'reason':'heuristic'}
+                if not raw_url or not raw_title:
+                    return {'processed':0,'rejected':1,'reason':'missing'}
                 item=await enrich_candidate_content(dict(raw))
                 title=strip_html_text(item.get('title') or raw_title)[:500]; url=normalize_url(item.get('url') or raw_url)
                 if not url or not title: return {'processed':0,'rejected':1,'reason':'missing'}
@@ -4500,7 +4511,13 @@ async def choose_test_candidate(db, ai, progress=None):
             raw_items=list(r.get('items') or [])
             method=r.get('method') or 'مستقیم'
             if progress: await progress(f"🌐 {idx}/{total} · {name} → {len(raw_items)} گزینه ({method})")
-            items=sorted(raw_items,key=lambda x: parse_publication_datetime(x.get('published_at') or '') or datetime.min.replace(tzinfo=timezone.utc),reverse=True)
+            priority_hours=float(await get_setting(db,'news_priority_hours',str(NEWS_PRIORITY_HOURS)) or NEWS_PRIORITY_HOURS)
+            def _test_sort_key(x):
+                dt=parse_publication_datetime(x.get('published_at') or '')
+                if not dt: return (1, 0)
+                age=(datetime.now(timezone.utc)-dt).total_seconds()/3600.0
+                return (0 if age <= priority_hours else 1, -dt.timestamp())
+            items=sorted(raw_items,key=_test_sort_key)
             if not items and progress: await progress(f"🌐 {idx}/{total} · {name} → رد شد؛ مورد تازه‌ای پیدا نشد")
             for c in items:
                 c=await enrich_candidate_content(dict(c))
