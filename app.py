@@ -870,6 +870,7 @@ async def enrich_candidate_content(item: Dict[str, Any]) -> Dict[str, Any]:
         item["body"] = parsed["body"][:14000]
         item["image_url"] = item.get("image_url") or parsed["image_url"]
         item["links"] = parsed.get("links", [])[:25]
+        item["published_at"] = item.get("published_at") or parsed.get("published_at") or ""
         item["url"] = parsed["canonical_url"] or item["url"]
     except Exception:
         pass
@@ -1391,21 +1392,61 @@ def _format_technical_tokens(text: str) -> str:
 
 def _normalize_text_blocks(value: str) -> str:
     value=(value or "").replace("\r\n","\n").replace("\r","\n")
+    # Convert literal backslash-n sequences from model output into real line breaks.
+    value=value.replace("\\n","\n")
     value=re.sub(r"<br\s*/?>","\n",value,flags=re.I)
     value=re.sub(r"[ \t]+"," ",value)
+    value=re.sub(r"[ \t]*\n[ \t]*", "\n", value)
     value=re.sub(r"\n{3,}","\n\n",value)
     return value.strip()
 
+def _protect_bidi_latin(text: str) -> str:
+    """Keep Latin/number runs readable inside RTL Persian text without altering URLs/HTML tags."""
+    if not text: return text
+    parts=re.split(r"(<a\b[^>]*>.*?</a>|<code>.*?</code>|<pre>.*?</pre>)", text, flags=re.I|re.S)
+    out=[]
+    for part in parts:
+        if re.match(r"<a\b|<code>|<pre>", part, flags=re.I):
+            out.append(part); continue
+        # Add LRM around compact Latin/number runs that are likely to reorder inside Persian.
+        part=re.sub(r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9@._+/#:-]{1,64})(?![A-Za-z0-9])", r"\u200e\1\u200e", part)
+        out.append(part)
+    return "".join(out)
+
+def _split_readable_paragraphs(value: str, max_chars: int = 520) -> List[str]:
+    """Split long AI paragraphs into mobile-friendly blocks without changing wording."""
+    raw=_normalize_text_blocks(value or "")
+    blocks=[x.strip() for x in re.split(r"\n\s*\n+", raw) if strip_html_text(x).strip()]
+    if not blocks: return []
+    out=[]
+    for block in blocks:
+        plain=strip_html_text(block).strip()
+        if len(plain)<=max_chars:
+            out.append(block); continue
+        # Sentence-aware split. Keep each chunk intact and avoid single giant paragraphs.
+        sentences=re.split(r"(?<=[.!?؟:])\s+", block)
+        current=""
+        for sent in sentences:
+            sent=sent.strip()
+            if not sent: continue
+            candidate=(current+" "+sent).strip()
+            if current and len(strip_html_text(candidate))>max_chars:
+                out.append(current.strip()); current=sent
+            else:
+                current=candidate
+        if current: out.append(current.strip())
+    return out
+
 def _visualize_plain_paragraphs(title: str, value: str, category: str, article: bool=False) -> str:
-    clean=dedupe_adjacent_emojis(sanitize_telegram_html(_normalize_text_blocks(value or "")))
+    clean=sanitize_telegram_html(_normalize_text_blocks(value or ""))
     plain=strip_html_text(clean)
     if not plain: return ""
     emoji_map={"ai":["🤖","🧠","⚡","🔬","🧩","🚀"],"cyber":["🛡️","🔐","🚨","🧩","⚠️","🔎"],"tech":["💻","⚙️","🚀","🔎","🧪","📱"],"edu":["📚","💡","🧭","📝","🎓","🔍"],"general":["🌐","✨","📌","🔭","🧭","💡"]}
     icons=emoji_map.get(category,emoji_map["tech"])
-    paragraphs=[x.strip() for x in re.split(r"\n\s*\n+",clean) if strip_html_text(x).strip()] or [clean]
+    paragraphs=_split_readable_paragraphs(clean, max_chars=430 if not article else 560) or [clean]
     out=[f"<b>{icons[0]} {html.escape(strip_html_text(title)[:220])}</b>"]
     last_icon=None
-    for i,para in enumerate(paragraphs[:10]):
+    for i,para in enumerate(paragraphs[:12]):
         pplain=strip_html_text(para).strip()
         if not pplain or (i==0 and SequenceMatcher(None,pplain.lower(),strip_html_text(title).lower()).ratio()>0.86): continue
         icon=icons[i%len(icons)]
@@ -1413,17 +1454,33 @@ def _visualize_plain_paragraphs(title: str, value: str, category: str, article: 
         last_icon=icon
         has_rich=any(tag in para.lower() for tag in ("<b>","<strong>","<i>","<em>","<u>","<s>","<a ","<blockquote>","<pre>","<code>"))
         if has_rich:
-            formatted=para.strip()
-            if not formatted.startswith(("<b>","<i>","<u>","<s>","<blockquote>","<pre>","<code>")): formatted=f"{icon} {formatted}"
-            if article and i in (2,5) and len(pplain)>=80 and "<blockquote>" not in formatted.lower(): formatted=f"<blockquote>{formatted}</blockquote>"
+            formatted=_protect_bidi_latin(para.strip())
         else:
-            formatted=_format_technical_tokens(html.escape(pplain,quote=False))
-            if i in (0,4,8): formatted=f"{icon} <b>{formatted}</b>"
-            elif article and i in (2,5) and len(pplain)>=80: formatted=f"<blockquote>{formatted}</blockquote>"
-            elif i==1: formatted=f"{icon} <i>{formatted}</i>"
-            else: formatted=f"{icon} {formatted}"
+            formatted=_format_technical_tokens(_protect_bidi_latin(html.escape(pplain,quote=False)))
+        if i==1:
+            formatted=f"{icon} <b>{formatted}</b>"
+        elif i==2 and len(pplain)>=60:
+            # A real paragraph is used as a visual quote; wording is untouched.
+            formatted=f"<blockquote>{icon} {formatted}</blockquote>"
+        elif article and i in (5,8) and len(pplain)>=60:
+            formatted=f"<blockquote>{icon} {formatted}</blockquote>"
+        elif i==3 and len(pplain)<=140:
+            formatted=f"{icon} <i>{formatted}</i>"
+        elif i==0:
+            formatted=f"{icon} {formatted}"
+        else:
+            formatted=f"{icon} {formatted}"
         out.append(formatted)
     return dedupe_adjacent_emojis("\n\n".join(out))
+
+def ensure_rich_channel_format(title: str, value: str, category: str = "tech") -> str:
+    return _visualize_plain_paragraphs(title, value or "", category, article=False)
+
+def ensure_rich_article_format(title: str, value: str, source_url: str) -> str:
+    clean=_normalize_text_blocks(value or "")
+    if not strip_html_text(sanitize_telegram_html(clean)):
+        return rich_article_fallback(title, "اطلاعات کافی برای تهیه متن کامل از منبع دریافت شد.", source_url)
+    return _visualize_plain_paragraphs(title, clean, "tech", article=True)
 
 def remove_article_metadata_blocks(value: str) -> str:
     text=_normalize_text_blocks(value or "")
@@ -1469,18 +1526,6 @@ def relative_time_label(value: str) -> str:
         return f"{fa(years)} سال پیش"
     except Exception:
         return "زمان نامشخص"
-
-def ensure_rich_channel_format(title: str, value: str, category: str = "tech") -> str:
-    clean=dedupe_adjacent_emojis(sanitize_telegram_html(_normalize_text_blocks(value or "")))
-    if not strip_html_text(clean):
-        return rich_channel_fallback(title, "اطلاعات قابل انتشار از منبع دریافت شد.")
-    return _visualize_plain_paragraphs(title, clean, category, article=False)
-
-def ensure_rich_article_format(title: str, value: str, source_url: str) -> str:
-    clean=dedupe_adjacent_emojis(sanitize_telegram_html(value or ""))
-    if not strip_html_text(clean):
-        return rich_article_fallback(title, "اطلاعات کافی برای تهیه متن کامل از منبع دریافت شد.", source_url)
-    return _visualize_plain_paragraphs(title, clean, "tech", article=True)
 
 def rich_article_fallback(title: str, text: str, source_url: str = "") -> str:
     """Safe fallback for article formatting when AI output is too short or empty.
@@ -1529,14 +1574,17 @@ def sanitize_resource_links(raw_links):
 
 def append_resource_links(article_html: str, resource_links, source_url: str = "") -> str:
     clean=remove_article_metadata_blocks(article_html)
-    rendered=[]; main=normalize_url(source_url or "")
-    if main: rendered.append(f'<a href="{html.escape(main,quote=True)}">منبع اصلی</a>')
+    main=normalize_url(source_url or "")
+    rendered=[]
+    if main:
+        rendered.append(f'<a href="{html.escape(main,quote=True)}">منبع اصلی</a>')
     for x in sanitize_resource_links(resource_links):
         label=x["label"]
         if not re.search(r"ثبت[-‌ ]?نام|عضویت|دانلود|دریافت|مستندات|docs|register|signup|خرید|قیمت|demo|دمو|مشاهده",label,re.I): continue
-        if x["url"]==main: continue
+        if normalize_url(x["url"])==main: continue
         rendered.append(f'<a href="{html.escape(x["url"],quote=True)}">{html.escape(label)}</a>')
         if len(rendered)>=2: break
+    # Only one compact source line + at most one necessary action link.
     return clean.rstrip()+"\n\n"+" · ".join(rendered) if rendered else clean
 
 async def resolve_article_image(db: D1Database, article: dict) -> str:
@@ -1699,7 +1747,17 @@ async def discover_for_processing(db: D1Database, source: Dict[str,Any], ai: AIP
     raw_items=list(direct.get('items') or [])
     diagnostics=list(direct.get('diagnostics') or [])
     now=datetime.now(timezone.utc)
-    fresh_items, fresh_diag, newest_dt, newest_url = select_latest_fresh_items(raw_items, now=now)
+    # Homepage/HTML discovery often gives a URL without its publication timestamp.
+    # Hydrate only those few candidates before the 24h freshness gate, so a fresh article
+    # is not rejected merely because its feed exposed no date.
+    needs_hydration=[dict(x) for x in raw_items if not parse_publication_datetime(x.get('published_at') or '') and x.get('url')]
+    if needs_hydration:
+        hydrated=await asyncio.gather(*(enrich_candidate_content(x) for x in needs_hydration[:MAX_SOURCE_ITEMS_PER_CYCLE]), return_exceptions=True)
+        repl={normalize_url(x.get('url') or ''):x for x in hydrated if isinstance(x,dict)}
+        for idx,raw in enumerate(raw_items):
+            key=normalize_url(raw.get('url') or '')
+            if key in repl: raw_items[idx]=repl[key]
+    fresh_items, fresh_diag, newest_dt, newest_url = ((raw_items[:MAX_SOURCE_ITEMS_PER_CYCLE], [], None, "") if include_old else select_latest_fresh_items(raw_items, now=now))
     diagnostics.extend(fresh_diag)
     source_id=source.get('id')
     unseen=[]; seen_count=0
@@ -1810,8 +1868,8 @@ URL: {item.get('url')}
 این دو دستور فقط مشخص می‌کنند چه اطلاعات و چه نوع محتوایی پوشش داده شود؛ به هیچ وجه قوانین Formatting را تغییر نده. قالب‌بندی وظیفه موتور تولید و ربات است.
 
 اول فقط برای تصمیم داخلی، امتیاز 0 تا 100 بده. این تصمیم نباید وارد متن نهایی شود و نباید با عبارت‌هایی مثل «این خبر مهم است»، «این خبر ارزشمند است»، «ما توصیه می‌کنیم» یا قضاوت شخصی نوشته شود.
-اگر تاریخ انتشار منبع مشخص و قابل‌اعتماد نیست، برای اتوماسیون accept=false بده. مطالب قدیمی‌تر از پنجره مجاز باید accept=false شوند. هیچ تاریخ یا تازگی را حدس نزن.
-اگر اطلاعات کافی برای تولید دقیق وجود ندارد، accept=false بده.
+تازگی توسط برنامه به‌صورت فنی و مستقل کنترل می‌شود؛ از ساختن تاریخ یا حدس‌زدن آن خودداری کن. مطالب خارج از پنجره ۲۴ ساعت برنامه اصلاً به این مرحله نمی‌رسند. مقدار accept فقط برای توصیف داخلی پاسخ است و تصمیم انتشار نهایی را برنامه بر اساس امتیاز و تنظیمات مدیر می‌گیرد.
+اگر اطلاعات کافی برای تولید دقیق وجود ندارد، محتوای قابل‌اعتماد تولید نکن و دلیل را در why بنویس.
 
 اگر accept=true، همزمان محتوای نهایی را تولید کن:
 1) channel_html: حدود 450 تا 650 کاراکتر «خودِ خبر»؛ نه teaser و نه صرفاً معرفی لینک. ساختار بصری داشته باشد: تیتر/شروع با <b>، حداکثر 1 بخش کوتاه با <i> یا <blockquote> فقط وقتی طبیعی است، پاراگراف‌های کوتاه و 1 تا 3 ایموجی دقیق و مرتبط.
@@ -1821,11 +1879,11 @@ URL: {item.get('url')}
 
 قواعد نگارش:
 - فارسی روان، دوستانه، عامیانه و خوش‌خوان؛ رسمی و خشک نباش.
-- اگر اصطلاح فنی لازم است، معادل فارسی + اصطلاح انگلیسی را بیاور.
-- در هر پاراگراف اصلی یک ایموجی دقیق و مرتبط داشته باش؛ تکراری و تزئینی نباشد.
-- نسخه کانال باید 2 تا 4 نشانه بصری متنوع داشته باشد و فاصله‌گذاری طبیعی موبایلی داشته باشد.
-- نسخه کامل باید تیترهای کوتاه Bold و در بخش‌های مهم 2 تا 3 Quote واقعی و کوتاه از خود منبع داشته باشد؛ اگر نقل‌قول دقیق در منبع وجود ندارد، Quote نساز.
-- متن را با تیتر، پاراگراف‌های کوتاه، Bold، Italic، Underline، Code و Quote در جاهای طبیعی و مفید خوش‌خوان کن؛ از فرمت‌ها برای زیبایی واقعی استفاده کن، نه تزئینی و افراطی.
+- اگر اصطلاح فنی لازم است، معادل فارسی + اصطلاح انگلیسی را بیاور و بخش انگلیسی را با فاصله‌گذاری درست از متن فارسی جدا کن تا RTL/LTR به‌هم نریزد.
+- در هر پاراگراف اصلی حداکثر یک ایموجی مرتبط داشته باش؛ دو یا چند ایموجی کنار هم نگذار و ایموجی تکراری پشت‌سرهم هم استفاده نکن.
+- نسخه کانال باید فاصله‌گذاری طبیعی موبایلی داشته باشد، چند پاراگراف کوتاه داشته باشد و در صورت مناسب یک بخش Quote کوتاه داشته باشد.
+- نسخه کامل باید تیترهای کوتاه Bold و در بخش‌های مهم 2 تا 3 Quote کوتاه داشته باشد؛ Quoteها را فقط از جمله‌های موجود در منبع انتخاب کن و جمله جدید به‌عنوان نقل‌قول نساز.
+- متن را با تیترهای کوتاه Bold، Italic فقط برای کلمه/عبارت کوتاه، Underline در موارد محدود، Code و Quote در جاهای طبیعی خوش‌خوان کن؛ روی یک جمله طولانی Italic نزن و از فرمت‌ها افراطی استفاده نکن.
 - اگر کد، دستور، نام API یا عبارت فنی دقیق وجود دارد از <code>...</code> استفاده کن؛ اگر متن شامل قطعه‌کد واقعی است از <pre>...</pre> استفاده کن.
 - هیچ‌وقت کاراکترهای متنی "\\n" را برای فاصله‌گذاری خروجی نده؛ برای خط جدید از newline واقعی استفاده کن.
 - سؤال‌هایی مثل «هدف چیست؟» یا «چه معنایی دارد؟» را به عنوان سؤال رها نکن؛ پاسخ و اطلاعات موجود در منبع را مستقیم بیان کن.
@@ -1941,7 +1999,9 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                         if item_id: await db.execute('UPDATE source_items SET status=\'error\',last_error=? WHERE id=?',[out['error'][:1200],item_id])
                         return {'processed':1,'errors':1,'reason':out['error'][:220]}
                     score=float(out.get('score',0) or 0); min_score=float(await get_setting(db,'min_content_score',str(DEFAULT_MIN_CONTENT_SCORE)))
-                    accept=bool(out.get('accept',True)) and score>=min_score and int(out.get('duplicate_risk',0) or 0)<7
+                    # Manager-controlled threshold is the publication gate. Duplicate risk is already
+                    # represented by the novelty weight and the persistent duplicate/cursor checks.
+                    accept=score>=min_score
                     if not accept:
                         if item_id: await db.execute("UPDATE source_items SET status='rejected',score=?,category=?,last_error=? WHERE id=?",[score,out.get('category',source.get('category','tech')),str(out.get('why') or 'score below threshold')[:1000],item_id])
                         return {'processed':1,'rejected':1,'score':score,'reason':str(out.get('why') or 'score below threshold')[:220]}
@@ -2012,7 +2072,7 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                             out=await ai_editorial_process(ai,raw,source,recent_titles,weights,await get_manager_editorial_prompts(db))
                             if out.get('error'): continue
                             score=float(out.get('score',0) or 0); min_score=float(await get_setting(db,'min_content_score',str(DEFAULT_MIN_CONTENT_SCORE)))
-                            if not out.get('accept',True) or score<min_score or int(out.get('duplicate_risk',0) or 0)>=7: continue
+                            if score<min_score: continue
                             title_out=strip_html_text(out.get('title') or title)[:500]
                             channel_text=ensure_rich_channel_format(title_out,out.get('channel_html') or out.get('channel_text') or '',str(out.get('category') or source.get('category') or 'tech'))
                             article_text=ensure_rich_article_format(title_out,out.get('article_html') or out.get('article_text') or '',u)
@@ -4401,31 +4461,37 @@ def health_progress_block(stage: int, total: int, title: str, detail: str = "") 
     return f"🧪 <b>{html.escape(title)}</b>\n\n<code>{bar}</code> {pct}%\n{html.escape(detail)}\n\n⏳ لطفاً منتظر بمان؛ نتیجه نهایی همین پیام نمایش داده می‌شود."
 
 async def choose_test_candidate(db, ai):
-    rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC LIMIT 8")
-    candidates=[]
-    recently_tested=set()
-    recent_test=await db.execute("SELECT source_url FROM articles WHERE status='test' ORDER BY id DESC LIMIT 30")
-    recently_tested={normalize_url(r.get('source_url') or '') for r in recent_test}
-    hist=await db.execute("SELECT content_hash FROM test_history ORDER BY id DESC LIMIT 100")
-    recently_tested_hashes={str(r.get('content_hash') or '') for r in hist if r.get('content_hash')}
+    """Select the first genuinely usable fresh candidate by source priority.
+    If source #1 fails, immediately continue to #2, #3 ...; no random re-selection.
+    The real-test path uses the same 24h freshness rule as automation.
+    """
+    rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC LIMIT 20")
+    recent_tested_hashes={str(r.get('content_hash') or '') for r in await db.execute("SELECT content_hash FROM test_history ORDER BY id DESC LIMIT 200") if r.get('content_hash')}
+    recent_article_urls={normalize_url(r.get('source_url') or '') for r in await db.execute("SELECT source_url FROM articles WHERE status IN ('published','ready') ORDER BY id DESC LIMIT 200") if r.get('source_url')}
+    diagnostics=[]
     for src in rows:
         try:
-            r=await discover_for_processing(db,src,ai,allow_scout=True,include_old=True)
-            items=list(r.get('items') or [])
-            random.shuffle(items)
+            r=await discover_for_processing(db,src,ai,allow_scout=True,include_old=False)
+            items=sorted(list(r.get('items') or []), key=lambda x: parse_publication_datetime(x.get('published_at') or '') or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
             for c in items:
                 c=await enrich_candidate_content(dict(c))
+                fresh_ok, fresh_reason, _=candidate_is_fresh(c)
+                if not fresh_ok: continue
                 body=(c.get('body') or c.get('description') or '').strip()
+                url=normalize_url(c.get('url') or '')
                 chash=text_hash((c.get('title') or '')+' '+body)
-                if len(body)>=200 and normalize_url(c.get('url') or '') not in recently_tested and chash not in recently_tested_hashes:
-                    c['_test_hash']=chash
-                    candidates.append((src,c))
-        except Exception:
+                if len(body)<120 or not url or url in recent_article_urls or chash in recent_tested_hashes: continue
+                c['_test_hash']=chash
+                return src,c
+            diagnostics.append(f"{src.get('name')}: هیچ candidate تازه و جدیدی نداشت")
+        except Exception as exc:
+            diagnostics.append(f"{src.get('name')}: {type(exc).__name__}: {str(exc)[:160]}")
             continue
-    if not candidates:
-        return None,None
-    random.shuffle(candidates)
-    return candidates[0]
+    try:
+        await log_automation(db,'WARN','test_candidate_exhausted',' | '.join(diagnostics)[:1800])
+    except Exception:
+        pass
+    return None,None
 
 @router.callback_query(F.data == "health_dry_run")
 async def health_dry_run(call:CallbackQuery,db:D1Database,bot:Bot):
