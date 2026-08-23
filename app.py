@@ -17,10 +17,10 @@ import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from difflib import SequenceMatcher
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any, Optional, Tuple
 import threading
-from flask 
-import Flask, jsonify
+from flask import Flask, jsonify
+from typing import List, Dict, Any, Optional, Tuple
+
 import pytz
 import aiohttp
 from dotenv import load_dotenv
@@ -4982,5 +4982,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped!")
-
 
