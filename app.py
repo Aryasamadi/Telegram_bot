@@ -1,4 +1,4 @@
-# VERSION 10.21.0 — canonical content pipeline, persistent source cursor, manager-first scoring
+# VERSION 10.24.0 — fix insufficient content detection + remove placeholder fallback from publication
 import os
 import io
 import re
@@ -17,8 +17,6 @@ import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from difflib import SequenceMatcher
 from datetime import datetime, timezone, timedelta
-import threading
-from flask import Flask, jsonify
 from typing import List, Dict, Any, Optional, Tuple
 
 import pytz
@@ -51,7 +49,7 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "10.22.0-manager-soft-gate-fresh-failover-unified-format"
+BUILD_VERSION = "10.24.0-fix-insufficient-content-placeholder"
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_AI_WORKERS = 3
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -88,7 +86,7 @@ NEWS_FRESHNESS_STRICT = os.getenv("NEWS_FRESHNESS_STRICT", "true").lower() in {"
 LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "14"))
 AI_PROVIDER_ENCRYPTION_KEY = os.getenv("AI_PROVIDER_ENCRYPTION_KEY", "")
 HTTP_USER_AGENT = os.getenv("HTTP_USER_AGENT", "TechNowAI/2.0 (+content automation)")
-HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "30")) # Updated to 30 for better reliability
+HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
 MAX_HTTP_BYTES = int(os.getenv("MAX_HTTP_BYTES", "1500000"))
 MAX_SOURCE_ITEMS_PER_CYCLE = int(os.getenv("MAX_SOURCE_ITEMS_PER_CYCLE", "5"))
 MAX_AUTOMATION_SOURCES = max(1, int(os.getenv("MAX_AUTOMATION_SOURCES", "50")))
@@ -147,36 +145,25 @@ class D1Database:
         if session is None or session.closed:
             session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS))
             temporary_session = True
-            
-        last_error = None
         try:
-            for attempt in range(3):
-                try:
-                    async with session.post(self.url, headers=self.headers, json=payload) as resp:
-                        if resp.status != 200:
-                            text = await resp.text()
-                            logger.error(f"D1 API Error (status {resp.status}): {text}")
-                            raise Exception(f"Cloudflare D1 API returned status {resp.status}: {text}")
-                        
-                        data = await resp.json()
-                        if not data.get("success"):
-                            errors = data.get("errors", [])
-                            logger.error(f"D1 Query failed: {errors}")
-                            raise Exception(f"D1 Query failed: {errors}")
-                        
-                        result = data.get("result", [])
-                        if isinstance(result, list) and len(result) > 0:
-                            return result[0].get("results", [])
-                        elif isinstance(result, dict):
-                            return result.get("results", [])
-                        return []
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    last_error = e
-                    await asyncio.sleep(0.5 * (attempt + 1))
-                    continue
-            
-            logger.error(f"Error executing SQL: {sql} with params {params}. Error: {last_error}")
-            raise last_error or Exception("Unknown D1 execution error")
+                async with session.post(self.url, headers=self.headers, json=payload) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        logger.error(f"D1 API Error (status {resp.status}): {text}")
+                        raise Exception(f"Cloudflare D1 API returned status {resp.status}: {text}")
+                    
+                    data = await resp.json()
+                    if not data.get("success"):
+                        errors = data.get("errors", [])
+                        logger.error(f"D1 Query failed: {errors}")
+                        raise Exception(f"D1 Query failed: {errors}")
+                    
+                    result = data.get("result", [])
+                    if isinstance(result, list) and len(result) > 0:
+                        return result[0].get("results", [])
+                    elif isinstance(result, dict):
+                        return result.get("results", [])
+                    return []
         except Exception as e:
             logger.error(f"Error executing SQL: {sql} with params {params}. Error: {e}")
             raise e
@@ -191,43 +178,31 @@ class D1Database:
             session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS))
             temporary_session = True
         output = []
-        last_error = None
         try:
             for query in queries:
-                payload = {"sql": query["sql"]}
-                if query.get("params"):
-                    payload["params"] = query["params"]
+                    payload = {"sql": query["sql"]}
+                    if query.get("params"):
+                        payload["params"] = query["params"]
 
-                success = False
-                for attempt in range(3):
-                    try:
-                        async with session.post(self.url, headers=self.headers, json=payload) as resp:
-                            if resp.status != 200:
-                                text = await resp.text()
-                                logger.error(f"D1 Batch API Error (status {resp.status}): {text}")
-                                raise Exception(f"Cloudflare D1 Batch API returned status {resp.status}: {text}")
-                            
-                            data = await resp.json()
-                            if not data.get("success"):
-                                errors = data.get("errors", [])
-                                logger.error(f"D1 Batch Query failed: {errors}")
-                                raise Exception(f"D1 Batch Query failed: {errors}")
-                            
-                            result = data.get("result", [])
-                            if isinstance(result, list) and len(result) > 0:
-                                output.append(result[0].get("results", []))
-                            elif isinstance(result, dict):
-                                output.append(result.get("results", []))
-                            else:
-                                output.append([])
-                            success = True
-                            break
-                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                        last_error = e
-                        await asyncio.sleep(0.5 * (attempt + 1))
-                        continue
-                if not success:
-                    raise last_error or Exception("Unknown D1 execution error in batch")
+                    async with session.post(self.url, headers=self.headers, json=payload) as resp:
+                        if resp.status != 200:
+                            text = await resp.text()
+                            logger.error(f"D1 Batch API Error (status {resp.status}): {text}")
+                            raise Exception(f"Cloudflare D1 Batch API returned status {resp.status}: {text}")
+                        
+                        data = await resp.json()
+                        if not data.get("success"):
+                            errors = data.get("errors", [])
+                            logger.error(f"D1 Batch Query failed: {errors}")
+                            raise Exception(f"D1 Batch Query failed: {errors}")
+                        
+                        result = data.get("result", [])
+                        if isinstance(result, list) and len(result) > 0:
+                            output.append(result[0].get("results", []))
+                        elif isinstance(result, dict):
+                            output.append(result.get("results", []))
+                        else:
+                            output.append([])
             return output
         except Exception as e:
             logger.error(f"Error executing batch queries. Error: {e}")
@@ -292,10 +267,10 @@ async def initialize_automation_database(db: D1Database):
     queries = [
         {"sql": "CREATE TABLE IF NOT EXISTS sources(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, url TEXT UNIQUE, feed_url TEXT, category TEXT DEFAULT 'tech', enabled INTEGER DEFAULT 1, interval_minutes INTEGER DEFAULT 15, priority INTEGER DEFAULT 5, last_checked_at TEXT, next_check_at TEXT, last_error TEXT, trust_score REAL DEFAULT 80, created_at TEXT, last_seen_published_at TEXT, last_seen_url TEXT)"},
         {"sql": "CREATE INDEX IF NOT EXISTS idx_sources_due ON sources(enabled, next_check_at)"},
-        {"sql": "CREATE TABLE IF NOT EXISTS source_items(id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER NOT NULL, canonical_url TEXT NOT NULL, title TEXT, description TEXT, content TEXT, image_url TEXT, published_at TEXT, discovered_at TEXT, content_hash TEXT, status TEXT DEFAULT 'new', score REAL DEFAULT 0, category TEXT, article_id INTEGER, last_error TEXT, UNIQUE(source_id, canonical_url))"},
+        {"sql": "CREATE TABLE IF NOT EXISTS source_items(id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER NOT NULL, canonical_url TEXT NOT NULL, title TEXT, description TEXT, content TEXT, image_url TEXT, published_at TEXT, discovered_at TEXT, content_hash TEXT, status TEXT DEFAULT 'new', score REAL DEFAULT 0, category TEXT, article_id INTEGER, last_error TEXT, retry_after TEXT, UNIQUE(source_id, canonical_url))"},
         {"sql": "CREATE INDEX IF NOT EXISTS idx_source_items_status ON source_items(status)"},
         {"sql": "CREATE INDEX IF NOT EXISTS idx_source_items_hash ON source_items(content_hash)"},
-        {"sql": "CREATE TABLE IF NOT EXISTS articles(id INTEGER PRIMARY KEY AUTOINCREMENT, source_item_id INTEGER UNIQUE, title TEXT, channel_text TEXT, body TEXT, source_url TEXT, image_url TEXT, category TEXT, score REAL, status TEXT DEFAULT 'ready', deep_token TEXT UNIQUE, created_at TEXT, verified_at TEXT, published_message_id INTEGER, source_published_at TEXT)"},
+        {"sql": "CREATE TABLE IF NOT EXISTS articles(id INTEGER PRIMARY KEY AUTOINCREMENT, source_item_id INTEGER UNIQUE, title TEXT, channel_text TEXT, body TEXT, source_url TEXT, image_url TEXT, category TEXT, score REAL, status TEXT DEFAULT 'ready', deep_token TEXT UNIQUE, created_at TEXT, verified_at TEXT, published_message_id INTEGER, source_published_at TEXT, deep_views INTEGER DEFAULT 0)"},
         {"sql": "CREATE TABLE IF NOT EXISTS publication_queue(id INTEGER PRIMARY KEY AUTOINCREMENT, article_id INTEGER UNIQUE, scheduled_at TEXT, status TEXT DEFAULT 'queued', attempts INTEGER DEFAULT 0, last_error TEXT, created_at TEXT, published_at TEXT)"},
         {"sql": "CREATE INDEX IF NOT EXISTS idx_publication_queue_due ON publication_queue(status, scheduled_at)"},
         {"sql": "CREATE TABLE IF NOT EXISTS ai_providers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, base_url TEXT, encrypted_api_key TEXT, model_name TEXT, priority INTEGER DEFAULT 10, enabled INTEGER DEFAULT 1, web_enabled INTEGER DEFAULT 0, created_at TEXT, updated_at TEXT, status TEXT DEFAULT 'unknown', last_error TEXT, cooldown_until TEXT, last_checked_at TEXT, last_latency_ms INTEGER DEFAULT 0, consecutive_failures INTEGER DEFAULT 0)"},
@@ -603,6 +578,7 @@ async def http_get(url: str, session: aiohttp.ClientSession) -> Tuple[str, str]:
             raise RuntimeError(str(e))
     raise RuntimeError(str(last_error or "request failed"))
 
+
 def local_name(tag: str) -> str:
     return tag.rsplit('}', 1)[-1].lower()
 
@@ -756,6 +732,60 @@ def select_latest_fresh_items(items: List[Dict[str, Any]], now: Optional[datetim
     for item in fresh:
         item.pop("_parsed_published_dt", None)
     return fresh[:max_items], diagnostics[-10:], newest_dt, newest_url
+
+# ============================================================
+# NEW: Insufficient content / paywall detection (replaces length gate)
+# ============================================================
+PAYWALL_KEYWORDS = [
+    "ادامه مطلب", "برای مشاهده", "اشتراک", "محدود", "ثبت نام", "عضویت", 
+    "خرید اشتراک", "دسترسی کامل", "متن کامل", "نمایش کامل", "بیشتر بخوانید",
+    "continue reading", "subscribe", "sign up", "register", "full access",
+    "premium", "paywall", "limited access", "you have reached",
+    "already a member", "log in", "login"
+]
+
+def is_insufficient_content(title: str, body: str, description: str) -> Tuple[bool, str]:
+    """
+    Detect if the source content is a paywall teaser or otherwise insufficient.
+    Returns (True, reason) if the content should be rejected.
+    Accepts genuinely short articles with real information.
+    """
+    title_plain = strip_html_text(title or "").strip()
+    desc_plain = strip_html_text(description or "").strip()
+    body_plain = strip_html_text(body or "").strip()
+    combined = (title_plain + " " + desc_plain + " " + body_plain).lower()
+
+    # If body is very short (< 20 chars) and title+desc are also short, reject.
+    if len(body_plain) < 20 and len(title_plain) < 30 and len(desc_plain) < 50:
+        return True, "محتوا بسیار کوتاه و فاقد اطلاعات کافی است"
+    
+    # Check for paywall keywords in the body/description/title.
+    if any(kw in combined for kw in PAYWALL_KEYWORDS):
+        # If the body is short and contains such keywords, it's likely a teaser.
+        if len(body_plain) < 200:
+            return True, "محتوای سرویس اشتراک/پشت پرده است و اطلاعات کافی ندارد"
+        # If body is longer but still has paywall phrases, we may still accept if there is real content.
+        # For safety, we will reject if body is less than 500 chars and paywall keywords present.
+        if len(body_plain) < 500:
+            return True, "محتوای سرویس اشتراک/پشت پرده است و اطلاعات کافی ندارد"
+    
+    # If body length is < 100, but title and desc are informative and no paywall, we might accept.
+    if len(body_plain) < 100:
+        # Check if title and desc together contain at least 20 words and seem substantive.
+        word_count = len(re.findall(r'\w+', title_plain + " " + desc_plain))
+        if word_count < 20:
+            return True, "محتوا بسیار کوتاه و فاقد اطلاعات کافی است"
+    
+    # If body has less than 300 characters but contains a date or number, it might still be okay.
+    # We'll accept if body has a digit or a date pattern.
+    if len(body_plain) < 300:
+        if re.search(r'\d{4}[-/]\d{1,2}[-/]\d{1,2}', body_plain) or re.search(r'\d+%', body_plain):
+            return False, ""  # Accept: contains numbers/dates
+    
+    # All good.
+    return False, ""
+
+# END new function
 
 async def discover_source_items(source: Dict[str, Any], return_diagnostics: bool = False, use_sitemap: bool = True) -> Any:
     """Discover real articles through several direct methods before giving up.
@@ -949,7 +979,7 @@ async def enrich_candidate_content(item: Dict[str, Any]) -> Dict[str, Any]:
         parsed = extract_html_page(text, item["url"])
         item["title"] = item.get("title") or parsed["title"]
         item["description"] = item.get("description") or parsed["description"]
-        item["body"] = parsed["body"][:10000]
+        item["body"] = parsed["body"][:14000]
         item["image_url"] = item.get("image_url") or parsed["image_url"]
         item["links"] = parsed.get("links", [])[:25]
         item["published_at"] = item.get("published_at") or parsed.get("published_at") or ""
@@ -1320,7 +1350,7 @@ class AIProviderManager:
             self._last_final_notice=time.time()
             try: await self.bot.send_message(ADMIN_ID,"🚨 خطای نهایی AI\n"+html.escape(final[:1500]))
             except Exception: pass
-        return {"content":"","provider":None,"model":None,"tokens":0,"error":final}
+        return {"content":"","provider":None,"model":None,"tokens":0,"error":final}# ... continued from part 1 ...
 
 async def ai_analyze_candidate(ai: AIProviderManager, item: Dict[str, Any], source: Dict[str, Any], recent_titles: List[str]) -> Dict[str, Any]:
     body = (item.get("body") or item.get("description") or "")[:10000]
@@ -1334,9 +1364,9 @@ async def ai_analyze_candidate(ai: AIProviderManager, item: Dict[str, Any], sour
 
 
 async def ai_generate_content(ai: AIProviderManager, item: Dict[str, Any], analysis: Dict[str, Any], source: Dict[str, Any]) -> Dict[str, Any]:
-    source_text = (item.get("body") or item.get("description") or "")[:10000]
+    source_text = (item.get("body") or item.get("description") or "")[:14000]
     prompt = f"""برای یک کانال فارسی حرفه‌ای در حوزه تکنولوژی، هوش مصنوعی، ابزارها، مدل‌ها و امنیت سایبری محتوا تولید کن.\n\nمنبع: {source.get('name')}\nURL: {item.get('url')}\nعنوان منبع: {item.get('title')}\nتحلیل قبلی: {json.dumps(analysis, ensure_ascii=False)}\nمتن منبع:\n{source_text}\n\nخروجی فقط JSON معتبر باشد:\n{{\n  "title": "عنوان دقیق و جذاب بدون clickbait",\n  "channel_text": "متن غنی و مستقل برای کانال، ترجیحاً 400 تا 600 کاراکتر، که خود خبر را توضیح دهد و در انتها جای لینک بیشتر داشته باشد. لینک را خودت ننویس.",\n  "article_text": "مقاله عمیق‌تر و مستقل برای داخل ربات. فقط تکرار channel_text نباشد. زمینه، اتفاق اصلی، جزئیات، اهمیت، اثرات، کاربرد، وضعیت کاربران و ایران در صورت ارتباط، محدودیت‌ها و جمع‌بندی را پوشش بده. طول متناسب با موضوع باشد.",\n  "category": "ai|tech|cyber|edu|general",\n  "facts": ["..."],\n  "image_note": "brief reason if source image is suitable"\n}}\n\nدر article_text هیچ ادعای مهمی که از منبع یا تحلیل داده‌ها پشتیبانی نمی‌شود نساز. فارسی طبیعی و خوانا بنویس."""
-    result = await ai.call([{"role": "system", "content": "You are an expert Persian technology editor. Output JSON only."}, {"role": "user", "content": prompt}], temperature=0.35, max_tokens=3500, purpose="content_generation")
+    result = await ai.call([{"role": "system", "content": "You are an expert Persian technology editor. Output JSON only."}, {"role": "user", "content": prompt}], temperature=0.35, max_tokens=4500, purpose="content_generation")
     obj = parse_json_object(result.get("content", ""))
     if not obj:
         return {"error": "invalid generation JSON", "ai": result}
@@ -1555,7 +1585,8 @@ def ensure_rich_channel_format(title: str, value: str, category: str = "tech") -
 def ensure_rich_article_format(title: str, value: str, source_url: str) -> str:
     clean=_normalize_text_blocks(value or "")
     if not strip_html_text(sanitize_telegram_html(clean)):
-        return rich_article_fallback(title, "اطلاعات کافی برای تهیه متن کامل از منبع دریافت شد.", source_url)
+        # Do not return placeholder; return empty so the pipeline can reject.
+        return ""
     return _visualize_plain_paragraphs(title, clean, "tech", article=True)
 
 def remove_article_metadata_blocks(value: str) -> str:
@@ -1612,6 +1643,7 @@ def relative_time_label(value: str) -> str:
 def rich_article_fallback(title: str, text: str, source_url: str = "") -> str:
     """Safe fallback for article formatting when AI output is too short or empty.
     Keeps the article readable and adds only the single primary source link.
+    Note: This is only used for tests and manual previews, not for production pipeline.
     """
     clean = sanitize_telegram_html(_normalize_text_blocks(text or ""))
     plain = strip_html_text(clean).strip()
@@ -1808,6 +1840,7 @@ async def discover_for_processing(db: D1Database, source: Dict[str,Any], ai: AIP
         'new_count': len(unseen),
     }
 
+
 def format_source_publication_date(raw: str) -> str:
     raw=normalize_model_text(raw or "").strip()
     if not raw:
@@ -1855,7 +1888,7 @@ def _needs_persian_rewrite(title: str, channel: str, article: str) -> bool:
     return _latin_ratio(sample) > 0.42 and _persian_ratio(sample) < 0.45
 
 async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:Dict[str,Any],recent_titles:List[str],weights:Dict[str,float],manager_prompts:Optional[Dict[str,str]]=None):
-    body=(item.get("body") or item.get("description") or "")[:10000]
+    body=(item.get("body") or item.get("description") or "")[:14000]
     manager_prompts=manager_prompts or {}
     channel_scope=manager_prompts.get("channel") or "تمرکز روی خبرهای فنی و ارزشمند؛ محتوای سطحی و کلیشه‌ای را کنار بگذار."
     article_scope=manager_prompts.get("article") or "نسخه کامل را فنی، غنی و مبتنی بر واقعیت‌های منبع بنویس."
@@ -1921,11 +1954,11 @@ URL: {item.get('url')}
 
 فقط JSON معتبر:
 {json.dumps(editorial_schema, ensure_ascii=False)}"""
-    result=await ai.call([{"role":"system","content":"You are a Persian technology content producer. Be neutral and factual. Return JSON only."},{"role":"user","content":prompt}],0.35,3500,"editorial")
+    result=await ai.call([{"role":"system","content":"You are a Persian technology content producer. Be neutral and factual. Return JSON only."},{"role":"user","content":prompt}],0.35,5000,"editorial")
     obj=parse_json_object(result.get("content",""))
     if not obj:
-        repair_prompt=("پاسخ زیر را فقط به JSON معتبر تبدیل کن؛ محتوای آن را تغییر نده. فیلدها: accept,score,category,iran_relevance,freshness,reliability,duplicate_risk,why,title,channel_html,article_html,facts.\n\n"+str(result.get("content",""))[:10000])
-        retry=await ai.call([{"role":"system","content":"Return valid JSON only."},{"role":"user","content":repair_prompt}],0,3500,"editorial_json_repair")
+        repair_prompt=("پاسخ زیر را فقط به JSON معتبر تبدیل کن؛ محتوای آن را تغییر نده. فیلدها: accept,score,category,iran_relevance,freshness,reliability,duplicate_risk,why,title,channel_html,article_html,facts.\n\n"+str(result.get("content",""))[:14000])
+        retry=await ai.call([{"role":"system","content":"Return valid JSON only."},{"role":"user","content":repair_prompt}],0,4200,"editorial_json_repair")
         obj=parse_json_object(retry.get("content","")); result=retry
     if not obj: return {"error":"پاسخ AI JSON معتبر نبود","ai":result}
     # یک مرحله اصلاح زبانی فقط وقتی لازم است؛ هدف کاهش مصرف توکن و جلوگیری از خروجی انگلیسی است.
@@ -1939,7 +1972,7 @@ URL: {item.get('url')}
             "قالب Telegram HTML مجاز است و یک Quote کوتاه هم نگه دار/ایجاد کن.\n\n"
             + json.dumps({"title":raw_title,"channel_html":raw_ch,"article_html":raw_ar},ensure_ascii=False)[:20000]
         )
-        repaired=await ai.call([{"role":"system","content":"Rewrite to fluent Persian. Return JSON only."},{"role":"user","content":repair}],0.15,3500,"editorial_persian_repair")
+        repaired=await ai.call([{"role":"system","content":"Rewrite to fluent Persian. Return JSON only."},{"role":"user","content":repair}],0.15,4200,"editorial_persian_repair")
         pobj=parse_json_object(repaired.get("content",""))
         if pobj:
             raw_title=strip_html_text(pobj.get("title") or raw_title)[:240]
@@ -1952,6 +1985,9 @@ URL: {item.get('url')}
     # واحدِ قالب‌بندی قطعی: هر خروجی، حتی اگر AI متن خام داده باشد، یک‌بار از همین renderer عبور می‌کند.
     ch=ensure_rich_channel_format(title, raw_ch, category)
     ar=ensure_rich_article_format(title, raw_ar, item.get("url") or "")
+    # If ensure_rich_article_format returns empty (due to no content), we treat as error.
+    if not ar:
+        return {"error": "تولید محتوای کامل ناموفق بود - خروجی خالی", "ai": result}
     resource_links=sanitize_resource_links(obj.get("resource_links"))
     ar=append_resource_links(ar, resource_links, item.get("url") or "")
     obj["title"]=title; obj["channel_html"]=ch; obj["article_html"]=ar; obj["resource_links"]=resource_links
@@ -1994,6 +2030,9 @@ async def add_source(db: D1Database, url: str, category: str = "tech", interval_
     return int(source_id)
 
 
+# ============================================================
+# MODIFIED fetch_source_cycle with paywall detection and placeholder rejection
+# ============================================================
 async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProviderManager, progress=None, allow_old_test=False):
     source_id=source['id']; now=datetime.now(timezone.utc)
     stats={'source':source.get('name') or source.get('url'), 'found':0,'seen':0,'candidates':0,'processed':0,'accepted':0,'rejected':0,'errors':0,'queued':0,'method':'','diagnostics':[]}
@@ -2026,6 +2065,11 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                 item=await enrich_candidate_content(dict(raw))
                 title=strip_html_text(item.get('title') or raw_title)[:500]; url=normalize_url(item.get('url') or raw_url)
                 if not url or not title: return {'processed':0,'rejected':1,'reason':'missing'}
+                # --- NEW: Check for insufficient content (paywall/snippet) before AI ---
+                insufficient, reason = is_insufficient_content(title, item.get('body') or '', item.get('description') or '')
+                if insufficient:
+                    if progress: await progress('skip', f"⏭️ {title[:60]} → {reason}")
+                    return {'processed':0,'rejected':1,'reason':reason}
                 async with sem:
                     exists=await db.execute('SELECT id,status,retry_after FROM source_items WHERE source_id=? AND canonical_url=?',[source_id,url])
                     item_id=int(exists[0].get('id') or 0) if exists else 0
@@ -2038,15 +2082,15 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                             return {'processed':0,'rejected':0,'seen':1,'reason':'seen'}
                     body=item.get('body') or item.get('description') or ''
                     body_plain=strip_html_text(body)
-                    if len(body_plain) < 80:
-                        # منبع واقعاً اطلاعاتی برای تولید ندارد؛ خبر را با متن ساختگی پر نمی‌کنیم، Candidate بعدی را امتحان می‌کنیم.
+                    # Additional check: if body is too short but we already rejected insufficient, so we can still accept if it passed.
+                    # But we also need to ensure there is at least some content.
+                    if len(body_plain) < 20:
                         return {'processed':0,'rejected':1,'reason':'source_content_too_thin'}
                     content_hash=text_hash(title+' '+body_plain)
                     recent_pub=await db.execute("SELECT id FROM articles WHERE status IN ('published','ready','test') AND source_url=? AND COALESCE(published_at,created_at) >= ? LIMIT 1",[url,(now-timedelta(hours=24)).isoformat()])
                     if recent_pub and not allow_old_test:
                         return {'processed':0,'rejected':0,'seen':1,'reason':'published_url_recently'}
                     recent_hash=await db.execute("SELECT id FROM articles WHERE status IN ('published','ready','test') AND COALESCE(published_at,created_at) >= ? LIMIT 200",[(now-timedelta(hours=24)).isoformat()])
-                    # Compare only a small recent window; database remains lightweight.
                     if recent_hash and not allow_old_test:
                         recent_bodies=await db.execute("SELECT title,body FROM articles WHERE status IN ('published','ready','test') AND COALESCE(published_at,created_at) >= ? ORDER BY id DESC LIMIT 50",[(now-timedelta(hours=24)).isoformat()])
                         if any(text_hash(str(r.get('title') or '')+' '+str(r.get('body') or ''))==content_hash for r in recent_bodies):
@@ -2060,10 +2104,10 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                         item_id=int(hrow.get('id') or 0)
                     if item_id:
                         await db.execute("UPDATE source_items SET title=?,description=?,content=?,published_at=?,discovered_at=?,content_hash=?,status='analyzing',last_error=NULL,retry_after=NULL WHERE id=?",
-                                          [title,item.get('description','')[:2000],body[:10000],item.get('published_at','')[:100],now.isoformat(),content_hash,item_id])
+                                          [title,item.get('description','')[:2000],body[:14000],item.get('published_at','')[:100],now.isoformat(),content_hash,item_id])
                     else:
                         ins=await db.execute("INSERT INTO source_items(source_id,canonical_url,title,description,content,image_url,published_at,discovered_at,content_hash,status,category) VALUES(?,?,?,?,?,?,?,?,?,'analyzing',?) RETURNING id",
-                            [source_id,url,title,item.get('description','')[:2000],body[:10000],'',item.get('published_at','')[:100],now.isoformat(),content_hash,source.get('category','tech')])
+                            [source_id,url,title,item.get('description','')[:2000],body[:14000],'',item.get('published_at','')[:100],now.isoformat(),content_hash,source.get('category','tech')])
                         item_id=ins[0].get('id') if ins else 0
                     out=await ai_editorial_process(ai,item,source,recent_titles,weights,await get_manager_editorial_prompts(db))
                     if out.get('error'):
@@ -2090,6 +2134,10 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                     # از خروجی نهایی AI همان یک renderer اصلی را اجرا می‌کنیم؛ دیگر مسیر خام/متفاوت نداریم.
                     channel_text=ensure_rich_channel_format(title_out, out.get('channel_html') or out.get('channel_text') or body_plain, str(out.get('category') or source.get('category') or 'tech'))
                     article_text=ensure_rich_article_format(title_out, out.get('article_html') or out.get('article_text') or body_plain, url)
+                    # IMPORTANT: Ensure article_text is not the placeholder fallback. If it contains the placeholder string, reject.
+                    if not article_text or "اطلاعات کافی برای تهیه متن کامل" in article_text:
+                        if item_id: await db.execute("UPDATE source_items SET status='error',last_error=?,retry_after=? WHERE id=?",['generation produced fallback placeholder',(now+timedelta(minutes=15)).isoformat(),item_id])
+                        return {'processed':1,'errors':1,'reason':'generation fallback placeholder'}
                     channel_text=clean_channel_copy(channel_text)
                     article_text=remove_article_metadata_blocks(article_text)
                     if not strip_html_text(channel_text) or not strip_html_text(article_text):
@@ -2113,7 +2161,6 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
             else:
                 for k in ('processed','accepted','rejected','errors','queued','seen'):
                     stats[k]+=int(r.get(k,0) or 0)
-        # Web Scout intentionally disabled in 10.18; no secondary AI-web crawl.
         finished=datetime.now(timezone.utc)
         next_check=(finished+timedelta(minutes=int(source.get('interval_minutes') or DEFAULT_SOURCE_INTERVAL_MINUTES))).isoformat()
         await db.execute('UPDATE sources SET last_checked_at=?,next_check_at=?,last_error=NULL WHERE id=?',[finished.isoformat(),next_check,source_id])
@@ -3528,6 +3575,7 @@ async def admin_home(call: CallbackQuery, db: D1Database):
         await call.answer("دسترسی ندارید", show_alert=True); return
     await render_admin_home(call, db)
 
+
 @router.callback_query(F.data == "admin_automation")
 async def admin_automation(call: CallbackQuery, db: D1Database):
     if call.from_user.id != ADMIN_ID: return
@@ -4123,863 +4171,1584 @@ async def provider_model_input(message: Message, state: FSMContext, db: D1Databa
     else:
         await message.answer(text,parse_mode='HTML',reply_markup=provider_list_kb(rows))
 
+
 @router.callback_query(F.data.startswith("provider_view_"))
 async def provider_view(call: CallbackQuery, db: D1Database):
     await call.answer()
-    provider_id = int(call.data.split("_")[-1])
-    rows = await db.execute("SELECT * FROM ai_providers WHERE id=?", [provider_id])
+    pid = int(call.data.split("_")[-1])
+    rows = await db.execute("SELECT id,name,base_url,model_name,priority,enabled,web_enabled,status,last_error,last_latency_ms,cooldown_until FROM ai_providers WHERE id=?", [pid])
     if not rows:
-        await call.answer("مدل یافت نشد", show_alert=True)
-        return
+        await call.answer("Provider یافت نشد", show_alert=True); return
     p = rows[0]
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 تست ارتباط", callback_data=f"provider_test_{provider_id}")],
-        [InlineKeyboardButton(text="✏️ ویرایش تنظیمات مدل", callback_data=f"provider_edit_{provider_id}")],
-        [InlineKeyboardButton(text="🔢 تغییر اولویت", callback_data=f"provider_priority_{provider_id}")],
-        [InlineKeyboardButton(text="⏸ غیرفعال" if p.get("enabled") else "▶️ فعال", callback_data=f"provider_toggle_{provider_id}")],
-        [InlineKeyboardButton(text="🌐 ابزار Web Scout: " + ("روشن" if p.get("web_enabled") else "خاموش"), callback_data=f"provider_web_{provider_id}")],
-        [InlineKeyboardButton(text="🗑 حذف", callback_data=f"provider_delete_{provider_id}")],
-        [InlineKeyboardButton(text="🔙 مدل‌ها", callback_data="auto_providers")]
-    ])
     status = p.get('status') or 'unknown'
-    mark = {'healthy':'🟢', 'invalid':'🔴', 'cooldown':'🟡'}.get(status, '⚪')
-    enabled_mark = '✅' if p.get('enabled') else '🔴'
-    
-    text = (f"🤖 #{p['id']} {mark}\n\n"
-            f"نام: <code>{html.escape(p.get('name') or '؟')}</code>\n"
-            f"مدل: <code>{html.escape(p.get('model_name') or '؟')}</code>\n"
-            f"آدرس URL: <code>{html.escape(p.get('base_url') or '؟')}</code>\n"
-            f"وضعیت کاربرد: {enabled_mark}\n"
-            f"اولویت نوبت‌دهی: {p.get('priority')}\n"
-            f"تعداد خطای متوالی: {p.get('consecutive_failures', 0)}\n"
-            f"آخرین زمان تست: {p.get('last_checked_at') or 'هنوز بررسی نشده'}\n"
-            f"سرعت پاسخ: {p.get('last_latency_ms') or 0}ms\n\n"
-            f"خطای سیستم: <code>{html.escape(str(p.get('last_error') or 'ندارد')[:800])}</code>")
+    status_text = {'healthy':'🟢 سالم','invalid':'🔴 تنظیمات/مدل نامعتبر','cooldown':'🟡 موقتاً در انتظار','unknown':'⚪ تست نشده'}.get(status,status)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ ویرایش مدل", callback_data=f"provider_edit_{pid}"), InlineKeyboardButton(text="🧪 تست اتصال", callback_data=f"provider_test_{pid}")],
+        [InlineKeyboardButton(text="🔢 تغییر اولویت", callback_data=f"provider_priority_{pid}"), InlineKeyboardButton(text="⏸ خاموش" if p.get('enabled') else "▶️ فعال", callback_data=f"provider_toggle_{pid}")],
+        [InlineKeyboardButton(text="🌐 Web Scout: خاموش" if not p.get('web_enabled') else "🌐 Web Scout: روشن", callback_data=f"provider_web_toggle_{pid}")],
+        [InlineKeyboardButton(text="🗑 حذف مدل", callback_data=f"provider_delete_{pid}" )],
+        [InlineKeyboardButton(text="🔙 فهرست مدل‌ها", callback_data="auto_providers")]
+    ])
+    text = (f"🤖 مدل #{p['id']}\n\nModel: <code>{html.escape(str(p.get('model_name')))}</code>\n"
+            f"Base URL: <code>{html.escape(str(p.get('base_url')))}</code>\n"
+            f"اولویت: {p.get('priority')}\nWeb Scout: {'🟢 روشن' if p.get('web_enabled') else '⚪ خاموش'}\nوضعیت: {status_text}\n"
+            f"Latency: {p.get('last_latency_ms') or 0}ms\n"
+            f"آخرین خطا: {html.escape(str(p.get('last_error') or '-'))[:500]}")
     await call.message.edit_text(text, parse_mode='HTML', reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("provider_web_toggle_"))
+async def provider_web_toggle(call: CallbackQuery, db: D1Database):
+    if call.from_user.id != ADMIN_ID: return
+    await call.answer()
+    pid=int(call.data.rsplit("_",1)[-1])
+    rows=await db.execute("SELECT web_enabled FROM ai_providers WHERE id=?",[pid])
+    if not rows:
+        await call.answer("مدل پیدا نشد",show_alert=True); return
+    new_value=0 if int(rows[0].get("web_enabled") or 0) else 1
+    await db.execute("UPDATE ai_providers SET web_enabled=?,updated_at=? WHERE id=?",[new_value,datetime.now(timezone.utc).isoformat(),pid])
+    await call.answer("🌐 Web Scout روشن شد" if new_value else "🌐 Web Scout خاموش شد")
+    await provider_view(call,db)
+
+@router.callback_query(F.data == "provider_help")
+async def provider_help(call: CallbackQuery):
+    await call.answer()
+    text = ("🤖 <b>راهنمای مدل‌های هوش مصنوعی</b>\n\n"
+            "برای افزودن هر مدل فقط سه چیز لازم است:\n"
+            "1️⃣ Base URL\n2️⃣ Token / API Key\n3️⃣ نام دقیق Model\n\n"
+            "ربات قبل از ذخیره یک درخواست واقعی آزمایشی می‌فرستد. فقط مدل‌هایی که تستشان موفق باشد ذخیره می‌شوند.\n\n"
+            "🔢 عدد اولویت کمتر = اولویت بالاتر\n"
+            "🌐 Web Scout فقط برای مدل‌هایی است که واقعاً دسترسی وب/URL دارند؛ روشن کردن این گزینه به‌تنهایی قابلیت وب به API اضافه نمی‌کند.\n"
+            "🟡 خطاهای موقت مثل 429/503 باعث cooldown می‌شوند و مدل «خراب» اعلام نمی‌شود.\n"
+            "🔴 خطاهایی مثل 404/401/403 به‌عنوان مشکل تنظیمات علامت‌گذاری می‌شوند.\n\n"
+            "از صفحه هر مدل می‌توانی آن را ویرایش، تست، فعال/غیرفعال، اولویت‌بندی یا حذف کنی.\n\n"
+            "🟦 Gemini / Google AI Studio:\n"
+            "OpenAI-compatible Base URL: https://generativelanguage.googleapis.com/v1beta/openai/\n"
+            "یا Native Base URL: https://generativelanguage.googleapis.com/v1beta\n"
+            "Token همان Gemini API Key است و Model باید دقیقاً نام مدل باشد؛ مثلاً gemini-3.6-flash.\n\n"
+            "ربات در افزودن مدل، اول endpoint را بررسی می‌کند و بعد واقعاً TEST_OK را به مدل می‌فرستد؛ اگر Google باشد هر دو مسیر Native و OpenAI-compatible را در صورت نیاز امتحان می‌کند.")
+    await call.message.edit_text(text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 فهرست مدل‌ها", callback_data="auto_providers")]]))
+
 
 @router.callback_query(F.data.startswith("provider_edit_"))
 async def provider_edit(call: CallbackQuery, state: FSMContext, db: D1Database):
-    provider_id = int(call.data.split("_")[-1])
-    rows = await db.execute("SELECT * FROM ai_providers WHERE id=?", [provider_id])
+    pid = int(call.data.split("_")[-1])
+    rows = await db.execute("SELECT id,base_url,model_name FROM ai_providers WHERE id=?", [pid])
     if not rows:
-        await call.answer("مدل یافت نشد", show_alert=True); return
+        await call.answer("مدل پیدا نشد", show_alert=True); return
+    p = rows[0]
     await state.set_state(BotStates.admin_add_provider)
-    await state.update_data(provider_edit_id=provider_id, parent_callback=f"provider_view_{provider_id}", panel_message_id=call.message.message_id)
+    await state.update_data(provider_edit_id=pid, provider_base_url=None, provider_token=None, panel_message_id=call.message.message_id,parent_callback="provider_view_"+str(pid))
     await call.message.edit_text(
-        f"✏️ ویرایش مدل #{provider_id}\n\n"
-        "مرحله ۱ از ۳\n"
-        "🔗 Base URL جدید خود را ارسال کنید.\n\n"
-        "برای لغو، از دکمه زیر استفاده کنید.",
-        reply_markup=get_exit_menu()
-    )
-    await call.answer()
+        f"✏️ <b>ویرایش مدل #{pid}</b>\n\n"
+        f"مدل فعلی: <code>{html.escape(str(p.get('model_name')))}</code>\n\n"
+        "مرحله ۱ از ۳\n🔗 Base URL جدید را ارسال کن.",
+        parse_mode='HTML', reply_markup=get_exit_menu())
 
 
 @router.callback_query(F.data.startswith("provider_test_"))
-async def provider_test(call: CallbackQuery, db: D1Database, bot: Bot):
-    provider_id = int(call.data.split("_")[-1])
-    rows = await db.execute("SELECT * FROM ai_providers WHERE id=?", [provider_id])
-    if not rows:
-        await call.answer("مدل یافت نشد", show_alert=True); return
-    await call.answer("در حال تست...", show_alert=True)
-    tester = AIProviderManager(db, bot)
+async def provider_test(call: CallbackQuery, db: D1Database):
+    pid = int(call.data.split("_")[-1])
+    await call.answer("🧪 در حال تست...", show_alert=False)
+    manager = AIProviderManager(db)
     try:
-        res = await tester.test_provider(provider_id)
+        result = await manager.test_provider(pid)
     finally:
-        await tester.close()
-    if res.get('ok'):
-        text = f"✅ مدل سالم است.\n\nتأخیر پاسخ: {res.get('latency_ms',0)}ms\nپاسخ آزمایشی: {html.escape(str(res.get('preview'))[:200])}"
+        await manager.close()
+    if result.get('ok'):
+        await call.message.edit_text(f"✅ تست موفق بود.\n\n⚡ زمان پاسخ: {result.get('latency_ms',0)}ms\n🤖 پاسخ: {html.escape(result.get('preview','OK'))}", reply_markup=get_admin_back_kb(f"provider_view_{pid}"))
     else:
-        text = f"❌ مدل در تست مردود شد.\n\nخطا: {html.escape(str(res.get('error'))[:800])}"
-    await call.message.edit_text(text, parse_mode='HTML', reply_markup=get_admin_back_kb(f"provider_view_{provider_id}"))
+        await call.message.edit_text(f"❌ تست ناموفق بود.\n\n{html.escape(result.get('error','unknown')[:1200])}", reply_markup=get_admin_back_kb(f"provider_view_{pid}"))
 
 
 @router.callback_query(F.data.startswith("provider_priority_"))
 async def provider_priority(call: CallbackQuery, state: FSMContext):
     pid = int(call.data.split("_")[-1])
     await state.set_state(BotStates.admin_automation_setting)
-    await state.update_data(automation_setting_key="__provider_priority__", provider_priority_id=pid, parent_callback=f"provider_view_{pid}", panel_message_id=call.message.message_id)
-    await call.message.edit_text("🔢 اولویت مدل را عددی بفرست.\nعدد کمتر = اولویت بالاتر (در صورت خرابی اولویت بالاتر، مدل بعدی جایگزین می‌شود).", reply_markup=get_exit_menu())
-    await call.answer()
+    await state.update_data(automation_setting_key="__provider_priority__", provider_priority_id=pid,parent_callback=f"provider_view_{pid}",panel_message_id=call.message.message_id)
+    await call.message.edit_text("🔢 اولویت این مدل را به عدد بفرست.\nعدد کمتر = اولویت بالاتر.", reply_markup=get_exit_menu())
 
 
 @router.callback_query(F.data.startswith("provider_toggle_"))
 async def provider_toggle(call: CallbackQuery, db: D1Database):
-    provider_id = int(call.data.split("_")[-1])
-    rows = await db.execute("SELECT enabled FROM ai_providers WHERE id=?", [provider_id])
+    pid = int(call.data.split("_")[-1])
+    rows = await db.execute("SELECT enabled FROM ai_providers WHERE id=?", [pid])
     if rows:
-        # وقتی ادمین دستی روشن می‌کند، خطاهای متوالی را هم صفر می‌کنیم
-        if not rows[0].get("enabled"):
-            await db.execute("UPDATE ai_providers SET enabled=1, status='healthy', consecutive_failures=0, cooldown_until=NULL WHERE id=?", [provider_id])
-        else:
-            await db.execute("UPDATE ai_providers SET enabled=0 WHERE id=?", [provider_id])
+        await db.execute("UPDATE ai_providers SET enabled=?, updated_at=? WHERE id=?", [0 if rows[0].get("enabled") else 1, datetime.now(timezone.utc).isoformat(), pid])
     await provider_view(call, db)
 
-@router.callback_query(F.data.startswith("provider_web_"))
-async def provider_web_toggle(call: CallbackQuery, db: D1Database):
-    # Web Scout is intentionally disabled structurally in 10.18; toggle does nothing.
-    await call.answer("Web Scout is disabled by core rules.", show_alert=True)
-    await provider_view(call, db)
 
-@router.callback_query(F.data.startswith("provider_delete_"))
+@router.callback_query(F.data.regexp(r"^provider_delete_(\d+)$"))
 async def provider_delete(call: CallbackQuery, db: D1Database):
-    provider_id = int(call.data.split("_")[-1])
-    await db.execute("DELETE FROM ai_providers WHERE id=?", [provider_id])
+    pid = int(call.data.split("_")[-1])
+    rows = await db.execute("SELECT id, model_name, name FROM ai_providers WHERE id=?", [pid])
+    if not rows:
+        await call.answer("مدل پیدا نشد", show_alert=True); return
+    p = rows[0]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑️ بله، حذف شود", callback_data=f"provider_delete_confirm_{pid}")],
+        [InlineKeyboardButton(text="↩️ لغو", callback_data=f"provider_view_{pid}")]
+    ])
+    await call.message.edit_text(
+        f"⚠️ <b>حذف مدل</b>\n\nمدل: <code>{html.escape(str(p.get('model_name')))}</code>\n\nاین Provider از چرخه Failover حذف خواهد شد. ادامه می‌دهی؟",
+        parse_mode='HTML', reply_markup=kb)
+
+
+@router.callback_query(F.data.regexp(r"^provider_delete_confirm_(\d+)$"))
+async def provider_delete_confirm(call: CallbackQuery, db: D1Database):
+    pid = int(call.data.split("_")[-1])
+    await db.execute("DELETE FROM ai_providers WHERE id=?", [pid])
     rows = await db.execute("SELECT id,name,base_url,model_name,priority,enabled,web_enabled,status,last_error,last_latency_ms FROM ai_providers ORDER BY priority ASC, id ASC")
-    await call.message.edit_text("✅ مدل با موفقیت حذف شد.", reply_markup=provider_list_kb(rows))
+    await call.message.edit_text("🗑️ <b>مدل حذف شد.</b>\n\nفهرست مدل‌ها:", parse_mode='HTML', reply_markup=provider_list_kb(rows))
     await call.answer("حذف شد")
 
-@router.callback_query(F.data == "provider_help")
-async def provider_help(call: CallbackQuery):
-    await call.answer()
-    text = (
-        "ℹ️ <b>راهنمای مدیریت مدل‌ها و AI Manager</b>\n\n"
-        "این سیستم از استراتژی <b>Failover آبشاری</b> استفاده می‌کند:\n\n"
-        "۱. <b>اولویت‌بندی:</b> مدلی که کمترین عدد Priority را دارد اولویت اول است.\n"
-        "۲. <b>Fall-back خودکار:</b> اگر مدل اول خراب شود، Timeout بدهد، یا خطای توکن بدهد، سیستم فوراً روی مدل بعدی (اولویت دوم) تلاش می‌کند و این روند تا پیدا کردن پاسخ موفق ادامه دارد.\n"
-        "۳. <b>قرنطینه و سلامت‌سنجی:</b> هر مدل پس از ۳ بار شکست متوالی در وضعیت قرنطینه (cooldown) قرار می‌گیرد و تا زمان پایان قرنطینه، به کل از چرخه حذف می‌شود.\n"
-        "۴. <b>ترمیم خودکار:</b> سیستم به‌صورت پس‌زمینه (هر ۱۵ دقیقه) یک پیام آزمایشی به مدل‌های خراب ارسال می‌کند؛ اگر جواب موفقیت‌آمیز بود، آن مدل دوباره به چرخه برمی‌گردد.\n"
-        "۵. <b>تشخیص پروتکل:</b> مدل‌های OpenAI-compatible و Gemini بومی به‌طور خودکار هنگام تست، شناسایی و کالیبره می‌شوند."
-    )
-    await call.message.edit_text(text, parse_mode='HTML', reply_markup=get_admin_back_kb("auto_providers"))
 
+def automation_content_db_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='📥 مدیریت صف انتشار',callback_data='auto_queue')],
+        [InlineKeyboardButton(text='📰 محتوای تولیدشده',callback_data='auto_articles')],
+        [InlineKeyboardButton(text='🗄 آمار و پاکسازی دیتای اتوماسیون',callback_data='auto_db')],
+        [InlineKeyboardButton(text='🔙 اتوماسیون محتوا',callback_data='auto_back')]
+    ])
 
-# ============================================================
-# پیکربندی زمان‌بندی و کیفیت محتوا (Quality & Schedule settings)
-# ============================================================
-
-@router.callback_query(F.data == "auto_schedule")
-async def auto_schedule(call: CallbackQuery, db: D1Database):
+@router.callback_query(F.data == "auto_content_db")
+async def auto_content_db(call: CallbackQuery, db: D1Database):
     if call.from_user.id != ADMIN_ID: return
     await call.answer()
-    text, kb = await get_schedule_panel(db)
-    await call.message.edit_text(text, parse_mode='HTML', reply_markup=kb)
+    rows=await db.execute("SELECT (SELECT COUNT(*) FROM articles) articles,(SELECT COUNT(*) FROM publication_queue WHERE status='queued') queued,(SELECT COUNT(*) FROM source_items) source_items,(SELECT COUNT(*) FROM test_history) tests")
+    r=rows[0] if rows else {}
+    text=("🗃 <b>محتوا و داده‌های اتوماسیون</b>\n\n"
+          f"📥 صف: <b>{r.get('queued',0)}</b>\n"
+          f"📰 مقالات تولیدشده: <b>{r.get('articles',0)}</b>\n"
+          f"🔎 آیتم‌های کشف‌شده/حافظه منابع: <b>{r.get('source_items',0)}</b>\n"
+          f"🧪 سوابق تست: <b>{r.get('tests',0)}</b>\n\n"
+          "منابع و مدل‌های AI پاک نمی‌شوند؛ فقط داده‌های محتوایی اتوماسیون مدیریت می‌شوند.")
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=automation_content_db_kb()); await call.answer()
+
+@router.callback_query(F.data == "auto_db")
+async def auto_db(call: CallbackQuery, db: D1Database):
+    if call.from_user.id != ADMIN_ID: return
+    await call.answer()
+    rows=await db.execute("SELECT (SELECT COUNT(*) FROM articles) articles,(SELECT COUNT(*) FROM publication_queue) queue_all,(SELECT COUNT(*) FROM source_items) source_items,(SELECT COUNT(*) FROM automation_logs) logs,(SELECT COUNT(*) FROM test_history) tests")
+    r=rows[0] if rows else {}
+    text=("🗄 <b>دیتای اتوماسیون</b>\n\n"
+          f"📰 مقالات: <b>{r.get('articles',0)}</b>\n📥 رکوردهای صف: <b>{r.get('queue_all',0)}</b>\n"
+          f"🔎 source items: <b>{r.get('source_items',0)}</b>\n🧪 سوابق تست: <b>{r.get('tests',0)}</b>\n📜 لاگ‌ها: <b>{r.get('logs',0)}</b>\n\n"
+          "⚠️ حذف همه داده‌های محتوایی برگشت‌پذیر نیست. منابع، تنظیمات و مدل‌های AI حفظ می‌شوند.")
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='🗑️ حذف کل دیتای محتوایی',callback_data='auto_db_delete_confirm')],
+        [InlineKeyboardButton(text='🔙 محتوا و داده‌ها',callback_data='auto_content_db')]
+    ])
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=kb); await call.answer()
+
+@router.callback_query(F.data == "auto_db_delete_confirm")
+async def auto_db_delete_confirm(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID: return
+    await call.answer()
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='⚠️ بله، همه داده‌ها حذف شود',callback_data='auto_db_delete_yes')],
+        [InlineKeyboardButton(text='↩️ لغو',callback_data='auto_db')]
+    ])
+    await call.message.edit_text("⚠️ <b>تأیید حذف کامل دیتای اتوماسیون</b>\n\nهمه مقالات، صف، آیتم‌های کشف‌شده، سوابق تست و لاگ‌های اتوماسیون حذف می‌شوند. منابع و مدل‌ها باقی می‌مانند.\n\nادامه می‌دهی؟",parse_mode='HTML',reply_markup=kb); await call.answer()
+
+@router.callback_query(F.data == "auto_db_delete_yes")
+async def auto_db_delete_yes(call: CallbackQuery, db: D1Database):
+    if call.from_user.id != ADMIN_ID: return
+    await call.answer()
+    await db.execute_batch([
+        {"sql":"DELETE FROM publication_queue"},
+        {"sql":"DELETE FROM articles"},
+        {"sql":"DELETE FROM source_items"},
+        {"sql":"DELETE FROM test_history"},
+        {"sql":"DELETE FROM manual_channel_events"},
+        {"sql":"DELETE FROM automation_logs"},
+    ])
+    now=datetime.now(timezone.utc).isoformat()
+    await db.execute("UPDATE sources SET last_checked_at=NULL,next_check_at=?",[now])
+    await call.message.edit_text("✅ <b>داده‌های محتوایی اتوماسیون پاک شد.</b>\n\nمنابع، تنظیمات و مدل‌های AI حفظ شدند و چرخه از نو قابل شروع است.",parse_mode='HTML',reply_markup=automation_content_db_kb()); await call.answer("پاکسازی انجام شد")
 
 @router.callback_query(F.data == "auto_quality")
 async def auto_quality(call: CallbackQuery, db: D1Database):
     if call.from_user.id != ADMIN_ID: return
+    score = await get_setting(db, 'min_content_score', str(DEFAULT_MIN_CONTENT_SCORE))
+    text = (f'🧠 <b>کیفیت محتوا</b>\n\nحداقل امتیاز فعلی: <b>{html.escape(score)}</b> از 100\n\n'
+            'این بخش فقط درباره انتخاب و کیفیت خبر است؛ تنظیم زمان و تعداد پست‌ها در بخش «برنامه انتشار» قرار دارد.')
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='⭐ تغییر حداقل امتیاز', callback_data='set_min_score')],
+        [InlineKeyboardButton(text='🎯 وزن معیارهای محتوا', callback_data='quality_weights')],
+        [InlineKeyboardButton(text='✍️ دستورهای محتوای تولید', callback_data='editorial_prompts')],
+        [InlineKeyboardButton(text='🔙 اتوماسیون محتوا', callback_data='auto_back')]
+    ])
+    await call.message.edit_text(text, parse_mode='HTML', reply_markup=kb)
+
+@router.callback_query(F.data == "quality_about")
+async def quality_about(call: CallbackQuery):
+    text = ('🧠 <b>معیارهای کیفیت محتوا</b>\n\n'
+            '⭐ اهمیت جهانی و فناوری\n'
+            '🤖 ارتباط با AI و مدل‌ها\n'
+            '🔐 ارزش امنیت سایبری\n'
+            '🇮🇷 ارتباط با ایران و فارسی‌زبانان\n'
+            '🆕 تازگی و ارزش خبری\n'
+            '♻️ تکراری نبودن\n'
+            '✅ اعتبار و کیفیت منبع\n\n'
+            'محتوای ضعیف یا مبهم منتشر نمی‌شود؛ کیفیت بر تعداد اولویت دارد.')
+    await call.message.edit_text(text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔙 کیفیت محتوا', callback_data='auto_quality')]]))
     await call.answer()
-    score=await get_setting(db,"min_content_score",str(DEFAULT_MIN_CONTENT_SCORE))
-    pch=await get_setting(db,"editorial_prompt_channel","")
-    par=await get_setting(db,"editorial_prompt_article","")
-    text=(f"🧠 <b>کیفیت محتوا</b>\n\nحداقل امتیاز: <b>{html.escape(score)}</b>\n"
-          f"✍️ پرامپت کانال: <code>{html.escape(pch[:180])}</code>\n"
-          f"📝 پرامپت ربات: <code>{html.escape(par[:180])}</code>")
-    await call.message.edit_text(text,parse_mode="HTML",reply_markup=quality_menu_kb())
-
-@router.callback_query(F.data == "set_max_daily")
-async def set_max_daily(call: CallbackQuery, state: FSMContext):
-    await state.set_state(BotStates.admin_automation_setting)
-    await state.update_data(automation_setting_key="max_daily_posts", panel_message_id=call.message.message_id, parent_callback="auto_channel")
-    await call.message.edit_text("🔢 سقف پست‌های مجاز در روز (عدد):", reply_markup=get_exit_menu()); await call.answer()
-
-@router.callback_query(F.data == "set_min_gap")
-async def set_min_gap(call: CallbackQuery, state: FSMContext):
-    await state.set_state(BotStates.admin_automation_setting)
-    await state.update_data(automation_setting_key="min_post_gap_minutes", panel_message_id=call.message.message_id, parent_callback="auto_channel")
-    await call.message.edit_text("⏱ حداقل فاصله بین دو پست به دقیقه (مثلاً 180 برای ۳ ساعت):", reply_markup=get_exit_menu()); await call.answer()
-
-@router.callback_query(F.data == "set_default_interval")
-async def set_default_interval(call: CallbackQuery, state: FSMContext):
-    await state.set_state(BotStates.admin_automation_setting)
-    await state.update_data(automation_setting_key="default_source_interval", panel_message_id=call.message.message_id, parent_callback="auto_channel")
-    await call.message.edit_text("🌐 پیش‌فرض فاصله بررسی منابع جدید به دقیقه (مثلاً 60):", reply_markup=get_exit_menu()); await call.answer()
-
-@router.callback_query(F.data == "set_min_score")
-async def set_min_score(call: CallbackQuery, state: FSMContext):
-    await state.set_state(BotStates.admin_automation_setting)
-    await state.update_data(automation_setting_key="min_content_score", panel_message_id=call.message.message_id, parent_callback="auto_quality")
-    await call.message.edit_text("⭐ حداقل امتیاز انتشار (0 تا 100):\nاگر کمتر باشد فقط بایگانی می‌شود.\nاگر روی 0 یا 1 تنظیم کنید، مدیر محتوا اجازه انتشار به *همه محتواهای تازه و تکراری‌نشده* را می‌دهد.", reply_markup=get_exit_menu()); await call.answer()
-
-@router.callback_query(F.data == "quality_weights")
-async def quality_weights(call: CallbackQuery, db: D1Database):
-    labels=[("global","🌍 جهانی"),("technology","💻 فناوری"),("ai","🤖 AI"),("cyber","🔐 سایبری"),("education","📚 آموزش"),("iran","🇮🇷 ایران/فارسی"),("freshness","🆕 تازگی"),("source","✅ منبع"),("novelty","♻️ عدم تکرار")]
-    text="🎯 <b>وزن معیارها</b>\n\nدرجه اهمیت هر معیار را مشخص کن (0 تا 100).\n\n" + "\n".join([f"{lab}: <b>{await get_setting(db,'weight_'+k,'10')}</b>" for k,lab in labels])
-    rows=[[InlineKeyboardButton(text=lab,callback_data="weight_"+k)] for k,lab in labels]
-    rows.append([InlineKeyboardButton(text="🔙 کیفیت محتوا",callback_data="auto_quality")])
-    await call.message.edit_text(text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)); await call.answer()
-
-@router.callback_query(F.data.startswith("weight_"))
-async def set_weight(call: CallbackQuery, state: FSMContext):
-    k=call.data.split("weight_")[1]
-    await state.set_state(BotStates.admin_automation_setting)
-    await state.update_data(automation_setting_key="weight_"+k, panel_message_id=call.message.message_id, parent_callback="quality_weights")
-    await call.message.edit_text(f"🎯 وزن جدید برای معیار {k} را بفرست (0 تا 100):",reply_markup=get_exit_menu()); await call.answer()
 
 @router.callback_query(F.data == "editorial_prompts")
-async def editorial_prompts(call: CallbackQuery, db: D1Database):
-    ch=await get_setting(db,'editorial_prompt_channel','')
-    ar=await get_setting(db,'editorial_prompt_article','')
-    text=("✍️ <b>دستورهای محتوای تولید</b>\n\nاین دستورها مستقیم به هوش مصنوعی داده می‌شوند تا لحن، محتوا و تمرکز نسخه کانال و نسخه داخل ربات را تنظیم کنند.\n\n"
-          f"📌 نسخه کانال: <code>{html.escape(ch[:260])}</code>\n"
-          f"📌 نسخه داخل ربات: <code>{html.escape(ar[:260])}</code>")
+async def editorial_prompts_panel(call: CallbackQuery, db: D1Database):
+    if call.from_user.id != ADMIN_ID: return
+    ch=await get_setting(db,"editorial_prompt_channel","")
+    ar=await get_setting(db,"editorial_prompt_article","")
+    text=("✍️ <b>دستورهای محتوای تولید</b>\n\n"
+          "این دو دستور فقط تعیین می‌کنند چه اطلاعاتی پوشش داده شود.\n"
+          "Formatting، ایموجی، Bold، Italic، Quote و زیباسازی را خود ربات انجام می‌دهد.\n\n"
+          f"📌 کوتاه (~500): <code>{html.escape(ch[:260])}</code>\n"
+          f"📌 کامل (~2000): <code>{html.escape(ar[:260])}</code>")
     kb=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='✍️ ویرایش نسخه کانال',callback_data='set_editorial_prompt_channel')],
-        [InlineKeyboardButton(text='📝 ویرایش نسخه داخل ربات',callback_data='set_editorial_prompt_article')],
-        [InlineKeyboardButton(text='♻️ پیش‌فرض',callback_data='editorial_prompts_reset')],
+        [InlineKeyboardButton(text='✍️ ویرایش دستور کوتاه',callback_data='set_editorial_prompt_channel')],
+        [InlineKeyboardButton(text='📝 ویرایش دستور کامل',callback_data='set_editorial_prompt_article')],
+        [InlineKeyboardButton(text='♻️ بازگردانی دستور پیش‌فرض',callback_data='editorial_prompts_reset')],
         [InlineKeyboardButton(text='🔙 کیفیت محتوا',callback_data='auto_quality')]
     ])
     await call.message.edit_text(text,parse_mode='HTML',reply_markup=kb); await call.answer()
 
 @router.callback_query(F.data == "editorial_prompts_reset")
 async def editorial_prompts_reset(call: CallbackQuery, db: D1Database):
-    await set_setting(db,'editorial_prompt_channel','فقط محتوای فنی و واقعاً ارزشمند برای مخاطب فناوری و هوش مصنوعی را پوشش بده.')
-    await set_setting(db,'editorial_prompt_article','نسخه کامل باید فنی، غنی و مبتنی بر واقعیت‌های منبع باشد.')
-    await editorial_prompts(call,db)
-
-@router.callback_query(F.data.in_({"set_editorial_prompt_channel","set_editorial_prompt_article"}))
-async def set_editorial_prompt(call: CallbackQuery, state: FSMContext):
-    key="editorial_prompt_channel" if "channel" in call.data else "editorial_prompt_article"
-    target="نسخه کوتاه کانال" if "channel" in call.data else "نسخه بلند ربات"
-    await state.set_state(BotStates.admin_automation_setting)
-    await state.update_data(automation_setting_key=key, panel_message_id=call.message.message_id, parent_callback="editorial_prompts")
-    await call.message.edit_text(f"✍️ پرامپت تحریریه برای {target} را ارسال کنید:\n\nاین متن به هوش مصنوعی می‌گوید چه لحن و دقتی داشته باشد.",reply_markup=get_exit_menu()); await call.answer()
-
-
-@router.callback_query(F.data == "auto_content_db")
-async def auto_content_db(call: CallbackQuery, db: D1Database):
     if call.from_user.id != ADMIN_ID: return
-    a_tot=(await db.execute("SELECT COUNT(*) c FROM articles"))[0].get('c',0)
-    a_rdy=(await db.execute("SELECT COUNT(*) c FROM articles WHERE status='ready'"))[0].get('c',0)
-    a_pub=(await db.execute("SELECT COUNT(*) c FROM articles WHERE status='published'"))[0].get('c',0)
-    text=(f"🗃 <b>مدیریت محتوا و پایگاه داده</b>\n\n"
-          f"مجموع مقالات (صرف‌نظر از انتشار): {a_tot}\n"
-          f"مقالات در نوبت انتشار: {a_rdy}\n"
-          f"مقالات منتشرشده: {a_pub}")
+    await set_setting(db,'editorial_prompt_channel',"فقط محتوای فنی، دقیق و واقعاً ارزشمند برای مخاطب فناوری و هوش مصنوعی را پوشش بده؛ مطالب سطحی، عمومی، کلیشه‌ای و پیش‌پاافتاده را کنار بگذار. خودِ خبر و جزئیات واقعی را بیان کن.")
+    await set_setting(db,'editorial_prompt_article',"مقاله کامل باید فنی، غنی و مبتنی بر اطلاعات واقعی منبع باشد؛ جزئیات، زمینه، نحوه کار، اعداد و اثرات قابل اتکا را توضیح بده. سؤال نساز؛ پاسخ و اطلاعات موجود را مستقیم بیان کن. از کلی‌گویی و قضاوت شخصی پرهیز کن.")
+    await editorial_prompts_panel(call,db)
+
+@router.callback_query(F.data == "set_editorial_prompt_channel")
+async def set_editorial_prompt_channel(call: CallbackQuery, state: FSMContext, db: D1Database):
+    if call.from_user.id != ADMIN_ID: return
+    current=await get_setting(db,"editorial_prompt_channel","")
+    await prompt_for_setting(
+        call,state,"editorial_prompt_channel",
+        "✍️ <b>پرامپت محتوای کوتاه کانال</b>\n\nاین متن فقط مشخص می‌کند چه چیزهایی در نسخه حدود 500 کاراکتری پوشش داده شود؛ Formatting را تغییر نمی‌دهد.\n\nپرامپت جدید را بفرست.\n\nفعلی:\n<code>"+html.escape(current[:1800])+"</code>",
+        "editorial_prompts"
+    )
+
+@router.callback_query(F.data == "set_editorial_prompt_article")
+async def set_editorial_prompt_article(call: CallbackQuery, state: FSMContext, db: D1Database):
+    if call.from_user.id != ADMIN_ID: return
+    current=await get_setting(db,"editorial_prompt_article","")
+    await prompt_for_setting(
+        call,state,"editorial_prompt_article",
+        "📝 <b>پرامپت محتوای کامل داخل ربات</b>\n\nاین متن فقط مشخص می‌کند چه اطلاعاتی در نسخه حدود 2000 کاراکتری پوشش داده شود؛ Formatting و زیبایی متن وظیفه ربات است.\n\nپرامپت جدید را بفرست.\n\nفعلی:\n<code>"+html.escape(current[:1800])+"</code>",
+        "editorial_prompts"
+    )
+
+@router.callback_query(F.data == "weight_global")
+async def set_weight_global(call:CallbackQuery,state:FSMContext):
+    await prompt_for_setting(call,state,"weight_global","🌍 اهمیت جهانی را به عدد 0 تا 100 بفرست.","quality_weights")
+
+@router.callback_query(F.data == "weight_technology")
+async def set_weight_technology(call:CallbackQuery,state:FSMContext):
+    await prompt_for_setting(call,state,"weight_technology","💻 فناوری را به عدد 0 تا 100 بفرست.","quality_weights")
+
+@router.callback_query(F.data == "weight_ai")
+async def set_weight_ai(call:CallbackQuery,state:FSMContext):
+    await prompt_for_setting(call,state,"weight_ai","🤖 هوش مصنوعی را به عدد 0 تا 100 بفرست.","quality_weights")
+
+@router.callback_query(F.data == "weight_cyber")
+async def set_weight_cyber(call:CallbackQuery,state:FSMContext):
+    await prompt_for_setting(call,state,"weight_cyber","🔐 امنیت سایبری را به عدد 0 تا 100 بفرست.","quality_weights")
+
+@router.callback_query(F.data == "weight_education")
+async def set_weight_education(call:CallbackQuery,state:FSMContext):
+    await prompt_for_setting(call,state,"weight_education","📚 آموزش را به عدد 0 تا 100 بفرست.","quality_weights")
+
+@router.callback_query(F.data == "weight_iran")
+async def set_weight_iran(call:CallbackQuery,state:FSMContext):
+    await prompt_for_setting(call,state,"weight_iran","🇮🇷 ارتباط ایران/فارسی را به عدد 0 تا 100 بفرست.","quality_weights")
+
+@router.callback_query(F.data == "weight_freshness")
+async def set_weight_freshness(call:CallbackQuery,state:FSMContext):
+    await prompt_for_setting(call,state,"weight_freshness","🆕 تازگی را به عدد 0 تا 100 بفرست.","quality_weights")
+
+@router.callback_query(F.data == "weight_source")
+async def set_weight_source(call:CallbackQuery,state:FSMContext):
+    await prompt_for_setting(call,state,"weight_source","✅ اعتبار منبع را به عدد 0 تا 100 بفرست.","quality_weights")
+
+@router.callback_query(F.data == "weight_novelty")
+async def set_weight_novelty(call:CallbackQuery,state:FSMContext):
+    await prompt_for_setting(call,state,"weight_novelty","♻️ عدم تکرار را به عدد 0 تا 100 بفرست.","quality_weights")
+
+@router.callback_query(F.data == "quality_weights")
+async def quality_weights(call:CallbackQuery,db:D1Database):
+    await call.answer()
+    items=[("global","🌍 اهمیت جهانی"),("technology","💻 فناوری"),("ai","🤖 هوش مصنوعی"),("cyber","🔐 امنیت سایبری"),("education","📚 آموزش"),("iran","🇮🇷 ایران/فارسی"),("freshness","🆕 تازگی"),("source","✅ اعتبار منبع"),("novelty","♻️ عدم تکرار")]
+    text="🎯 <b>وزن معیارها</b>\nعدد بالاتر = اهمیت بیشتر.\n\n"; rows=[]
+    pairs=[]
+    for k,label in items:
+        text+=f"{label}: <b>{await get_setting(db,'weight_'+k,'10')}</b>\n"; pairs.append((k,label))
+    rows=[]
+    for i in range(0,len(pairs),2):
+        rows.append([InlineKeyboardButton(text=label,callback_data='weight_'+k) for k,label in pairs[i:i+2]])
+    rows.append([InlineKeyboardButton(text="🔙 کیفیت محتوا",callback_data="auto_quality")])
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)); await call.answer()
+
+@router.callback_query(F.data == "auto_schedule")
+async def auto_schedule(call: CallbackQuery, db: D1Database):
+    if call.from_user.id != ADMIN_ID: return
+    await call.answer()
+    text,kb=await get_schedule_panel(db)
+    await call.message.edit_text(text,parse_mode="HTML",reply_markup=kb)
+
+@router.callback_query(F.data == "auto_health")
+async def auto_health(call:CallbackQuery,db:D1Database,bot:Bot):
+    if call.from_user.id!=ADMIN_ID:return
+    await call.answer()
+    channel=await get_channel_id(db)
+    providers=await db.execute("SELECT status,enabled FROM ai_providers")
+    healthy=sum(1 for p in providers if p.get('enabled') and p.get('status')=='healthy')
+    sources=await db.execute("SELECT COUNT(*) c FROM sources WHERE enabled=1")
+    text=(f"🧪 <b>تست و سلامت</b>\n\nD1: {'✅ آماده' if db.session and not db.session.closed else '❌'}\n"
+          f"کانال: {'✅ تنظیم شده' if channel else '❌ تنظیم نشده'}\nمدل سالم: {healthy}/{len(providers)}\n"
+          f"منبع فعال: {sources[0].get('c',0) if sources else 0}\n\nاز اینجا تست‌ها را مرحله‌به‌مرحله اجرا کن.")
     kb=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗑 پاکسازی کل Archive (مخرب)",callback_data="auto_clear_articles")],
-        [InlineKeyboardButton(text="🔙 اتوماسیون محتوا",callback_data="auto_back")]
+        [InlineKeyboardButton(text="🤖 تست مدل‌ها",callback_data="health_test_ai"),InlineKeyboardButton(text="🌐 تست همه منابع",callback_data="health_test_source")],
+        [InlineKeyboardButton(text="🧪 تولید بدون انتشار",callback_data="health_dry_run")],
+        [InlineKeyboardButton(text="▶️ اجرای یک چرخه واقعی",callback_data="health_run_cycle")],
+        [InlineKeyboardButton(text="📢 تست انتشار واقعی",callback_data="health_test_publish")],
+        [InlineKeyboardButton(text="🚦 وضعیت اجرا",callback_data="health_deployment")],
+        [InlineKeyboardButton(text="📜 لاگ اتوماسیون",callback_data="health_logs")],
+        [InlineKeyboardButton(text="🔄 بروزرسانی",callback_data="auto_health"),InlineKeyboardButton(text="🔙 اتوماسیون",callback_data="auto_back")]
     ])
     await call.message.edit_text(text,parse_mode="HTML",reply_markup=kb); await call.answer()
 
-@router.callback_query(F.data == "auto_clear_articles")
-async def auto_clear_articles(call: CallbackQuery, db: D1Database):
-    if call.from_user.id != ADMIN_ID: return
-    kb=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚠️ بله، تمام مقالات و صف‌ها حذف شوند",callback_data="auto_clear_articles_confirm")],
-        [InlineKeyboardButton(text="❌ انصراف",callback_data="auto_content_db")]
-    ])
-    await call.message.edit_text("⚠️ <b>هشدار جدی</b>\nآیا از حذف تمام مقالات تولیدشده، صف‌های انتشار و رهگیری محتوا اطمینان دارید؟",parse_mode="HTML",reply_markup=kb); await call.answer()
+@router.callback_query(F.data == "health_test_ai")
+async def health_test_ai(call:CallbackQuery,db:D1Database):
+    rows=await db.execute("SELECT id,name,model_name,priority,status FROM ai_providers WHERE enabled=1 AND status NOT IN ('cooldown') ORDER BY priority ASC,id ASC LIMIT 8")
+    if not rows:
+        await call.message.edit_text("❌ هیچ مدل فعالی نیست.",reply_markup=get_admin_back_kb("auto_health")); return
+    await call.answer("تست مدل‌ها شروع شد…")
+    await log_automation(db,"INFO","health_test_ai_started","manual AI provider test")
+    await edit_health_progress(call.message,health_progress_block(1,3,"تست مدل‌های AI","هر مدل با درخواست واقعی TEST_OK بررسی می‌شود…"))
+    m=AIProviderManager(db, None); results=[]
+    try:
+        for i,p in enumerate(rows,1):
+            await edit_health_progress(call.message,health_progress_block(2,3,"تست مدل‌های AI",f"در حال تست {i}/{len(rows)}: {p.get('model_name')}…"))
+            result=await m.test_provider(int(p['id']))
+            if result.get('ok'):
+                results.append(f"✅ {html.escape(str(p.get('model_name')))} · {result.get('latency_ms',0)}ms")
+            else:
+                results.append(f"❌ {html.escape(str(p.get('model_name')))}\n<code>{html.escape(str(result.get('error','unknown'))[:650])}</code>")
+    finally: await m.close()
+    await log_automation(db,"INFO","health_test_ai_finished",f"providers={len(rows)}")
+    await edit_health_progress(call.message,"🧪 <b>نتیجه تست مدل‌های AI</b>\n\n"+"\n".join(results), get_admin_back_kb("auto_health")); await call.answer()
 
-@router.callback_query(F.data == "auto_clear_articles_confirm")
-async def auto_clear_articles_confirm(call: CallbackQuery, db: D1Database):
-    if call.from_user.id != ADMIN_ID: return
-    await db.execute_batch([
-        {"sql":"DELETE FROM publication_queue"},
-        {"sql":"DELETE FROM articles"},
-        {"sql":"DELETE FROM source_items"}
-    ])
-    await call.answer("پاکسازی انجام شد",show_alert=True)
-    await auto_content_db(call,db)
+@router.callback_query(F.data == "health_test_source")
+async def health_test_source(call:CallbackQuery,db:D1Database,bot:Bot):
+    rows=await db.execute("SELECT * FROM sources ORDER BY priority ASC,id ASC")
+    if not rows:
+        await call.message.edit_text("❌ هیچ منبعی ثبت نشده است.",reply_markup=get_admin_back_kb("auto_health")); return
+    await call.answer("تست همه منابع شروع شد…")
+    await log_automation(db,"INFO","health_test_sources_started",f"sources={len(rows)}")
+    await edit_health_progress(call.message,health_progress_block(0,max(1,len(rows)),"تست همه منابع","در حال بررسی واقعی هر منبع…"))
+    ai=AIProviderManager(db,bot); results=[]
+    try:
+        for i,src in enumerate(rows,1):
+            await edit_health_progress(call.message,health_progress_block(i,len(rows),"تست همه منابع",f"🌐 {i}/{len(rows)} · {src.get('name')} → کشف"))
+            try:
+                r=await discover_for_processing(db,src,ai,allow_scout=False,include_old=False,advance_cursor=False)
+                found=int(r.get('direct_count',0) or 0)
+                fresh=int(r.get('fresh_count',0) or 0)
+                new_count=int(r.get('new_count',0) or 0)
+                method=r.get('method') or 'مستقیم'
+                if new_count:
+                    marker='🟢 آماده بررسی'
+                elif fresh:
+                    marker='🟡 تازه هست، قبلاً دیده شده'
+                elif found:
+                    marker='🟠 محتوا هست، ولی تازه نیست'
+                else:
+                    marker='🔴 دریافت نشد'
+                results.append(f"{marker} · {src.get('name')}: پیدا {found} · تازه‌۲۴ساعت {fresh} · جدید {new_count} · مسیر {method}")
+            except Exception as e:
+                results.append(f"❌ {src.get('name')}: {html.escape(str(e)[:180])}")
+    finally: await ai.close()
+    await log_automation(db,"INFO","health_test_sources_finished",f"sources={len(rows)}")
+    await edit_health_progress(call.message,"🧪 <b>نتیجه تست همه منابع</b>\n\n"+"\n".join(results)+"\n\n🟢 قابل بررسی = محتوای تازه پیدا شد\n🟡 = سایت پاسخ داد ولی گزینه تازه/جدید نداریم\n🔴 = دریافت مستقیم محتوا موفق نشد", get_admin_back_kb("auto_health")); await call.answer()
 
-@router.callback_query(F.data == "auto_health")
-async def auto_health(call: CallbackQuery, db: D1Database, bot: Bot):
-    if call.from_user.id != ADMIN_ID: return
-    logs = await db.execute("SELECT * FROM automation_logs ORDER BY id DESC LIMIT 5")
-    channel_id = await get_channel_id(db)
-    channel_ok = False
-    if channel_id:
+async def edit_health_progress(message: Message, text: str, reply_markup=None):
+    try:
+        await message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    except Exception:
+        pass
+
+def health_progress_block(stage: int, total: int, title: str, detail: str = "") -> str:
+    total=max(1,total); filled=max(0,min(total,stage)); bar="█"*filled+"░"*(total-filled); pct=int((filled/total)*100)
+    return f"🧪 <b>{html.escape(title)}</b>\n\n<code>{bar}</code> {pct}%\n{html.escape(detail)}\n\n⏳ لطفاً منتظر بمان؛ نتیجه نهایی همین پیام نمایش داده می‌شود."
+
+async def choose_test_candidate(db, ai, progress=None):
+    """Find a fresh test item source-by-source, with visible failover diagnostics.
+    Manual tests bypass the source cursor/retry cooldown so a rejected recent article can be retested
+    after the manager changes criteria. Freshness allows the last 24 hours; the first 6 hours are prioritized.
+    """
+    rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC")
+    recent_tested_hashes={str(r.get('content_hash') or '') for r in await db.execute("SELECT content_hash FROM test_history ORDER BY id DESC LIMIT 200") if r.get('content_hash')}
+    recent_article_rows=await db.execute("SELECT source_url,body,title FROM articles WHERE status IN ('published','ready','test') ORDER BY id DESC LIMIT 300")
+    recent_article_urls={normalize_url(r.get('source_url') or '') for r in recent_article_rows if r.get('source_url')}
+    recent_article_hashes={text_hash(str(r.get('title') or '')+' '+str(r.get('body') or '')) for r in recent_article_rows}
+    diagnostics=[]
+    total=len(rows)
+    for idx,src in enumerate(rows,1):
+        name=str(src.get('name') or src.get('url') or f'منبع {idx}') + (" · خاموش" if not src.get("enabled") else "")
         try:
-            member = await bot.get_chat_member(channel_id, (await bot.get_me()).id)
-            channel_ok = getattr(member, "can_post_messages", False)
-        except Exception:
-            channel_ok = False
+            if progress: await progress(f"🌐 {idx}/{total} · {name} → کشف مستقیم")
+            r=await discover_for_processing(db,src,ai,allow_scout=False,include_old=True)
+            raw_items=list(r.get('items') or [])
+            method=r.get('method') or 'مستقیم'
+            if progress: await progress(f"🌐 {idx}/{total} · {name} → {len(raw_items)} گزینه ({method})")
+            priority_hours=float(await get_setting(db,'news_priority_hours',str(NEWS_PRIORITY_HOURS)) or NEWS_PRIORITY_HOURS)
+            def _test_sort_key(x):
+                dt=parse_publication_datetime(x.get('published_at') or '')
+                if not dt: return (1, 0)
+                age=(datetime.now(timezone.utc)-dt).total_seconds()/3600.0
+                return (0 if age <= priority_hours else 1, -dt.timestamp())
+            items=sorted(raw_items,key=_test_sort_key)
+            if not items and progress: await progress(f"🌐 {idx}/{total} · {name} → رد شد؛ مورد تازه‌ای پیدا نشد")
+            for c in items:
+                c=await enrich_candidate_content(dict(c))
+                fresh_ok,fresh_reason,_=candidate_is_fresh(c)
+                if not fresh_ok:
+                    continue
+                # Re-check paywall before test
+                insufficient, reason = is_insufficient_content(c.get('title',''), c.get('body',''), c.get('description',''))
+                if insufficient:
+                    continue
+                body=(c.get('body') or c.get('description') or '').strip(); url=normalize_url(c.get('url') or '')
+                chash=text_hash((c.get('title') or '')+' '+body)
+                if len(body)<20 or not url or url in recent_article_urls or chash in recent_tested_hashes or chash in recent_article_hashes:
+                    continue
+                c['_test_hash']=chash
+                if progress: await progress(f"✅ {idx}/{total} · {name} → گزینه تازه پیدا شد")
+                return src,c
+            diagnostics.append(f"{name}: مورد تازه/جدیدِ قابل تست نداشت")
+            if progress: await progress(f"➡️ {idx}/{total} · {name} → رد شد؛ رفتیم سراغ منبع بعدی")
+        except Exception as exc:
+            msg=f"{type(exc).__name__}: {str(exc)[:120]}"
+            diagnostics.append(f"{name}: {msg}")
+            if progress: await progress(f"⚠️ {idx}/{total} · {name} → خطا؛ منبع بعدی")
+            continue
+    try: await log_automation(db,'WARN','test_candidate_exhausted',' | '.join(diagnostics)[:1800])
+    except Exception: pass
+    return None,None
 
-    tehran = datetime.now(pytz.timezone("Asia/Tehran")).isoformat()
-    text = f"🧪 <b>وضعیت سلامت هسته</b>\n\nزمان سرور: <code>{tehran}</code>\nدسترسی کانال: {'✅' if channel_ok else '🔴'}\n\n<b>آخرین رویدادها:</b>\n"
-    if not logs:
-        text += "لاگی موجود نیست."
+
+@router.callback_query(F.data == "health_dry_run")
+async def health_dry_run(call:CallbackQuery,db:D1Database,bot:Bot):
+    if call.from_user.id!=ADMIN_ID:return
+    await call.answer("تست تولید شروع شد…")
+    await edit_health_progress(call.message,health_progress_block(1,6,"تست تولید بدون انتشار شروع شد","یک Candidate واقعی از بین منابع انتخاب می‌شود؛ محتوای ثابت استفاده نمی‌شود."))
+    ai=AIProviderManager(db,bot)
+    try:
+        src,item=await choose_test_candidate(db,ai,lambda detail: edit_health_progress(call.message,health_progress_block(2,6,'تست تولید بدون انتشار',detail)))
+        if not item:
+            await edit_health_progress(call.message,"❌ <b>هیچ گزینه محتوای تازه‌ای برای تست پیدا نشد.</b>\n\nهمه منابع به‌ترتیب بررسی شدند.", get_admin_back_kb("auto_health")); return
+        await edit_health_progress(call.message,health_progress_block(2,6,"محتوا پیدا شد",f"منبع: {src.get('name')}\nعنوان: {item.get('title')[:180]}"))
+        test_hash=item.get('_test_hash') or text_hash((item.get('title') or '')+' '+(item.get('body') or item.get('description') or ''))
+        await db.execute("INSERT INTO test_history(source_url,content_hash,title,tested_at) VALUES(?,?,?,?)",[item.get('url') or '',test_hash,item.get('title') or '',datetime.now(timezone.utc).isoformat()])
+        weights={k:float(await get_setting(db,'weight_'+k,'10')) for k in ['global','technology','ai','cyber','education','iran','freshness','source','novelty']}
+        out=await ai_editorial_process(ai,item,src,[],weights,await get_manager_editorial_prompts(db))
+        if out.get('error'):
+            await edit_health_progress(call.message,"❌ <b>تست تولید شکست خورد</b>\n\n<code>"+html.escape(str(out['error'])[:1800])+"</code>", get_admin_back_kb("auto_health")); return
+        min_score=float(await get_setting(db,'min_content_score',str(DEFAULT_MIN_CONTENT_SCORE)))
+        if float(out.get('score',0) or 0) < min_score:
+            await edit_health_progress(call.message,f"⚠️ <b>این گزینه زیر حداقل امتیاز مدیر بود.</b>\n\nامتیاز: <b>{out.get('score','-')}</b> · حد مدیر: <b>{min_score:g}</b>\nدلیل: {html.escape(str(out.get('why','-'))[:800])}", get_admin_back_kb("auto_health")); return
+        await edit_health_progress(call.message,health_progress_block(4,6,"محتوا تولید شد","در حال بررسی Formatting و طول متن…"))
+        ch=ensure_rich_channel_format(str(out.get('title') or item.get('title') or 'مطلب'), out.get('channel_html') or out.get('channel_text') or item.get('body') or item.get('description') or '', str(out.get('category') or src.get('category') or 'tech'))
+        ar=ensure_rich_article_format(str(out.get('title') or item.get('title') or 'مطلب'), out.get('article_html') or out.get('article_text') or item.get('body') or item.get('description') or '', item.get('url') or '')
+        await edit_health_progress(call.message,health_progress_block(5,6,"قالب و محتوا آماده شد","عکس منبع و Deep Link آزمایشی نیز بررسی می‌شوند."))
+        ai_info=out.get('ai') or {}
+        msg=("✅ <b>تست تولید واقعی موفق شد.</b>\n\n"
+             f"🌐 منبع: <b>{html.escape(str(src.get('name')))}</b>\n"
+             f"📰 عنوان: <b>{html.escape(str(out.get('title') or item.get('title')))}</b>\n"
+             f"🤖 مدل: <code>{html.escape(str(ai_info.get('model') or '-'))}</code>\n"
+             f"📊 امتیاز: <b>{out.get('score','-')}</b>\n\n"
+             "<b>📝 کانال:</b>\n"+ch[:1500]+"\n\n<b>📖 مقاله:</b>\n"+ar[:4200]+"\n\n"
+             "🚫 <b>انتشار انجام نشد.</b> این همان موتور تولید واقعی بود اما در حالت تست.")
+        await edit_health_progress(call.message,msg, get_admin_back_kb("auto_health"))
+    except Exception as e:
+        logger.exception('health dry run failed')
+        await edit_health_progress(call.message,"❌ <b>تست تولید شکست خورد</b>\n\n<code>"+html.escape(str(e)[:2500])+"</code>", get_admin_back_kb("auto_health"))
+    finally: await ai.close()
+
+def make_health_png(width=1280,height=720):
+    row=bytearray()
+    for x in range(width):
+        t=x/(width-1); row.extend((int(16+24*t),int(22+36*t),int(48+78*t)))
+    raw=bytearray()
+    for _ in range(height): raw.append(0); raw.extend(row)
+    def chunk(tag,data): return struct.pack('>I',len(data))+tag+data+struct.pack('>I',zlib.crc32(tag+data)&0xffffffff)
+    return b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',width,height,8,2,0,0,0))+chunk(b'IDAT',zlib.compress(bytes(raw),9))+chunk(b'IEND',b'')
+
+@router.callback_query(F.data == "health_run_cycle")
+async def health_run_cycle(call:CallbackQuery,db:D1Database,bot:Bot):
+    if call.from_user.id!=ADMIN_ID:return
+    await call.answer('چرخه واقعی شروع شد؛ این بار واقعاً منابع و AI را اجرا می‌کنم…')
+    await log_automation(db,"INFO","real_cycle_started","manual real pipeline test")
+    ai=AIProviderManager(db,bot); rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC")
+    await edit_health_progress(call.message,health_progress_block(0,max(1,len(rows)),'▶️ اجرای یک چرخه واقعی','این همان Pipeline اتوماتیک است؛ داده ساختگی استفاده نمی‌شود.'))
+    results=[]
+    try:
+        total=len(rows)
+        for i,src in enumerate(rows,1):
+            name=str(src.get('name') or src.get('url') or f'منبع {i}')
+            await edit_health_progress(call.message,health_progress_block(i-1,max(1,total),'▶️ اجرای یک چرخه واقعی',f'🌐 {i}/{total} · {name} → در حال بررسی عمیق…'))
+            await log_automation(db,'INFO','source_check_started',f'{i}/{total} · {name} → شروع بررسی')
+            try:
+                r=await fetch_source_cycle(db,src,ai)
+                results.append(r)
+                await log_automation(db,'INFO','source_check_result',f'{i}/{total} · {name} → پیدا {r.get("found",0)} · تازه {r.get("candidates",0)} · AI {r.get("processed",0)} · صف {r.get("queued",0)} · رد {r.get("rejected",0)} · خطا {r.get("errors",0)}')
+                await edit_health_progress(call.message,health_progress_block(i,max(1,total),'▶️ اجرای یک چرخه واقعی',f'🌐 {i}/{total} · {name} → پایان: پیدا {r.get("found",0)} | تازه {r.get("candidates",0)} | صف {r.get("queued",0)}'))
+            except Exception as exc:
+                r={'errors':1,'found':0,'candidates':0,'processed':0,'queued':0,'rejected':0}
+                results.append(r)
+                await log_automation(db,'ERROR','source_check_result',f'{i}/{total} · {name} → خطا: {type(exc).__name__}: {str(exc)[:180]}')
+                await edit_health_progress(call.message,health_progress_block(i,max(1,total),'▶️ اجرای یک چرخه واقعی',f'🌐 {i}/{total} · {name} → خطا؛ منبع بعدی'))
+        published=await publish_next_article(db,bot)
+        total_found=sum((r.get('found',0) if isinstance(r,dict) else 0) for r in results)
+        total_new=sum((r.get('candidates',0) if isinstance(r,dict) else 0) for r in results)
+        total_processed=sum((r.get('processed',0) if isinstance(r,dict) else 0) for r in results)
+        total_queued=sum((r.get('queued',0) if isinstance(r,dict) else 0) for r in results)
+        q=await db.execute("SELECT COUNT(*) c FROM publication_queue WHERE status='queued'")
+        await log_automation(db,"INFO","real_cycle_finished",json.dumps({"sources":len(rows),"processed":total_processed,"queued":total_queued,"published":bool(published)},ensure_ascii=False))
+        total_rejected=sum((r.get('rejected',0) if isinstance(r,dict) else 0) for r in results)
+        total_errors=sum((r.get('errors',0) if isinstance(r,dict) else 0) for r in results)
+        detail = ('✅ بله' if published else '⏸ خیر')
+        summary_text=(f"✅ <b>چرخه واقعی کامل شد.</b>\n\n"
+                     f"🌐 منابع بررسی‌شده: <b>{len(rows)}</b>\n"
+                     f"📰 مواردی که منبع برگرداند: <b>{total_found}</b>\n"
+                     f"🆕 گزینه‌های تازه/جدید: <b>{total_new}</b>\n"
+                     f"🤖 ارسال‌شده به AI: <b>{total_processed}</b>\n"
+                     f"✅ پذیرفته‌شده: <b>{total_queued}</b>\n"
+                     f"🚫 ردشده: <b>{total_rejected}</b>\n"
+                     f"❌ خطا: <b>{total_errors}</b>\n"
+                     f"📦 صف فعلی: <b>{q[0].get('c',0) if q else 0}</b>\n"
+                     f"📢 انتشار همین چرخه: <b>{detail}</b>\n\n"
+                     "ℹ️ این چرخه همان کاری را اجرا می‌کند که Worker خودکار انجام می‌دهد:\n"
+                     "کشف → تازه/جدید → AI → امتیاز مدیر → تولید → صف → انتشار بر اساس برنامه.")
+        await edit_health_progress(call.message,summary_text, get_admin_back_kb("auto_health"))
+    except Exception as e:
+        logger.exception('health run cycle failed')
+        await edit_health_progress(call.message,"❌ <b>اجرای چرخه شکست خورد</b>\n\n<code>"+html.escape(str(e)[:2500])+"</code>", get_admin_back_kb("auto_health"))
+    finally: await ai.close()
+
+@router.callback_query(F.data == "health_test_publish")
+async def health_test_publish(call:CallbackQuery,db:D1Database,bot:Bot):
+    if call.from_user.id!=ADMIN_ID:return
+    channel=await get_channel_id(db)
+    if not channel:
+        await call.message.edit_text("❌ <b>کانال تنظیم نشده است.</b>",parse_mode='HTML',reply_markup=get_admin_back_kb('auto_health')); return
+    await call.answer('تست انتشار واقعی شروع شد…')
+    await edit_health_progress(call.message,health_progress_block(1,6,'📢 تست انتشار واقعی','یک گزینه محتوای تازه از منابع واقعی گرفته و با AI تولید می‌شود؛ متن ثابت استفاده نمی‌شود.'))
+    ai=AIProviderManager(db,bot)
+    try:
+        src,item=await choose_test_candidate(db,ai,lambda detail: edit_health_progress(call.message,health_progress_block(2,6,'📢 تست انتشار واقعی',detail)))
+        if not item: raise RuntimeError('هیچ گزینه محتوای تازه‌ای برای تست انتشار پیدا نشد.')
+        await edit_health_progress(call.message,health_progress_block(2,6,'Candidate واقعی پیدا شد',f"منبع: {src.get('name')}\n{item.get('title')[:180]}"))
+        test_hash=item.get('_test_hash') or text_hash((item.get('title') or '')+' '+(item.get('body') or item.get('description') or ''))
+        await db.execute("INSERT INTO test_history(source_url,content_hash,title,tested_at) VALUES(?,?,?,?)",[item.get('url') or '',test_hash,item.get('title') or '',datetime.now(timezone.utc).isoformat()])
+        weights={k:float(await get_setting(db,'weight_'+k,'10')) for k in ['global','technology','ai','cyber','education','iran','freshness','source','novelty']}
+        out=await ai_editorial_process(ai,item,src,[],weights,await get_manager_editorial_prompts(db))
+        if out.get('error'): raise RuntimeError(out['error'])
+        # Test publication obeys only the manager's numeric threshold.
+        min_score=float(await get_setting(db,'min_content_score',str(DEFAULT_MIN_CONTENT_SCORE)))
+        if not manager_accepts_score(float(out.get('score',0) or 0), min_score):
+            raise RuntimeError(f"امتیاز {out.get('score','-')} با حد مدیر {min_score:g} و دامنه انعطاف {MANAGER_SCORE_TOLERANCE:g} همخوان نیست")
+        ch=sanitize_telegram_html(out.get('channel_html') or out.get('channel_text') or '')
+        ar=sanitize_telegram_html(out.get('article_html') or out.get('article_text') or '')
+        ar=append_resource_links(ar,out.get('resource_links'),item.get('url') or '')
+        ar=remove_article_metadata_blocks(ar)
+        await edit_health_progress(call.message,health_progress_block(3,6,'محتوا و Formatting آماده شد','در حال ذخیره مقاله تست و ساخت Deep Link…'))
+        now=datetime.now(timezone.utc).isoformat()
+        ins=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at,source_published_at) VALUES(NULL,?,?,?,?,?,?,?,'test',?,?) RETURNING id",
+            [out.get('title') or item.get('title') or 'Test',ch,ar,item.get('url') or '','', 'test',float(out.get('score') or 0),now,item.get('published_at','')[:100]])
+        aid=int(ins[0]['id']) if ins else 0
+        token=make_deep_token(aid); await db.execute('UPDATE articles SET deep_token=? WHERE id=?',[token,aid])
+        username=await get_runtime_bot_username(bot)
+        if not username: raise RuntimeError('Username ربات پیدا نشد.')
+        deep=f'https://t.me/{username}?start=article_{token}'
+        await edit_health_progress(call.message,health_progress_block(4,6,'Deep Link آماده شد','ارسال همان محتوای تولیدشده به کانال…'))
+        channel_html=sanitize_telegram_html(ch)
+        photo=item.get('image_url') or ''
+        sent=None
+        if photo:
+            try: sent=await bot.send_photo(channel,photo=photo,caption=publication_caption(str(out.get('title') or item.get('title') or 'مطلب'),channel_html,deep),parse_mode='HTML')
+            except Exception: sent=None
+        if sent is None:
+            final_text=sanitize_telegram_html(channel_html + f"\n\n<a href=\"{html.escape(deep,quote=True)}\">📖 بیشتر بخوانید</a>")
+            sent=await bot.send_message(channel,text=final_text[:4096],parse_mode='HTML',disable_web_page_preview=True)
+        await db.execute("UPDATE articles SET published_message_id=?,published_at=? WHERE id=?",[getattr(sent,'message_id',0),now,aid])
+        await edit_health_progress(call.message,health_progress_block(5,6,'✅ انتشار انجام شد','در حال نهایی‌کردن نتیجه و لینک تست…'))
+        result=("✅ <b>تست انتشار واقعی موفق شد.</b>\n\n"
+                f"🌐 منبع: <b>{html.escape(str(src.get('name')))}</b>\n"
+                f"📰 عنوان: <b>{html.escape(str(out.get('title') or item.get('title')))}</b>\n"
+                f"🤖 مدل: <code>{html.escape(str((out.get('ai') or {}).get('model') or '-'))}</code>\n"
+                f"📢 Message ID: <code>{getattr(sent,'message_id',0)}</code>\n"
+                f"🔗 <a href=\"{html.escape(deep,quote=True)}\">📖 باز کردن ادامه مطلب تست</a>")
+        await edit_health_progress(call.message,result, get_admin_back_kb("auto_health"))
+    except Exception as e:
+        logger.exception('real publish test failed')
+        await edit_health_progress(call.message,'❌ <b>تست انتشار واقعی شکست خورد</b>\n\n<code>'+html.escape(str(e)[:2500])+'</code>', get_admin_back_kb("auto_health"))
+    finally: await ai.close()
+
+@router.callback_query(F.data == "health_deployment")
+async def health_deployment(call:CallbackQuery,db:D1Database):
+    if call.from_user.id!=ADMIN_ID:return
+    await call.answer()
+    hb=await get_setting(db,'worker_heartbeat_at',''); started=await get_setting(db,'worker_started_at',''); cycle=await get_setting(db,'last_cycle_finished_at','')
+    now=datetime.now(timezone.utc); hb_age=None
+    if hb:
+        try: hb_age=int((now-datetime.fromisoformat(hb.replace('Z','+00:00'))).total_seconds())
+        except Exception: hb_age=None
+    alive=hb_age is not None and hb_age<180
+    text=(f"🚦 <b>وضعیت اجرا / Deployment</b>\n\n📦 نسخه: <code>{BUILD_VERSION}</code>\n"
+          f"🤖 Worker: {'🟢 زنده' if alive else '🔴 Heartbeat دریافت نمی‌شود'}\n"
+          f"⚙️ اتوماسیون: {'🟢 فعال' if await get_setting(db,'automation_enabled','0')=='1' else '🔴 خاموش'}\n"
+          f"💓 آخرین Heartbeat: {(str(hb_age)+' ثانیه قبل') if hb_age is not None else 'نداریم'}\n"
+          f"🚀 Worker شروع شد: {started or 'نامشخص'}\n🔄 آخرین چرخه: {cycle or 'هنوز اجرا نشده'}")
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=get_admin_back_kb('auto_health')); await call.answer()
+
+@router.callback_query(F.data == "health_logs")
+async def health_logs(call:CallbackQuery,db:D1Database):
+    await call.answer()
+    rows=await db.execute("SELECT level,event,details,created_at FROM automation_logs ORDER BY id DESC LIMIT 20")
+    names={"source_check_started":"شروع بررسی منبع","source_check_result":"نتیجه منبع","source_cycle":"چرخه منبع","source_cycle_failed":"خطای منبع","real_cycle_started":"شروع چرخه واقعی","real_cycle_finished":"پایان چرخه واقعی","publication_failed":"خطای انتشار","published":"انتشار موفق","test_candidate_exhausted":"پایان جستجوی گزینه تست","health_test_sources_started":"شروع تست منابع","health_test_sources_finished":"پایان تست منابع"}
+    text='📜 <b>لاگ کوتاه و زنده اتوماسیون</b>\n\n'
+    if not rows: text+='هنوز لاگی ثبت نشده است.'
     else:
-        for r in logs:
-            level = "🔴" if r["level"] == "ERROR" else "🟡" if r["level"] == "WARN" else "🟢"
-            text += f"{level} {r['event_type']} - <code>{html.escape(r.get('details','')[:100])}</code>\n"
-    
-    await call.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 تازه‌سازی", callback_data="auto_health")], [InlineKeyboardButton(text="🔙 اتوماسیون محتوا", callback_data="auto_back")]]))
+        for r in rows:
+            ev=str(r.get('event') or '')
+            label=names.get(ev,ev)
+            tm=html.escape(str(r.get('created_at') or ''))[11:19]
+            detail=html.escape(str(r.get('details') or '')[:420])
+            text+=f"<b>{tm} · {html.escape(label)}</b>\n{detail}\n\n"
+    await call.message.edit_text(text[:4000],parse_mode='HTML',reply_markup=get_admin_back_kb('auto_health')); await call.answer()
 
-# ============================================================
-# هندلرهای محتوای اصلی و تعامل کاربران (لایک، دیس‌لایک، سیو، فولدربندی)
-# ============================================================
-@router.callback_query(F.data.startswith("usave_"))
-async def user_save_to_folder(call: CallbackQuery, db: D1Database):
-    parts = call.data.split("_")
-    content_type = parts[1]
-    content_id = int(parts[2])
-    folder = parts[3]
-    user_id = call.from_user.id
-    
-    rows = await db.execute("SELECT * FROM user_content_saves WHERE user_id = ? AND content_type = ? AND content_id = ?", [user_id, content_type, content_id])
-    if rows:
-        await db.execute("UPDATE user_content_saves SET folder = ? WHERE user_id = ? AND content_type = ? AND content_id = ?", [folder, user_id, content_type, content_id])
-        await call.answer(f"✅ به پوشه {FOLDER_NAMES.get(folder, folder)} منتقل شد", show_alert=True)
-    else:
-        await db.execute("INSERT INTO user_content_saves(user_id, content_type, content_id, folder) VALUES(?, ?, ?, ?)", [user_id, content_type, content_id, folder])
-        await call.answer(f"✅ در پوشه {FOLDER_NAMES.get(folder, folder)} ذخیره شد", show_alert=True)
-        
-    if content_type == "post":
-        post_rows = await db.execute("SELECT likes, dislikes FROM posts WHERE id = ?", [content_id])
-        if post_rows:
-            kb = get_post_inline_kb(content_id, post_rows[0].get("likes", 0), post_rows[0].get("dislikes", 0), True)
-            try: await call.message.edit_reply_markup(reply_markup=kb)
-            except Exception: pass
-    elif content_type == "article":
-        like_rows = await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='like'", [content_id])
-        dislike_rows = await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='dislike'", [content_id])
-        kb = get_article_inline_kb(content_id, like_rows[0].get('c', 0) if like_rows else 0, dislike_rows[0].get('c', 0) if dislike_rows else 0, True)
-        try: await call.message.edit_reply_markup(reply_markup=kb)
-        except Exception: pass
 
-@router.callback_query(F.data.startswith("save_"))
-async def post_save(call: CallbackQuery):
-    post_id = int(call.data.split("_")[1])
-    await call.message.edit_reply_markup(reply_markup=get_save_to_folder_kb("post", post_id))
+@router.callback_query(F.data == "auto_settings")
+async def auto_settings_legacy(call: CallbackQuery, db: D1Database):
+    # سازگاری با callbackهای قدیمی؛ به برنامه انتشار هدایت می‌شود.
+    await auto_schedule(call, db)
+
+def current_automation_parent(call: CallbackQuery, fallback: str = "auto_channel") -> str:
+    return fallback
+
+async def prompt_for_setting(call: CallbackQuery, state: FSMContext, key: str, label: str, parent: str = "auto_schedule"):
+    await state.set_state(BotStates.admin_automation_setting)
+    await state.update_data(automation_setting_key=key, panel_message_id=call.message.message_id, parent_callback=parent)
+    await call.message.edit_text(label, parse_mode="HTML", reply_markup=get_exit_menu())
     await call.answer()
 
-@router.callback_query(F.data.startswith("unsave_"))
-async def post_unsave(call: CallbackQuery, db: D1Database):
-    post_id = int(call.data.split("_")[1])
-    user_id = call.from_user.id
-    await db.execute("DELETE FROM user_content_saves WHERE user_id = ? AND content_type = 'post' AND content_id = ?", [user_id, post_id])
-    post_rows = await db.execute("SELECT likes, dislikes FROM posts WHERE id = ?", [post_id])
-    if post_rows:
-        kb = get_post_inline_kb(post_id, post_rows[0].get("likes", 0), post_rows[0].get("dislikes", 0), False)
-        try: await call.message.edit_reply_markup(reply_markup=kb)
+
+@router.callback_query(F.data == "set_max_daily")
+async def set_max_daily(call: CallbackQuery, state: FSMContext, db: D1Database):
+    current=await get_setting(db,"max_daily_posts",str(DEFAULT_MAX_DAILY_POSTS))
+    await prompt_for_setting(call, state, "max_daily_posts", f"🔢 <b>سقف تقریبی پست روزانه</b> را به عدد بفرست.\nفعلاً روی <b>{html.escape(current)}</b> پست است.", "auto_channel")
+@router.callback_query(F.data == "set_min_score")
+async def set_min_score(call: CallbackQuery, state: FSMContext):
+    await prompt_for_setting(call, state, "min_content_score", "⭐ حداقل امتیاز انتشار را بین 0 تا 100 بفرست. پیشنهاد: 75", "auto_quality")
+
+@router.callback_query(F.data == "set_min_gap")
+async def set_min_gap(call: CallbackQuery, state: FSMContext, db: D1Database):
+    current=await get_setting(db,"min_post_gap_minutes",str(DEFAULT_MIN_POST_GAP_MINUTES))
+    await prompt_for_setting(call, state, "min_post_gap_minutes", f"⏱ <b>حداقل فاصله بین دو پست</b> را بر حسب دقیقه بفرست.\nفعلاً روی <b>{format_duration_minutes(current)}</b> است.\nمثال: <code>30</code> یعنی هر ۳۰ دقیقه و <code>120</code> یعنی هر ۲ ساعت.", "auto_channel")
+@router.callback_query(F.data == "set_default_interval")
+async def set_default_interval(call: CallbackQuery, state: FSMContext, db: D1Database):
+    current=await get_setting(db,"default_source_interval",str(DEFAULT_SOURCE_INTERVAL_MINUTES))
+    await prompt_for_setting(call, state, "default_source_interval", f"🌐 <b>فاصله بررسی پیش‌فرض منابع</b> را بر حسب دقیقه بفرست.\nفعلاً روی <b>{html.escape(current)}</b> دقیقه است.\nمثال: <code>1</code> یعنی هر دقیقه.", "auto_channel")
+@router.callback_query(F.data == "set_workers")
+async def set_workers(call: CallbackQuery, state: FSMContext, db: D1Database):
+    current=await get_setting(db,"max_workers",str(DEFAULT_MAX_WORKERS))
+    await prompt_for_setting(call, state, "max_workers", f"⚡ تعداد Workerهای همزمان را بین 1 تا 4 بفرست.\nفعلاً روی <b>{html.escape(current)}</b> است.", "auto_channel")
+@router.callback_query(F.data == "set_ai_workers")
+async def set_ai_workers(call: CallbackQuery, state: FSMContext, db: D1Database):
+    current=await get_setting(db,"max_ai_workers",str(DEFAULT_MAX_AI_WORKERS))
+    await prompt_for_setting(call, state, "max_ai_workers", f"🧠 تعداد درخواست‌های همزمان AI را بین 1 تا 4 بفرست.\nفعلاً روی <b>{html.escape(current)}</b> است.", "auto_channel")
+@router.callback_query(F.data == "set_ai_verify")
+async def set_ai_verify(call:CallbackQuery,state:FSMContext):
+    await prompt_for_setting(call,state,"ai_verify_mode","🛡 حالت راستی‌آزمایی را بفرست:\nauto = فقط موارد حساس\nalways = همیشه\noff = خاموش","auto_quality")
+
+async def next_publication_estimate(db:D1Database)->Dict[str,Any]:
+    now=datetime.now(timezone.utc)
+    last_manual=await get_setting(db,"last_manual_channel_post_at","")
+    last_pub=await db.execute("SELECT published_at FROM publication_queue WHERE status='published' AND published_at IS NOT NULL ORDER BY id DESC LIMIT 1")
+    candidates=[x for x in [last_manual, last_pub[0].get("published_at") if last_pub else ""] if x]
+    latest=None
+    for raw in candidates:
+        try:
+            dt=datetime.fromisoformat(str(raw).replace("Z","+00:00"))
+            if latest is None or dt>latest: latest=dt
         except Exception: pass
-    await call.answer("❌ از ذخیره‌ها حذف شد", show_alert=True)
+    interval_minutes=float(await get_setting(db,"min_post_gap_minutes",str(DEFAULT_MIN_POST_GAP_MINUTES)))
+    target=max(now, latest+timedelta(minutes=interval_minutes) if latest else now)
+    queued=await db.execute("SELECT COUNT(*) c FROM publication_queue WHERE status='queued'")
+    return {"target":target,"minutes":max(0,int((target-now).total_seconds()/60)) if target>now else 0,"latest":latest,"interval_minutes":int(interval_minutes),"queued":int(queued[0].get('c',0)) if queued else 0}
+
+@router.callback_query(F.data == "auto_publish_now")
+async def auto_publish_now(call:CallbackQuery,db:D1Database,bot:Bot):
+    if call.from_user.id!=ADMIN_ID: return
+    try:
+        ok=await publish_next_article(db,bot,force=True)
+        msg="✅ اولین محتوای صف همین حالا منتشر شد." if ok else "⚠️ محتوای آماده‌ای برای انتشار فوری پیدا نشد یا سقف روزانه تکمیل شده است."
+    except Exception as e:
+        msg="❌ انتشار فوری شکست خورد:\n"+html.escape(str(e)[:1200])
+    await call.message.edit_text(msg,parse_mode="HTML",reply_markup=get_admin_back_kb("auto_queue")); await call.answer()
+
+@router.callback_query(F.data == "auto_queue")
+async def auto_queue(call: CallbackQuery, db: D1Database):
+    await call.answer()
+    est=await next_publication_estimate(db)
+    rows=await db.execute("SELECT q.id,q.article_id,q.status,q.attempts,a.title,a.score,a.category,a.deep_views FROM publication_queue q JOIN articles a ON a.id=q.article_id WHERE q.status='queued' ORDER BY COALESCE(a.source_published_at,a.created_at) DESC, a.score DESC, q.created_at ASC LIMIT 20")
+    last_txt=est['latest'].astimezone(pytz.timezone('Asia/Tehran')).strftime('%H:%M') if est['latest'] else 'هنوز منتشر نشده'
+    if est['minutes']<=0: next_txt='آماده انتشار طبق برنامه'
+    elif est['minutes']<60: next_txt=f"حدود {est['minutes']} دقیقه دیگر"
+    else: next_txt=f"حدود {est['minutes']//60} ساعت و {est['minutes']%60} دقیقه دیگر"
+    text=("📥 <b>صف انتشار</b>\n\n"
+          f"📦 تعداد در صف: <b>{est['queued']}</b>\n"
+          f"🕘 آخرین انتشار: <b>{last_txt}</b>\n"
+          f"⏱ فاصله مدیریت‌شده: <b>{est['interval_minutes']} دقیقه</b>\n"
+          f"🕐 نوبت بعدی: <b>{next_txt}</b>\n\n")
+    if not rows: text+="صف فعلاً خالی است."
+    kb_rows=[]
+    for r in rows:
+        text+=f"#{r['article_id']} · ⭐ {float(r['score'] or 0):.0f} · {str(r['title'])[:70]}\n"
+        kb_rows.append([InlineKeyboardButton(text=f"📄 #{r['article_id']} · {str(r['title'])[:22]}",callback_data=f'auto_art_{r["article_id"]}')])
+    kb_rows += [[InlineKeyboardButton(text='🚀 همین حالا منتشر کن',callback_data='auto_publish_now'),InlineKeyboardButton(text='🔄 بروزرسانی',callback_data='auto_queue')],
+                [InlineKeyboardButton(text='📰 محتوای تولیدشده',callback_data='auto_articles')],
+                [InlineKeyboardButton(text='🔙 محتوا و داده‌ها',callback_data='auto_content_db')]]
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows)); await call.answer()
+
+@router.callback_query(F.data == "auto_articles")
+async def auto_articles(call: CallbackQuery, db: D1Database):
+    if call.from_user.id != ADMIN_ID: return
+    await call.answer()
+    rows=await db.execute("SELECT id,title,score,status,category,created_at,published_at,deep_views FROM articles ORDER BY id DESC LIMIT 20")
+    text="📰 <b>محتوای تولیدشده</b>\n\n"
+    kb=[]
+    if not rows: text+='هنوز محتوایی تولید نشده.'
+    for r in rows:
+        text+=f"#{r['id']} · {'✅' if r.get('status')=='published' else '📝'} · ⭐{float(r.get('score') or 0):.0f} · {str(r.get('title') or '')[:70]}\n"
+        kb.append([InlineKeyboardButton(text=f"📄 مشاهده #{r['id']}",callback_data=f"auto_art_{r['id']}")])
+    kb += [[InlineKeyboardButton(text='🔙 محتوا و داده‌ها',callback_data='auto_content_db')]]
+    await call.message.edit_text(text[:4000],parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)); await call.answer()
+
+async def render_automation_article(call: CallbackQuery, db: D1Database, article_id:int):
+    rows=await db.execute("SELECT a.*,q.status q_status,q.scheduled_at FROM articles a LEFT JOIN publication_queue q ON q.article_id=a.id WHERE a.id=?",[article_id])
+    if not rows:
+        await call.answer('محتوا پیدا نشد',show_alert=True); return
+    a=rows[0]
+    ch=plain_len(a.get('channel_text') or '')
+    ar=plain_len(a.get('body') or '')
+    text=(f"📰 <b>محتوا #{article_id}</b>\n\n"
+          f"<b>{html.escape(str(a.get('title') or 'بدون عنوان'))}</b>\n\n"
+          f"📌 وضعیت: <b>{html.escape(str(a.get('status') or '-'))}</b>\n"
+          f"⭐ امتیاز: <b>{float(a.get('score') or 0):.1f}</b>\n"
+          f"📥 وضعیت صف: <b>{html.escape(str(a.get('q_status') or 'ندارد'))}</b>\n"
+          f"📏 کانال: <b>{ch}</b> کاراکتر · مقاله: <b>{ar}</b> کاراکتر\n"
+          f"👁 بازشدن Deep Link: <b>{int(a.get('deep_views') or 0)}</b>\n"
+          f"🌐 منبع: <code>{html.escape(str(a.get('source_url') or '-'))}</code>\n\n"
+          "از اینجا می‌توانی محتوای تولیدشده را ببینی، ویرایش یا حذف کنی.")
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='👁 مشاهده متن',callback_data=f'auto_art_view_{article_id}')],
+        [InlineKeyboardButton(text='✏️ عنوان',callback_data=f'auto_art_edit_title_{article_id}'),InlineKeyboardButton(text='✏️ متن کانال',callback_data=f'auto_art_edit_channel_{article_id}')],
+        [InlineKeyboardButton(text='✏️ متن کامل',callback_data=f'auto_art_edit_body_{article_id}'),InlineKeyboardButton(text='📊 آمار',callback_data=f'auto_art_stats_{article_id}')],
+        [InlineKeyboardButton(text='🗑 حذف',callback_data=f'auto_art_delete_{article_id}')],
+        [InlineKeyboardButton(text='🔙 '+('صف انتشار' if a.get('q_status')=='queued' else 'محتوای تولیدشده'),callback_data='auto_queue' if a.get('q_status')=='queued' else 'auto_articles')]
+    ])
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=kb); await call.answer()
+
+@router.callback_query(F.data.regexp(r'^auto_art_(\d+)$'))
+async def auto_art_view_callback(call:CallbackQuery,db:D1Database):
+    await render_automation_article(call,db,int(call.data.split('_')[-1]))
+
+@router.callback_query(F.data.regexp(r'^auto_art_view_(\d+)$'))
+async def auto_art_view_text(call:CallbackQuery,db:D1Database,bot:Bot):
+    aid=int(call.data.split('_')[-1]); rows=await db.execute("SELECT title,channel_text,body,status FROM articles WHERE id=?",[aid])
+    if not rows: await call.answer('محتوا پیدا نشد',show_alert=True); return
+    a=rows[0]
+    head=f"📄 <b>{html.escape(str(a.get('title') or ''))}</b>\n\n📢 <b>نسخه کانال:</b>\n{sanitize_telegram_html(a.get('channel_text') or '')}\n\n📖 <b>نسخه کامل:</b>\n"
+    body=sanitize_telegram_html(a.get('body') or '')
+    paragraphs=[x for x in body.split('\n\n') if x.strip()]
+    chunks=[]; cur=head
+    for para in paragraphs:
+        candidate=cur+para+'\n\n'
+        if len(candidate)>3800 and cur.strip()!=head.strip():
+            chunks.append(cur.rstrip()); cur=para+'\n\n'
+        else:
+            cur=candidate
+    if cur.strip(): chunks.append(cur.rstrip())
+    if not chunks: chunks=[head+'(متن کامل خالی است.)']
+    await call.message.edit_text(chunks[0][:4000],parse_mode='HTML',reply_markup=get_admin_back_kb(f'auto_art_{aid}'))
+    for chunk in chunks[1:]:
+        try: await bot.send_message(call.message.chat.id,chunk[:4000],parse_mode='HTML')
+        except Exception: pass
+    await call.answer()
+
+@router.callback_query(F.data.regexp(r'^auto_art_stats_(\d+)$'))
+async def auto_art_stats(call:CallbackQuery,db:D1Database):
+    aid=int(call.data.split('_')[-1]); rows=await db.execute("SELECT a.*,q.status q_status FROM articles a LEFT JOIN publication_queue q ON q.article_id=a.id WHERE a.id=?",[aid])
+    if not rows: await call.answer('محتوا پیدا نشد',show_alert=True); return
+    a=rows[0]
+    text=(f"📊 <b>آمار محتوا #{aid}</b>\n\nعنوان: <b>{html.escape(str(a.get('title') or ''))}</b>\n"
+          f"امتیاز: <b>{float(a.get('score') or 0):.1f}</b>\nوضعیت: <b>{html.escape(str(a.get('status') or '-'))}</b>\n"
+          f"صف: <b>{html.escape(str(a.get('q_status') or 'ندارد'))}</b>\nDeep Link: <b>{int(a.get('deep_views') or 0)} بار</b>\n"
+          f"تولید: <b>{html.escape(str(a.get('created_at') or '-'))}</b>\nانتشار: <b>{html.escape(str(a.get('published_at') or '-'))}</b>")
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=get_admin_back_kb(f'auto_art_{aid}')); await call.answer()
+
+@router.callback_query(F.data.regexp(r'^auto_art_edit_(title|channel|body)_(\d+)$'))
+async def auto_art_edit_start(call:CallbackQuery,state:FSMContext,db:D1Database):
+    if call.from_user.id!=ADMIN_ID:return
+    parts=call.data.split('_'); field=parts[2]; aid=int(parts[3])
+    rows=await db.execute("SELECT title,channel_text,body FROM articles WHERE id=?",[aid])
+    if not rows: await call.answer('محتوا پیدا نشد',show_alert=True); return
+    labels={'title':'عنوان','channel':'متن کانال','body':'متن کامل'}
+    await state.set_state(BotStates.automation_article_edit)
+    await state.update_data(article_edit_id=aid,article_edit_field=field,parent_message_id=call.message.message_id)
+    await call.message.edit_text(f"✏️ <b>ویرایش {labels[field]} #{aid}</b>\n\nمقدار جدید را بفرست.\n\nپیام قبلی پاک نمی‌شود.",parse_mode='HTML',reply_markup=get_exit_menu()); await call.answer()
+
+@router.message(F.chat.id==ADMIN_ID,StateFilter(BotStates.automation_article_edit))
+async def auto_art_edit_input(message:Message,state:FSMContext,db:D1Database,bot:Bot):
+    data=await state.get_data(); aid=int(data['article_edit_id']); field=data['article_edit_field']; value=(message.text or message.caption or '').strip()
+    if not value:
+        await message.answer('❌ مقدار خالی است؛ دوباره بفرست.',reply_markup=get_exit_menu()); return
+    col={'title':'title','channel':'channel_text','body':'body'}[field]
+    if field=='title': value=strip_html_text(value)[:500]
+    elif field=='channel': value=sanitize_telegram_html(value)[:5000]
+    else: value=sanitize_telegram_html(value)[:18000]
+    await db.execute(f"UPDATE articles SET {col}=? WHERE id=?",[value,aid])
+    # اگر پست قبلاً در کانال منتشر شده، تلاش می‌کنیم همان پیام هم اصلاح شود.
+    rows=await db.execute("SELECT published_message_id,status,deep_token,title,channel_text FROM articles WHERE id=?",[aid])
+    if rows and rows[0].get('status')=='published' and rows[0].get('published_message_id'):
+        try:
+            channel_id=await get_channel_id(db); token=rows[0].get('deep_token'); username=await get_runtime_bot_username(bot)
+            deep=f"https://t.me/{username}?start=auto_{token}" if token and username else ''
+            if field in {'title','channel'} and deep:
+                latest=await db.execute("SELECT title,channel_text FROM articles WHERE id=?",[aid])
+                cap=publication_caption(latest[0].get('title') or '',latest[0].get('channel_text') or '',deep)
+                try: await bot.edit_message_caption(chat_id=channel_id,message_id=int(rows[0]['published_message_id']),caption=cap,parse_mode='HTML')
+                except Exception:
+                    try: await bot.edit_message_text(chat_id=channel_id,message_id=int(rows[0]['published_message_id']),text=cap,parse_mode='HTML')
+                    except Exception: pass
+        except Exception: pass
+    await state.set_state(BotStates.idle)
+    # Return to article panel via a fresh bot message to avoid losing the parent navigation.
+    cb=type('C',(),{})(); cb.message=type('M',(),{})(); cb.message.chat=message.chat; cb.message.message_id=data.get('parent_message_id',0)
+    await message.answer(f"✅ {field} محتوای #{aid} ویرایش شد.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📄 مدیریت همین محتوا',callback_data=f'auto_art_{aid}')],[InlineKeyboardButton(text='🔙 محتوا و داده‌ها',callback_data='auto_content_db')]]))
+
+@router.callback_query(F.data.regexp(r'^auto_art_delete_(\d+)$'))
+async def auto_art_delete(call:CallbackQuery):
+    aid=int(call.data.split('_')[-1])
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🗑️ بله، حذف شود',callback_data=f'auto_art_delete_yes_{aid}')],[InlineKeyboardButton(text='↩️ لغو',callback_data=f'auto_art_{aid}')]])
+    await call.message.edit_text(f'⚠️ <b>حذف محتوای #{aid}</b>\n\nاین عمل مقاله، صف و ارتباط آن با منبع را از چرخه دوباره‌کاری خارج می‌کند. ادامه می‌دهی؟',parse_mode='HTML',reply_markup=kb); await call.answer()
+
+@router.callback_query(F.data.regexp(r'^auto_art_delete_yes_(\d+)$'))
+async def auto_art_delete_yes(call:CallbackQuery,db:D1Database):
+    aid=int(call.data.split('_')[-1])
+    await db.execute("UPDATE source_items SET status='discarded',article_id=NULL WHERE article_id=?",[aid])
+    await db.execute("DELETE FROM publication_queue WHERE article_id=?",[aid])
+    await db.execute("DELETE FROM articles WHERE id=?",[aid])
+    await call.message.edit_text('🗑️ <b>محتوا حذف شد.</b>',parse_mode='HTML',reply_markup=automation_content_db_kb()); await call.answer('حذف شد')
+
+
+@router.channel_post()
+async def on_channel_post(message: Message, db: D1Database):
+    configured_channel = await get_channel_id(db)
+    if not configured_channel or str(message.chat.id) != str(configured_channel):
+        return
+    rows = await db.execute("SELECT id FROM articles WHERE published_message_id=?", [message.message_id])
+    if rows:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    await set_setting(db, "last_manual_channel_post_at", now)
+    await db.execute("INSERT INTO manual_channel_events(message_id, created_at) VALUES(?,?)", [message.message_id, now])
+
+
+# ============================================================
+# پردازش رویدادهای کلیک روی کیبوردهای شیشه‌ای (Callback Queries)
+# ============================================================
+@router.callback_query(F.data.startswith("alike_") | F.data.startswith("adis_"))
+async def process_article_voting(call: CallbackQuery, db: D1Database):
+    parts=call.data.split("_"); new_vote="like" if parts[0]=="alike" else "dislike"; article_id=int(parts[1]); uid=call.from_user.id
+    try:
+        existing=await db.execute("SELECT vote_type FROM user_content_votes WHERE user_id=? AND content_type='article' AND content_id=?",[uid,article_id])
+        if existing and existing[0].get('vote_type')==new_vote:
+            await db.execute("DELETE FROM user_content_votes WHERE user_id=? AND content_type='article' AND content_id=?",[uid,article_id]); msg="🔄 رأی حذف شد"
+        elif existing:
+            await db.execute("UPDATE user_content_votes SET vote_type=? WHERE user_id=? AND content_type='article' AND content_id=?",[new_vote,uid,article_id]); msg="🔄 رأی تغییر کرد"
+        else:
+            await db.execute("INSERT INTO user_content_votes(user_id,content_type,content_id,vote_type,created_at) VALUES(?,?,?,?,?)",[uid,'article',article_id,new_vote,datetime.now(timezone.utc).isoformat()]); msg="✅ ثبت شد"
+        likes=(await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='like'",[article_id]))[0].get('c',0)
+        dislikes=(await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='dislike'",[article_id]))[0].get('c',0)
+        saved=bool(await db.execute("SELECT 1 FROM user_content_saves WHERE user_id=? AND content_type='article' AND content_id=?",[uid,article_id]))
+        await call.message.edit_reply_markup(reply_markup=get_article_inline_kb(article_id,likes,dislikes,saved)); await call.answer(msg)
+    except Exception as exc:
+        logger.exception("article vote failed: %s",exc); await call.answer("❌ ثبت واکنش انجام نشد",show_alert=True)
 
 @router.callback_query(F.data.startswith("asave_"))
-async def article_save(call: CallbackQuery):
-    article_id = int(call.data.split("_")[1])
-    await call.message.edit_reply_markup(reply_markup=get_save_to_folder_kb("article", article_id))
-    await call.answer()
+async def process_article_save_action(call: CallbackQuery):
+    article_id=int(call.data.split("_")[1]); await call.answer(); await call.message.edit_reply_markup(reply_markup=get_save_to_folder_kb("article",article_id,f"article_actions_{article_id}"))
 
 @router.callback_query(F.data.startswith("aunsave_"))
-async def article_unsave(call: CallbackQuery, db: D1Database):
-    article_id = int(call.data.split("_")[1])
-    user_id = call.from_user.id
-    await db.execute("DELETE FROM user_content_saves WHERE user_id=? AND content_type='article' AND content_id=?", [user_id, article_id])
-    like_rows = await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='like'", [article_id])
-    dislike_rows = await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='dislike'", [article_id])
-    kb = get_article_inline_kb(article_id, like_rows[0].get('c', 0) if like_rows else 0, dislike_rows[0].get('c', 0) if dislike_rows else 0, False)
-    try: await call.message.edit_reply_markup(reply_markup=kb)
-    except Exception: pass
-    await call.answer("❌ از ذخیره‌ها حذف شد", show_alert=True)
+async def process_article_unsave_action(call: CallbackQuery, db: D1Database):
+    article_id=int(call.data.split("_")[1]); uid=call.from_user.id
+    try:
+        await db.execute("DELETE FROM user_content_saves WHERE user_id=? AND content_type='article' AND content_id=?",[uid,article_id])
+        likes=(await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='like'",[article_id]))[0].get('c',0)
+        dislikes=(await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='dislike'",[article_id]))[0].get('c',0)
+        await call.message.edit_reply_markup(reply_markup=get_article_inline_kb(article_id,likes,dislikes,False)); await call.answer("🗑️ از ذخیره‌ها حذف شد")
+    except Exception as exc:
+        logger.exception("article unsave failed: %s",exc); await call.answer("❌ حذف نشد",show_alert=True)
 
-@router.callback_query(F.data.startswith("alike_") | F.data.startswith("adis_"))
-async def handle_article_vote(call: CallbackQuery, db: D1Database):
+@router.callback_query(F.data.startswith("usave_"))
+async def process_unified_folder_save(call: CallbackQuery, db: D1Database):
     parts=call.data.split("_")
-    action=parts[0]
-    article_id=int(parts[1])
-    uid=call.from_user.id
-    vt='like' if action=='alike' else 'dislike'
-    exist=await db.execute("SELECT vote_type FROM user_content_votes WHERE user_id=? AND content_type='article' AND content_id=?",[uid,article_id])
-    if exist:
-        if exist[0].get("vote_type")==vt:
-            await db.execute("DELETE FROM user_content_votes WHERE user_id=? AND content_type='article' AND content_id=?",[uid,article_id])
-            msg="رای شما برداشته شد."
+    if len(parts)!=4: return await call.answer("❌ خطا",show_alert=True)
+    _,ctype,cid_str,folder=parts; cid=int(cid_str); uid=call.from_user.id
+    try:
+        await db.execute("INSERT OR REPLACE INTO user_content_saves(user_id,content_type,content_id,folder,created_at) VALUES(?,?,?,?,?)",[uid,ctype,cid,folder,datetime.now(timezone.utc).isoformat()])
+        if ctype=='article':
+            likes=(await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='like'",[cid]))[0].get('c',0)
+            dislikes=(await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='dislike'",[cid]))[0].get('c',0)
+            await call.message.edit_reply_markup(reply_markup=get_article_inline_kb(cid,likes,dislikes,True))
         else:
-            await db.execute("UPDATE user_content_votes SET vote_type=? WHERE user_id=? AND content_type='article' AND content_id=?",[vt,uid,article_id])
-            msg="رای شما تغییر کرد."
-    else:
-        await db.execute("INSERT INTO user_content_votes(user_id,content_type,content_id,vote_type) VALUES(?,'article',?,?)",[uid,article_id,vt])
-        msg="رای شما ثبت شد."
-    await call.answer(msg)
-    like_rows=await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='like'",[article_id])
-    dislike_rows=await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='dislike'",[article_id])
-    save_rows=await db.execute("SELECT folder FROM user_content_saves WHERE user_id=? AND content_type='article' AND content_id=?",[uid,article_id])
-    kb=get_article_inline_kb(article_id,like_rows[0].get("c",0) if like_rows else 0,dislike_rows[0].get("c",0) if dislike_rows else 0,bool(save_rows))
-    try: await call.message.edit_reply_markup(reply_markup=kb)
-    except Exception: pass
+            rows=await db.execute("SELECT likes,dislikes FROM posts WHERE id=?",[cid]); p=rows[0] if rows else {}
+            await call.message.edit_reply_markup(reply_markup=get_post_inline_kb(cid,p.get('likes',0),p.get('dislikes',0),True))
+        await call.answer(f"✅ در {FOLDER_NAMES.get(folder,folder)} ذخیره شد")
+    except Exception as exc:
+        logger.exception("save failed: %s",exc); await call.answer("❌ ذخیره‌سازی انجام نشد",show_alert=True)
+
+@router.callback_query(F.data.startswith("article_actions_"))
+async def article_actions(call: CallbackQuery, db: D1Database):
+    article_id=int(call.data.split("_")[2]); uid=call.from_user.id
+    likes=(await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='like'",[article_id]))[0].get('c',0)
+    dislikes=(await db.execute("SELECT COUNT(*) c FROM user_content_votes WHERE content_type='article' AND content_id=? AND vote_type='dislike'",[article_id]))[0].get('c',0)
+    saved=bool(await db.execute("SELECT 1 FROM user_content_saves WHERE user_id=? AND content_type='article' AND content_id=?",[uid,article_id]))
+    await call.message.edit_reply_markup(reply_markup=get_article_inline_kb(article_id,likes,dislikes,saved)); await call.answer()
 
 @router.callback_query(F.data.startswith("like_") | F.data.startswith("dis_"))
-async def post_vote(call: CallbackQuery, db: D1Database):
-    action, post_id_str = call.data.split("_")
-    post_id = int(post_id_str)
+async def process_post_voting(call: CallbackQuery, db: D1Database):
+    parts = call.data.split("_")
+    new_vote = "like" if parts[0] == "like" else "dislike"
+    post_id = int(parts[1])
     user_id = call.from_user.id
     
-    rows = await db.execute("SELECT vote_type FROM user_content_votes WHERE user_id = ? AND content_type='post' AND content_id = ?", [user_id, post_id])
-    old_vote = rows[0].get("vote_type") if rows else None
+    vote_rows = await db.execute("SELECT vote_type FROM user_content_votes WHERE user_id = ? AND content_type='post' AND content_id = ?", [user_id, post_id])
+    response_text = ""
     
-    new_vote = "like" if action == "like" else "dislike"
-    like_delta, dis_delta = 0, 0
-    
-    if old_vote == new_vote:
-        await db.execute("DELETE FROM user_content_votes WHERE user_id = ? AND content_type='post' AND content_id = ?", [user_id, post_id])
-        if new_vote == "like": like_delta = -1
-        else: dis_delta = -1
-        msg = "رای شما برداشته شد."
-    else:
-        if old_vote:
-            await db.execute("UPDATE user_content_votes SET vote_type = ? WHERE user_id = ? AND content_type='post' AND content_id = ?", [new_vote, user_id, post_id])
-            if new_vote == "like": like_delta, dis_delta = 1, -1
-            else: like_delta, dis_delta = -1, 1
+    try:
+        if not vote_rows:
+            await db.execute_batch([
+                {"sql": "INSERT INTO user_content_votes(user_id,content_type,content_id,vote_type,created_at) VALUES(?,?,?,?,?)", "params": [user_id, "post", post_id, new_vote, datetime.now(timezone.utc).isoformat()]},
+                {"sql": f"UPDATE posts SET {new_vote}s = {new_vote}s + 1 WHERE id = ?", "params": [post_id]}
+            ])
+            response_text = "✅ رأی خفنت ثبت شد! 😎"
         else:
-            await db.execute("INSERT INTO user_content_votes(user_id, content_type, content_id, vote_type) VALUES(?, 'post', ?, ?)", [user_id, post_id, new_vote])
-            if new_vote == "like": like_delta = 1
-            else: dis_delta = 1
-        msg = "رای شما ثبت شد."
+            current_vote = vote_rows[0].get("vote_type")
+            if current_vote == new_vote:
+                await db.execute_batch([
+                    {"sql": "DELETE FROM user_content_votes WHERE user_id = ? AND content_type='post' AND content_id = ?", "params": [user_id, post_id]},
+                    {"sql": f"UPDATE posts SET {new_vote}s = {new_vote}s - 1 WHERE id = ?", "params": [post_id]}
+                ])
+                response_text = "🔄 رأیت رو پس گرفتی! 🔙"
+            else:
+                await db.execute_batch([
+                    {"sql": "UPDATE user_content_votes SET vote_type = ? WHERE user_id = ? AND content_type='post' AND content_id = ?", "params": [new_vote, user_id, post_id]},
+                    {"sql": f"UPDATE posts SET {new_vote}s = {new_vote}s + 1, {current_vote}s = {current_vote}s - 1 WHERE id = ?", "params": [post_id]}
+                ])
+                response_text = "🔄 رأیت با موفقیت تغییر کرد!"
+    except Exception:
+        response_text = "❌ خطا در ثبت رأی"
         
-    await db.execute("UPDATE posts SET likes = likes + ?, dislikes = dislikes + ? WHERE id = ?", [like_delta, dis_delta, post_id])
-    post_rows = await db.execute("SELECT likes, dislikes FROM posts WHERE id = ?", [post_id])
-    if post_rows:
-        save_rows = await db.execute("SELECT folder FROM user_content_saves WHERE user_id = ? AND content_type='post' AND content_id = ?", [user_id, post_id])
-        is_saved = len(save_rows) > 0
-        kb = get_post_inline_kb(post_id, post_rows[0].get("likes", 0), post_rows[0].get("dislikes", 0), is_saved)
-        try: await call.message.edit_reply_markup(reply_markup=kb)
-        except Exception: pass
-        
-    await call.answer(msg)
-
-@router.callback_query(F.data == "help_more")
-async def process_help_more(call: CallbackQuery):
-    await call.message.edit_text(
-        "🧠 *چطوری با هوش مصنوعی حرف بزنم؟*\n"
-        "خیلی ساده! هر وقت منوی اصلی بسته بود و دکمه‌ای نمی‌دیدی، یعنی ربات آماده شنیدن حرف‌های توعه.\n\n"
-        "فقط کافیه سؤالت رو بپرسی یا متن/فایل بفرستی تا بررسی کنه.\n"
-        "*(سهمیه هر کاربر روزانه 10000 توکن است و هر شب صفر میشه)*",
-        parse_mode="Markdown",
-        reply_markup=get_help_got_it_kb()
-    )
-    await call.answer()
-
-@router.callback_query(F.data == "help_got_it")
-async def process_help_got_it(call: CallbackQuery, state: FSMContext):
-    await state.set_state(BotStates.idle)
-    await call.message.edit_text("🏠 منوی اصلی\n\nامیدوارم از ربات لذت ببری! 🚀", reply_markup=get_main_menu())
-    await call.answer()
-
-# ============================================================
-# هندلرهای مربوط به منوی مدیریت محتوا (CRUD Posts & Broadcast)
-# ============================================================
-@router.callback_query(F.data == "conf_add_yes", StateFilter(BotStates.waiting_post_confirm))
-async def confirm_add_post(call: CallbackQuery, state: FSMContext, db: D1Database):
-    data = await state.get_data()
-    text = data.get("temp_text", "")
-    file_id = data.get("temp_file_id")
-    media_type = data.get("temp_media_type")
+    await call.answer(response_text, show_alert=True)
     
-    await db.execute("INSERT INTO posts(text, file_id, media_type) VALUES(?, ?, ?)", [text, file_id, media_type])
-    await call.message.edit_reply_markup(reply_markup=None)
-    await call.message.answer("✅ پست با موفقیت به دیتابیس اضافه شد!", reply_markup=get_admin_menu())
-    
-    await state.set_state(BotStates.idle)
-    await state.update_data(temp_text=None, temp_file_id=None, temp_media_type=None)
-    await call.answer()
-
-@router.callback_query(F.data == "conf_add_no", StateFilter(BotStates.waiting_post_confirm))
-async def cancel_add_post(call: CallbackQuery, state: FSMContext):
-    await call.message.edit_reply_markup(reply_markup=None)
-    await call.message.answer("❌ عملیات ثبت پست لغو شد.", reply_markup=get_admin_menu())
-    await state.set_state(BotStates.idle)
-    await state.update_data(temp_text=None, temp_file_id=None, temp_media_type=None)
-    await call.answer()
-
-@router.callback_query(F.data == "conf_broad_yes", StateFilter(BotStates.waiting_broadcast_confirm))
-async def confirm_broadcast(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
-    data = await state.get_data()
-    text = data.get("temp_text", "")
-    file_id = data.get("temp_file_id")
-    media_type = data.get("temp_media_type")
-    post = {"text": text, "file_id": file_id, "media_type": media_type}
-    
-    await call.message.edit_reply_markup(reply_markup=None)
-    await call.message.answer("🚀 شروع ارسال همگانی...")
-    
-    users = await db.execute("SELECT id FROM users")
-    success_count = 0
-    fail_count = 0
-    
-    for u in users:
+    p_rows = await db.execute("SELECT likes, dislikes FROM posts WHERE id = ?", [post_id])
+    if p_rows:
+        p = p_rows[0]
+        s_rows = await db.execute("SELECT folder FROM user_content_saves WHERE user_id = ? AND content_type='post' AND content_id = ?", [user_id, post_id])
+        kb = get_post_inline_kb(post_id, p.get("likes", 0), p.get("dislikes", 0), len(s_rows) > 0)
         try:
-            await send_post_content(bot, u["id"], post)
-            success_count += 1
-            await asyncio.sleep(0.05)
+            await call.message.edit_reply_markup(reply_markup=kb)
         except Exception:
-            fail_count += 1
-            
-    await call.message.answer(f"✅ ارسال همگانی به پایان رسید!\nموفق: {success_count}\nناموفق: {fail_count}", reply_markup=get_admin_menu())
-    await state.set_state(BotStates.idle)
-    await state.update_data(temp_text=None, temp_file_id=None, temp_media_type=None)
-    await call.answer()
+            pass
 
-@router.callback_query(F.data == "conf_broad_no", StateFilter(BotStates.waiting_broadcast_confirm))
-async def cancel_broadcast(call: CallbackQuery, state: FSMContext):
-    await call.message.edit_reply_markup(reply_markup=None)
-    await call.message.answer("❌ ارسال همگانی لغو شد.", reply_markup=get_admin_menu())
-    await state.set_state(BotStates.idle)
-    await state.update_data(temp_text=None, temp_file_id=None, temp_media_type=None)
-    await call.answer()
-
-@router.callback_query(F.data == "adm_search_text")
-async def adm_search_text(call: CallbackQuery, state: FSMContext):
-    await state.set_state(BotStates.admin_search_word)
-    await call.message.edit_text("🔍 لطفاً کلمه‌ای که می‌خواهید در متن پست‌ها جستجو شود را ارسال کنید:", reply_markup=get_admin_back_kb("admin_content"))
-    await call.answer()
-
-@router.message(StateFilter(BotStates.admin_search_word))
-async def process_admin_search_word(message: Message, state: FSMContext, db: D1Database, bot: Bot):
-    if message.from_user.id != ADMIN_ID: return
-    word = (message.text or "").strip()
-    if not word: return
-    
-    rows = await db.execute("SELECT id FROM posts WHERE text LIKE ? AND deleted = 0 ORDER BY id DESC", [f"%{word}%"])
-    if not rows:
-        await message.answer("❌ پستی با این کلمه یافت نشد. می‌توانید کلمه دیگری بفرستید:", reply_markup=get_admin_back_kb("admin_content"))
-        return
-        
-    ids = [r["id"] for r in rows]
-    await state.update_data(admin_search_ids=ids, admin_search_index=0)
-    await state.set_state(BotStates.idle)
-    
-    await message.answer(f"✅ {len(ids)} پست یافت شد.")
-    first_id = ids[0]
-    post_rows = await db.execute("SELECT text, file_id, media_type FROM posts WHERE id = ?", [first_id])
-    if post_rows:
-        kb = get_admin_search_pagination_kb(first_id, 0)
-        await send_post_content(bot, message.chat.id, post_rows[0], kb)
-
-@router.callback_query(F.data.startswith("asearch_"))
-async def process_asearch_pagination(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
-    action, index_str = call.data.split("_")[1:3]
-    index = int(index_str)
-    data = await state.get_data()
-    ids = data.get("admin_search_ids", [])
-    
-    if not ids:
-        await call.answer("❌ لیست نتایج یافت نشد.", show_alert=True)
-        return
-        
-    if action == "prev":
-        if index > 0: index -= 1
-        else: index = len(ids) - 1
-    elif action == "next":
-        if index < len(ids) - 1: index += 1
-        else: index = 0
-        
-    await state.update_data(admin_search_index=index)
-    post_id = ids[index]
-    
-    post_rows = await db.execute("SELECT text, file_id, media_type FROM posts WHERE id = ?", [post_id])
-    if post_rows:
-        kb = get_admin_search_pagination_kb(post_id, index)
-        try: await call.message.delete()
-        except Exception: pass
-        await send_post_content(bot, call.message.chat.id, post_rows[0], kb)
-    await call.answer()
-
-@router.callback_query(F.data == "adm_view_all")
-async def adm_view_all_init(call: CallbackQuery):
-    await call.message.edit_text("⚠️ این گزینه تمام پست‌های فعال دیتابیس را به صورت صفحه‌بندی شده نمایش می‌دهد. آیا ادامه می‌دهید؟", reply_markup=get_admin_view_all_confirm_kb())
-    await call.answer()
-
-@router.callback_query(F.data == "adm_view_all_cancel")
-async def adm_view_all_cancel(call: CallbackQuery):
-    await call.message.edit_text("📁 مدیریت محتوا\nانتخاب کنید:", reply_markup=get_content_management_kb())
-    await call.answer()
-
-@router.callback_query(F.data == "adm_view_all_confirm")
-async def adm_view_all_confirm(call: CallbackQuery, state: FSMContext, db: D1Database):
-    await state.set_state(BotStates.idle)
-    await show_admin_all_posts_page(call.message, db, 0)
-    await call.answer()
-
-@router.callback_query(F.data.startswith("adm_all_page_"))
-async def adm_all_page_nav(call: CallbackQuery, db: D1Database):
-    parts = call.data.split("_")
-    action = parts[3]
-    current_page = int(parts[4])
-    
-    total_posts = (await db.execute("SELECT COUNT(*) as c FROM posts WHERE deleted = 0"))[0].get("c", 0)
-    total_pages = math.ceil(total_posts / 5)
-    
-    if action == "prev" and current_page > 0:
-        current_page -= 1
-    elif action == "next" and current_page < total_pages - 1:
-        current_page += 1
-    else:
-        await call.answer("صفحه دیگری وجود ندارد.")
-        return
-        
-    await show_admin_all_posts_page(call.message, db, current_page, edit=True)
-    await call.answer()
-
-async def show_admin_all_posts_page(message_or_call: Message, db: D1Database, page: int, edit: bool = False):
-    limit = 5
-    offset = page * limit
-    total_posts = (await db.execute("SELECT COUNT(*) as c FROM posts WHERE deleted = 0"))[0].get("c", 0)
-    total_pages = max(1, math.ceil(total_posts / limit))
-    
-    rows = await db.execute("SELECT id, text FROM posts WHERE deleted = 0 ORDER BY id DESC LIMIT ? OFFSET ?", [limit, offset])
-    
-    text = f"📋 لیست تمام پست‌ها (صفحه {page+1} از {total_pages}):\n\n"
-    for r in rows:
-        snippet = (r["text"][:30] + "...") if r["text"] and len(r["text"]) > 30 else (r["text"] or "بدون متن")
-        text += f"🔹 #{r['id']} - {snippet}\n"
-        
-    kb = get_admin_all_posts_kb(rows, page, total_pages)
-    
-    if edit:
-        try: await message_or_call.edit_text(text, reply_markup=kb)
-        except Exception: pass
-    else:
-        await message_or_call.edit_text(text, reply_markup=kb)
-
-@router.callback_query(F.data.startswith("astats_"))
-async def admin_post_stats(call: CallbackQuery, db: D1Database):
+@router.callback_query(F.data.startswith("save_"))
+async def process_save_action(call: CallbackQuery):
     post_id = int(call.data.split("_")[1])
-    rows = await db.execute("SELECT likes, dislikes, views FROM posts WHERE id = ?", [post_id])
-    if rows:
-        p = rows[0]
-        text = f"📊 آمار پست #{post_id}\n\n👁️ بازدید: {p.get('views',0)}\n👍 لایک: {p.get('likes',0)}\n👎 دیس‌لایک: {p.get('dislikes',0)}"
-        await call.answer(text, show_alert=True)
-    else:
-        await call.answer("پست یافت نشد", show_alert=True)
-
-@router.callback_query(F.data.startswith("aedit_"))
-async def admin_post_edit_init(call: CallbackQuery, state: FSMContext):
-    post_id = int(call.data.split("_")[1])
-    await state.update_data(edit_post_id=post_id)
-    await state.set_state(BotStates.admin_post_edit)
-    await call.message.answer(f"✏️ شما در حال ویرایش پست #{post_id} هستید.\n\nلطفاً متن جدید پست را ارسال کنید:", reply_markup=get_exit_menu())
+    try:
+        await call.message.edit_reply_markup(reply_markup=get_save_to_folder_kb("post",post_id,f"post_actions_{post_id}"))
+    except Exception:
+        pass
     await call.answer()
 
-@router.message(StateFilter(BotStates.admin_post_edit))
-async def admin_post_edit_save(message: Message, state: FSMContext, db: D1Database):
-    if message.from_user.id != ADMIN_ID: return
-    new_text = message.text
-    if not new_text:
-        await message.answer("لطفاً فقط متن ارسال کنید.")
-        return
-        
-    data = await state.get_data()
-    post_id = data.get("edit_post_id")
-    if post_id:
-        await db.execute("UPDATE posts SET text = ? WHERE id = ?", [new_text, post_id])
-        await message.answer(f"✅ متن پست #{post_id} با موفقیت ویرایش شد.", reply_markup=get_admin_back_kb("admin_content"))
-    await state.set_state(BotStates.idle)
+@router.callback_query(F.data.startswith("fsave_"))
+async def process_folder_save(call: CallbackQuery, db: D1Database):
+    parts=call.data.split("_")
+    post_id=int(parts[1]); folder=parts[2]; user_id=call.from_user.id
+    try:
+        await db.execute("INSERT OR REPLACE INTO user_content_saves(user_id,content_type,content_id,folder,created_at) VALUES(?,?,?,?,?)",[user_id,"post",post_id,folder,datetime.now(timezone.utc).isoformat()])
+        p_rows=await db.execute("SELECT likes,dislikes FROM posts WHERE id=?",[post_id])
+        p=p_rows[0] if p_rows else {}
+        await call.answer(f"✅ در {FOLDER_NAMES.get(folder,folder)} ذخیره شد",show_alert=True)
+        await call.message.edit_reply_markup(reply_markup=get_post_inline_kb(post_id,p.get('likes',0),p.get('dislikes',0),True))
+    except Exception:
+        await call.answer("❌ خطا در ذخیره‌سازی",show_alert=True)
 
-@router.callback_query(F.data.startswith("adelete_"))
-async def admin_post_delete(call: CallbackQuery, db: D1Database):
+@router.callback_query(F.data.startswith("unsave_"))
+async def process_unsave_action(call: CallbackQuery, db: D1Database):
     post_id = int(call.data.split("_")[1])
-    await db.execute("UPDATE posts SET deleted = 1 WHERE id = ?", [post_id])
-    await call.answer("✅ پست با موفقیت حذف شد.", show_alert=True)
+    user_id = call.from_user.id
     
-    try: await call.message.delete()
-    except Exception: pass
+    try:
+        await db.execute("DELETE FROM user_content_saves WHERE user_id = ? AND content_type='post' AND content_id = ?", [user_id, post_id])
+        await call.answer("🗑️ مطلب از ذخیره‌هات پاک شد!", show_alert=True)
+        
+        p_rows = await db.execute("SELECT likes, dislikes FROM posts WHERE id = ?", [post_id])
+        if p_rows:
+            p = p_rows[0]
+            kb = get_post_inline_kb(post_id, p.get("likes", 0), p.get("dislikes", 0), False)
+            try:
+                await call.message.edit_reply_markup(reply_markup=kb)
+            except Exception:
+                pass
+    except Exception:
+        await call.answer("❌ خطا در حذف", show_alert=True)
 
-# ============================================================
-# هندلرهای مربوط به پوشه‌ها و ذخیره‌های کاربری
-# ============================================================
 @router.callback_query(F.data.startswith("f_view_"))
-async def f_view_folder(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
+async def process_view_saved_folder(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
     folder = call.data.split("_")[2]
-    await state.update_data(folder=folder)
+    user_id = call.from_user.id
+    state_data = await state.get_data()
     
+    if state_data.get("cached_folder") == folder and state_data.get("cached_list"):
+        cached_list = state_data["cached_list"]
+        await call.answer()
+        await state.update_data(current_folder=folder, current_index=0, current_list=cached_list)
+        p_rows = await db.execute("SELECT text, file_id, media_type FROM posts WHERE id = ?", [cached_list[0]])
+        if p_rows:
+            kb = get_saved_folder_pagination_kb(cached_list[0], folder, 0)
+            await send_post_content(bot, call.message.chat.id, p_rows[0], kb)
+        return
+        
     rows = await db.execute(
         """SELECT posts.id FROM user_content_saves s JOIN posts ON s.content_id = posts.id AND s.content_type='post'
-           WHERE s.user_id = ? AND s.folder = ? AND posts.deleted = 0 ORDER BY posts.id DESC LIMIT 30""",
-        [call.from_user.id, folder]
+           WHERE s.user_id = ? AND s.folder = ? AND posts.deleted = 0
+           ORDER BY posts.id DESC LIMIT 30""",
+        [user_id, folder]
     )
-    
+    folder_display = FOLDER_NAMES.get(folder, folder)
     if not rows:
-        await call.answer("❌ این پوشه خالی است.", show_alert=True)
-        return
+        await call.answer(f"📭 {folder_display} فعلاً خالیه! برو از کانال چند تا مطلب خفن توش ذخیره کن 🕸️", show_alert=True)
+    else:
+        post_ids = [r["id"] for r in rows]
+        await state.update_data(cached_folder=folder, cached_list=post_ids, current_folder=folder, current_index=0, current_list=post_ids)
+        await call.answer()
         
-    folder_ids = [r["id"] for r in rows]
-    await state.update_data(folder_ids=folder_ids, folder_index=0)
-    
-    first_post_id = folder_ids[0]
-    post_rows = await db.execute("SELECT text, file_id, media_type FROM posts WHERE id = ?", [first_post_id])
-    
-    if post_rows:
-        kb = get_saved_folder_pagination_kb(first_post_id, folder, 0)
-        try: await call.message.delete()
-        except Exception: pass
-        await send_post_content(bot, call.message.chat.id, post_rows[0], kb)
-    await call.answer()
+        post_id = post_ids[0]
+        p_rows = await db.execute("SELECT text, file_id, media_type FROM posts WHERE id = ?", [post_id])
+        if p_rows:
+            kb = get_saved_folder_pagination_kb(post_id, folder, 0)
+            await send_post_content(bot, call.message.chat.id, p_rows[0], kb)
 
 @router.callback_query(F.data.startswith("fpg_"))
-async def fpg_pagination(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
+async def process_folder_pagination(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
     parts = call.data.split("_")
-    action = parts[1]
+    direction = parts[1]
     folder = parts[2]
-    index = int(parts[3])
+    current_index = int(parts[3])
     
-    data = await state.get_data()
-    folder_ids = data.get("folder_ids", [])
+    state_data = await state.get_data()
+    lst = state_data.get("current_list", [])
+    if lst and folder:
+        new_index = current_index + 1 if direction == "next" else current_index - 1
+        new_index = max(0, min(new_index, len(lst) - 1))
+        
+        if new_index == current_index:
+            await call.answer("🚧 رسیدی به انتهای لیست!")
+        else:
+            await call.answer()
+            post_id = lst[new_index]
+            await state.update_data(current_index=new_index)
+            
+            p_rows = await db.execute("SELECT text, file_id, media_type FROM posts WHERE id = ?", [post_id])
+            if p_rows:
+                post = p_rows[0]
+                kb = get_saved_folder_pagination_kb(post_id, folder, new_index)
+                if post.get("file_id") and post.get("media_type"):
+                    try:
+                        await call.message.delete()
+                    except Exception:
+                        pass
+                    await send_post_content(bot, call.message.chat.id, post, kb)
+                else:
+                    try:
+                        await call.message.edit_text(text=post.get("text") or "", reply_markup=kb)
+                    except Exception:
+                        pass
+
+@router.callback_query(F.data.startswith("f_srch_"))
+async def process_f_search_button(call: CallbackQuery, state: FSMContext):
+    folder = call.data.split("_")[2]
+    state_data = await state.get_data()
     
-    if not folder_ids:
-        await call.answer("لیست خالی است", show_alert=True)
+    now = time.time() * 1000
+    WINDOW_MS = 8 * 60 * 60 * 1000
+    search_count = state_data.get("search_count", 0)
+    window_start = state_data.get("search_window_start", 0)
+    
+    if now - window_start > WINDOW_MS:
+        search_count = 0
+        window_start = 0
+        
+    if search_count >= 5:
+        await call.answer("🛑 به دلیل کمبود منابع در هر 8 ساعت قادر به تنها 5 بار جستوجو هستید", show_alert=True)
+        unlock_time_ms = window_start + WINDOW_MS
+        tehran_tz = pytz.timezone("Asia/Tehran")
+        unlock_dt = datetime.fromtimestamp(unlock_time_ms / 1000, tehran_tz)
+        time_str = unlock_dt.strftime("%H:%M")
+        day_str = "امروز" if unlock_dt.date() == datetime.now(tehran_tz).date() else "فردا"
+        
+        await call.message.answer(f"⏱️ موتور جستجوی اختصاصی شما {day_str} ساعت {time_str} فعال میشه\n\n تا اون موقع می‌تونی دستی پوشه‌هات رو ورق بزنی ! 🕵️‍♂️")
         return
         
-    if action == "prev":
-        if index > 0: index -= 1
-        else: index = len(folder_ids) - 1
-    elif action == "next":
-        if index < len(folder_ids) - 1: index += 1
-        else: index = 0
-        
-    await state.update_data(folder_index=index)
-    post_id = folder_ids[index]
-    
-    post_rows = await db.execute("SELECT text, file_id, media_type FROM posts WHERE id = ?", [post_id])
-    if post_rows:
-        kb = get_saved_folder_pagination_kb(post_id, folder, index)
-        try: await call.message.delete()
-        except Exception: pass
-        await send_post_content(bot, call.message.chat.id, post_rows[0], kb)
+    await state.set_state(BotStates.user_search_folder)
+    await state.update_data(folder=folder)
+    folder_display = FOLDER_NAMES.get(folder, folder)
+    await call.message.answer(f"🔍 کلمات یا واژه‌ای که می‌دونی تو پوشه {folder_display} ذخیره کردی رو بفرست تا برات سرچش کنم 🕵️‍♂️")
     await call.answer()
 
 @router.callback_query(F.data.startswith("fspg_"))
-async def fspg_pagination(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
+async def process_folder_search_pagination(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
     parts = call.data.split("_")
-    action = parts[1]
+    direction = parts[1]
     folder = parts[2]
-    index = int(parts[3])
+    current_index = int(parts[3])
     
-    data = await state.get_data()
-    search_ids = data.get("search_ids", [])
-    
-    if not search_ids:
-        await call.answer("لیست جستجو خالی است", show_alert=True)
-        return
+    state_data = await state.get_data()
+    search_ids = state_data.get("search_ids", [])
+    if search_ids and folder:
+        new_index = current_index + 1 if direction == "next" else current_index - 1
+        new_index = max(0, min(new_index, len(search_ids) - 1))
         
-    if action == "prev":
-        if index > 0: index -= 1
-        else: index = len(search_ids) - 1
-    elif action == "next":
-        if index < len(search_ids) - 1: index += 1
-        else: index = 0
-        
-    await state.update_data(search_index=index)
-    post_id = search_ids[index]
-    
-    post_rows = await db.execute("SELECT text, file_id, media_type FROM posts WHERE id = ?", [post_id])
-    if post_rows:
-        kb = get_saved_folder_search_pagination_kb(post_id, folder, index)
-        try: await call.message.delete()
-        except Exception: pass
-        await send_post_content(bot, call.message.chat.id, post_rows[0], kb)
-    await call.answer()
+        if new_index == current_index:
+            await call.answer("🚧 رسیدی به انتهای نتایج!")
+        else:
+            await call.answer()
+            post_id = search_ids[new_index]
+            p_rows = await db.execute("SELECT text, file_id, media_type FROM posts WHERE id = ?", [post_id])
+            if p_rows:
+                post = p_rows[0]
+                kb = get_saved_folder_search_pagination_kb(post_id, folder, new_index)
+                if post.get("file_id") and post.get("media_type"):
+                    try:
+                        await call.message.delete()
+                    except Exception:
+                        pass
+                    await send_post_content(bot, call.message.chat.id, post, kb)
+                else:
+                    try:
+                        await call.message.edit_text(text=post.get("text") or "", reply_markup=kb)
+                    except Exception:
+                        pass
 
 @router.callback_query(F.data.startswith("ask_del_"))
-async def ask_delete_saved(call: CallbackQuery):
+async def process_ask_deletion(call: CallbackQuery, state: FSMContext):
     parts = call.data.split("_")
     post_id = int(parts[2])
     folder = parts[3]
-    await call.message.edit_reply_markup(reply_markup=get_confirm_delete_kb(post_id, folder))
+    
+    await state.update_data(pending_delete={"post_id": post_id, "folder": folder})
+    kb = get_confirm_delete_kb(post_id, folder)
+    try:
+        await call.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        await call.message.answer("آیا مطمئنی می‌خوای این مطلب رو از پوشه‌ات پاک کنی؟ 🤔", reply_markup=kb)
     await call.answer()
 
 @router.callback_query(F.data.startswith("cancel_delete_"))
-async def cancel_delete_saved(call: CallbackQuery, state: FSMContext):
+async def process_cancel_deletion(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
     folder = call.data.split("_")[2]
-    data = await state.get_data()
-    
-    # تشخیص اینکه در حالت جستجو هستیم یا مرور عادی
-    if "search_ids" in data:
-        index = data.get("search_index", 0)
-        post_id = data["search_ids"][index]
-        kb = get_saved_folder_search_pagination_kb(post_id, folder, index)
-    else:
-        index = data.get("folder_index", 0)
-        post_id = data["folder_ids"][index]
-        kb = get_saved_folder_pagination_kb(post_id, folder, index)
+    await call.answer("✅ عملیات لغو شد.", show_alert=True)
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
         
-    await call.message.edit_reply_markup(reply_markup=kb)
-    await call.answer()
+    state_data = await state.get_data()
+    lst = state_data.get("current_list", [])
+    idx = state_data.get("current_index", 0)
+    
+    if lst and idx < len(lst):
+        post_id = lst[idx]
+        p_rows = await db.execute("SELECT text, file_id, media_type FROM posts WHERE id = ?", [post_id])
+        if p_rows:
+            kb = get_saved_folder_pagination_kb(post_id, folder, idx)
+            await send_post_content(bot, call.message.chat.id, p_rows[0], kb)
+    else:
+        user_id = call.from_user.id
+        rows = await db.execute(
+            """SELECT posts.id FROM user_content_saves s JOIN posts ON s.content_id = posts.id AND s.content_type='post'
+               WHERE s.user_id = ? AND s.folder = ? AND posts.deleted = 0
+               ORDER BY posts.id DESC LIMIT 30""",
+            [user_id, folder]
+        )
+        if rows:
+            post_id = rows[0]["id"]
+            kb = get_saved_folder_pagination_kb(post_id, folder, 0)
+            await send_post_content(bot, call.message.chat.id, rows[0], kb)
+        else:
+            await call.message.answer("📭 این پوشه خالی شد.")
 
 @router.callback_query(F.data.startswith("f_del_save_"))
-async def f_del_save(call: CallbackQuery, state: FSMContext, db: D1Database):
+async def process_f_del_save(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
     parts = call.data.split("_")
     post_id = int(parts[3])
     folder = parts[4]
+    user_id = call.from_user.id
     
-    await db.execute("DELETE FROM user_content_saves WHERE user_id = ? AND content_type='post' AND content_id = ?", [call.from_user.id, post_id])
-    await call.answer("✅ از ذخیره‌ها حذف شد", show_alert=True)
-    
-    try: await call.message.delete()
-    except Exception: pass
-    
-    # حذف از لیست‌های state
-    data = await state.get_data()
-    
-    if "search_ids" in data:
-        ids = data["search_ids"]
-        if post_id in ids:
-            ids.remove(post_id)
-            await state.update_data(search_ids=ids)
-    
-    if "folder_ids" in data:
-        ids = data["folder_ids"]
-        if post_id in ids:
-            ids.remove(post_id)
-            await state.update_data(folder_ids=ids)
+    try:
+        await db.execute("DELETE FROM user_content_saves WHERE user_id = ? AND content_type='post' AND content_id = ?", [user_id, post_id])
+        await call.answer("🗑️ مطلب با موفقیت حذف شد!", show_alert=True)
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+            
+        rows = await db.execute(
+            """SELECT posts.id FROM user_content_saves s JOIN posts ON s.content_id = posts.id AND s.content_type='post'
+               WHERE s.user_id = ? AND s.folder = ? AND posts.deleted = 0
+               ORDER BY posts.id DESC LIMIT 30""",
+            [user_id, folder]
+        )
+        if rows:
+            post_ids = [r["id"] for r in rows]
+            await state.update_data(current_list=post_ids, current_index=0)
+            new_post_id = post_ids[0]
+            p_rows = await db.execute("SELECT text, file_id, media_type FROM posts WHERE id = ?", [new_post_id])
+            if p_rows:
+                kb = get_saved_folder_pagination_kb(new_post_id, folder, 0)
+                await send_post_content(bot, call.message.chat.id, p_rows[0], kb)
+        else:
+            folder_display = FOLDER_NAMES.get(folder, folder)
+            await call.message.answer(f"📭 پوشه {folder_display} کاملاً خالی شد.")
+    except Exception:
+        await call.answer("❌ خطا در حذف", show_alert=True)
 
-@router.callback_query(F.data.startswith("f_srch_"))
-async def f_search_init(call: CallbackQuery, state: FSMContext):
-    folder = call.data.split("_")[2]
-    await state.update_data(folder=folder)
-    await state.set_state(BotStates.user_search_folder)
+# ============================================================
+# بخش‌های خلاصه لیست و مدیریت پست‌ها برای ادمین (Callback Queries)
+# ============================================================
+async def send_admin_all_posts_page(bot: Bot,chat_id:int,rows:List[Dict[str,Any]],page:int,total_pages:int,total_count:int,edit_message_id:Optional[int]=None):
+    text="📋 <b>همه محتواها</b>\n\n"+f"صفحه {page+1}/{total_pages} · مجموع {total_count}\n"
+    buttons=[]
+    for p in rows:
+        preview=html.escape(strip_html_text(p.get("text") or "")[:60].replace("\n"," "))
+        text+=f"\n<b>#{p['id']}</b> {preview}"
+        buttons.append([InlineKeyboardButton(text=f"✏️ #{p['id']}",callback_data=f"aedit_{p['id']}"),
+                        InlineKeyboardButton(text=f"🗑 #{p['id']}",callback_data=f"adelete_{p['id']}")])
+    buttons.append([InlineKeyboardButton(text="⏮",callback_data=f"adm_all_page_prev_{page}"),InlineKeyboardButton(text=f"{page+1}/{total_pages}",callback_data="noop"),InlineKeyboardButton(text="⏭",callback_data=f"adm_all_page_next_{page}")])
+    buttons.append([InlineKeyboardButton(text="🔙 مدیریت محتوا",callback_data="admin_content")])
+    kb=InlineKeyboardMarkup(inline_keyboard=buttons)
+    if edit_message_id:
+        try:
+            await bot.edit_message_text(chat_id=chat_id,message_id=edit_message_id,text=text,parse_mode="HTML",reply_markup=kb); return
+        except Exception: pass
+    await bot.send_message(chat_id,text,parse_mode="HTML",reply_markup=kb)
+
+@router.callback_query(F.data == "adm_view_all")
+async def callback_admin_view_all(call: CallbackQuery):
+    await call.message.edit_text("📋 <b>همه محتواها</b>\n\nبرای نمایش ادامه بده:",parse_mode="HTML",reply_markup=get_admin_view_all_confirm_kb())
+    await call.answer()
+
+@router.callback_query(F.data == "adm_view_all_cancel")
+async def callback_admin_view_all_cancel(call: CallbackQuery):
+    await call.message.edit_text("📁 <b>مدیریت محتوای هسته</b>",parse_mode="HTML",reply_markup=get_content_management_kb())
+    await call.answer()
+
+@router.callback_query(F.data == "adm_view_all_confirm")
+async def callback_admin_view_all_confirm(call:CallbackQuery,state:FSMContext,db:D1Database,bot:Bot):
+    per_page=10
+    total=(await db.execute("SELECT COUNT(*) c FROM posts WHERE deleted=0"))[0].get("c",0)
+    pages=max(1,math.ceil(total/per_page))
+    rows=await db.execute("SELECT id,text,likes,dislikes,views,file_id,media_type FROM posts WHERE deleted=0 ORDER BY id DESC LIMIT ? OFFSET ?",[per_page,0])
+    await state.set_state(BotStates.admin_view_all); await state.update_data(all_posts_page=0,all_per_page=per_page,all_total_pages=pages,all_total_count=total)
+    if rows: await send_admin_all_posts_page(bot,call.message.chat.id,rows,0,pages,total,call.message.message_id)
+    else: await call.message.edit_text("📭 محتوایی وجود ندارد.",reply_markup=get_content_management_kb())
+    await call.answer()
+
+@router.callback_query(F.data.startswith("adm_all_page_"))
+async def callback_admin_all_posts_page(call:CallbackQuery,state:FSMContext,db:D1Database,bot:Bot):
+    parts=call.data.split("_"); direction=parts[3]; current=int(parts[4]); data=await state.get_data()
+    per=int(data.get("all_per_page",10)); total_pages=int(data.get("all_total_pages",1)); total=int(data.get("all_total_count",0))
+    new=max(0,min(current+(1 if direction=="next" else -1),total_pages-1))
+    rows=await db.execute("SELECT id,text,likes,dislikes,views,file_id,media_type FROM posts WHERE deleted=0 ORDER BY id DESC LIMIT ? OFFSET ?",[per,new*per])
+    await state.update_data(all_posts_page=new)
+    if rows: await send_admin_all_posts_page(bot,call.message.chat.id,rows,new,total_pages,total,call.message.message_id)
+    await call.answer()
+
+@router.callback_query(F.data == "adm_search_text")
+async def callback_admin_search_text(call:CallbackQuery,state:FSMContext):
+    await state.set_state(BotStates.admin_search_word); await state.update_data(search_ids=[],search_index=0)
+    await call.message.edit_text("🔍 <b>جستجو</b>\n\nکلمه کلیدی یا شماره پست را بفرست.",parse_mode="HTML",reply_markup=get_exit_menu())
+    await call.answer()
+
+@router.message(F.chat.id==ADMIN_ID,StateFilter(BotStates.admin_search_word))
+async def process_admin_search_word(message:Message,state:FSMContext,db:D1Database,bot:Bot):
+    q=(message.text or "").strip()
+    if not q: return
+    rows=await db.execute("SELECT id FROM posts WHERE id=? AND deleted=0" if q.isdigit() else "SELECT id FROM posts WHERE text LIKE ? AND deleted=0 ORDER BY id DESC LIMIT 50",[int(q)] if q.isdigit() else [f"%{q}%"])
+    ids=[r["id"] for r in rows]
+    if not ids:
+        await message.answer("❌ چیزی پیدا نشد.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔍 دوباره",callback_data="adm_search_text"),InlineKeyboardButton(text="🔙 مدیریت محتوا",callback_data="admin_content")]])); return
+    await state.update_data(search_ids=ids,search_index=0); await state.set_state(BotStates.admin_search_word)
+    p=await db.execute("SELECT id,text,file_id,media_type FROM posts WHERE id=?",[ids[0]])
+    if p: await bot.send_message(message.chat.id,"نتیجه:",reply_markup=get_admin_search_pagination_kb(ids[0],0)); await send_post_content(bot,message.chat.id,p[0],get_admin_search_pagination_kb(ids[0],0))
+
+@router.callback_query(F.data.startswith("asearch_"))
+async def callback_admin_search_pagination(call:CallbackQuery,state:FSMContext,db:D1Database,bot:Bot):
+    parts=call.data.split("_"); direction=parts[1]; current=int(parts[2]); data=await state.get_data(); ids=data.get("search_ids",[])
+    if not ids: await call.answer("جستجو تمام شده است",show_alert=True); return
+    new=max(0,min(current+(1 if direction=="next" else -1),len(ids)-1)); await state.update_data(search_index=new)
+    p=await db.execute("SELECT id,text,file_id,media_type FROM posts WHERE id=?",[ids[new]])
+    if p:
+        kb=get_admin_search_pagination_kb(ids[new],new)
+        if p[0].get("file_id"):
+            try: await call.message.delete()
+            except Exception: pass
+            await send_post_content(bot,call.message.chat.id,p[0],kb)
+        else:
+            await call.message.edit_text(p[0].get("text") or "",reply_markup=kb)
+    await call.answer()
+
+@router.callback_query(F.data.startswith("aedit_"))
+async def admin_edit_post_start(call:CallbackQuery,state:FSMContext,db:D1Database):
+    pid=int(call.data.split("_")[1]); rows=await db.execute("SELECT id,text FROM posts WHERE id=? AND deleted=0",[pid])
+    if not rows: await call.answer("پست پیدا نشد",show_alert=True); return
+    await state.set_state(BotStates.admin_post_edit); await state.update_data(edit_post_id=pid,parent_message_id=call.message.message_id)
+    await call.message.edit_text(f"✏️ <b>ویرایش #{pid}</b>\n\nمتن جدید را بفرست.",parse_mode="HTML",reply_markup=get_exit_menu()); await call.answer()
+
+@router.message(F.chat.id==ADMIN_ID,StateFilter(BotStates.admin_post_edit))
+async def admin_edit_post_input(message:Message,state:FSMContext,db:D1Database):
+    data=await state.get_data(); pid=int(data["edit_post_id"]); new_text=message.text or message.caption or ""
+    if not new_text: await message.answer("❌ متن خالی است."); return
+    await db.execute("UPDATE posts SET text=? WHERE id=?",[new_text,pid]); await state.set_state(BotStates.idle)
+    await message.answer(f"✅ پست #{pid} ویرایش شد.",reply_markup=get_content_management_kb())
+
+@router.callback_query(F.data.startswith("astats_"))
+async def callback_admin_search_post_stats(call:CallbackQuery,db:D1Database):
+    pid=int(call.data.split("_")[1]); p=await db.execute("SELECT likes,dislikes,views FROM posts WHERE id=?",[pid])
+    if not p: await call.answer("پست پیدا نشد",show_alert=True); return
+    await call.answer(f"👁 {p[0].get('views',0)} | 👍 {p[0].get('likes',0)} | 👎 {p[0].get('dislikes',0)}",show_alert=True)
+
+@router.callback_query(F.data.startswith("adelete_"))
+async def callback_admin_delete_post(call:CallbackQuery,db:D1Database):
+    pid=int(call.data.split("_")[1]); p=await db.execute("SELECT text FROM posts WHERE id=? AND deleted=0",[pid])
+    if not p: await call.answer("پست پیدا نشد",show_alert=True); return
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🗑️ تأیید حذف",callback_data=f"adelete_confirm_{pid}"),InlineKeyboardButton(text="↩️ لغو",callback_data="admin_content")]])
+    await call.message.edit_text(f"⚠️ <b>حذف #{pid}</b>\n\nآیا مطمئنی؟",parse_mode="HTML",reply_markup=kb); await call.answer()
+
+@router.callback_query(F.data.startswith("adelete_confirm_"))
+async def callback_admin_delete_post_confirm(call:CallbackQuery,db:D1Database):
+    pid=int(call.data.split("_")[-1]); await db.execute("UPDATE posts SET deleted=1 WHERE id=?",[pid])
+    await call.message.edit_text("🗑️ حذف شد.",reply_markup=get_content_management_kb()); await call.answer("حذف شد")
+
+
+# ============================================================
+# تایید ارسال‌های ادمین و راهنما (Callback Queries)
+# ============================================================
+@router.callback_query(F.data == "help_more")
+async def callback_help_more(call: CallbackQuery):
+    first_name = call.from_user.first_name or "دوست"
+    detailed_text = f"""ببین {first_name} جان، داستان از این قراره! 🤖
+
+ما اینجا یه پایگاه داده خفن و پویا از دنیای تکنولوژی، هوش مصنوعی و امنیت سایبری ساختیم.\n\n🚀 حتماً دیدی که تو کانال @TechNowAi بعضی وقتا فقط یه خلاصه کوچیک از خبرا یا آموزش‌ها رو می‌ذاریم؛ دلیلش اینه که تلگرام شلوغ نشه! اما وقتی روی لینک‌ها می‌زنی، دقیقاً هدایت میشی به همینجا تا متن کامل، جامع و تخصصی رو با خیال راحت مطالعه کنی. 📖🧐
+
+حالا اینجا چه امکاناتی داری؟
+
+۱. 💡 رأی‌گیری هوشمند: می‌تونی به هر پست رأی (👍 یا 👎) بدی. اینجوری ما می‌فهمیم سلیقه‌ات چیه و مطالب بهتری برات آماده می‌کنیم!
+
+۲. 📂 پوشه‌بندی اختصاصی: یه مطلب خیلی برات کاربردی بود؟ با یه کلیک 💾 ذخیره‌اش کن و دقیقاً بندازش تو پوشه مخصوص خودش (مثلاً هوش مصنوعی یا امنیت) تا هر وقت بهش نیاز داشتی، تو سه‌سوت پیداش کنی!
+
+۳. 🔍 جستجوی پیشرفته: تو پوشه‌هات دنبال یه کلمه خاص می‌گردی؟ دکمه جستجو رو بزن و کلمه‌ات رو بفرست تا ربات کل آرشیوت رو زیر و رو کنه!
+
+۴. 🤖 هوش مصنوعی: با انتخاب دکمه هوش مصنوعی از منو، میتونی سوالاتت رو بپرسی یا فایل متنی/کد بفرستی تا پردازش بشه.
+
+۵. 💬 ارتباط مستقیم: اگه ایده جذابی داشتی یا جایی به مشکل خوردی، مستقیم با خود مدیریت چت کن.
+
+🔄 هر جا حس کردی ربات یه ذره گیج می‌زنه، فقط یه /start بفرست تا مثل روز اول سرحال بشه! ⚡️
+
+📜 یادت نره که این ابزار برای پیشرفت و یادگیری راحت‌تر تو طراحی شده، پس حسابی ازش استفاده کن! 🎯
+
+📌 راستی این ربات مخصوص کانال خودمون هست و همینجا کارایی داره خلاصه که ما تلاش میکنیم تا در کمک به علوم فناوری و هوش مصنوعی و امنیت سایبری برای فارسی‌زبانان سهیم باشیم ❤️
+
+نسخه ربات: v1.5.0 🏷️"""
+    try:
+        await call.message.edit_text(text=detailed_text, reply_markup=get_help_got_it_kb())
+    except Exception:
+        pass
+    await call.answer()
+
+@router.callback_query(F.data == "help_got_it")
+async def callback_help_got_it(call: CallbackQuery):
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    await call.answer("🚀 بزن بریم سراغ یادگیری!")
+
+@router.callback_query(F.data == "conf_add_yes")
+async def callback_confirm_add_post_yes(call: CallbackQuery, state: FSMContext, db: D1Database):
+    state_data = await state.get_data()
+    temp_text = state_data.get("temp_text")
+    temp_file_id = state_data.get("temp_file_id")
+    temp_media_type = state_data.get("temp_media_type")
     
-    try: await call.message.delete()
-    except Exception: pass
+    if temp_text or temp_file_id:
+        try:
+            res = await db.execute(
+                "INSERT INTO posts(text, file_id, media_type) VALUES(?, ?, ?) RETURNING id",
+                [temp_text, temp_file_id, temp_media_type]
+            )
+            post_id = None
+            if res and isinstance(res, list) and len(res) > 0:
+                post_id = res[0].get("id")
+                
+            if not post_id:
+                last_id_rows = await db.execute("SELECT last_insert_rowid() as id")
+                if last_id_rows:
+                    post_id = last_id_rows[0].get("id")
+                    
+            await state.update_data(temp_text=None, temp_file_id=None, temp_media_type=None)
+            await state.set_state(BotStates.idle)
+            
+            await call.message.answer(f"✅ آرشیو شد!\n🔗 لینک:\nhttps://t.me/{BOT_USERNAME}?start={post_id}")
+            await call.answer("✅ ثبت شد!")
+        except Exception as e:
+            await call.answer(f"❌ خطا در ثبت: {e}", show_alert=True)
+    else:
+        await call.answer("❌ اطلاعات ناقص است", show_alert=True)
+
+@router.callback_query(F.data == "conf_add_no")
+async def callback_confirm_add_post_no(call: CallbackQuery, state: FSMContext):
+    await state.update_data(temp_text=None, temp_file_id=None, temp_media_type=None)
+    await state.set_state(BotStates.idle)
+    await call.message.answer("❌ لغو شد.")
+    await call.answer("لغو شد")
+
+@router.callback_query(F.data == "conf_broad_yes")
+async def callback_confirm_broadcast_yes(call: CallbackQuery, state: FSMContext, db: D1Database, bot: Bot):
+    state_data = await state.get_data()
+    temp_text = state_data.get("temp_text")
+    temp_file_id = state_data.get("temp_file_id")
+    temp_media_type = state_data.get("temp_media_type")
     
-    await call.message.answer(
-        f"🔍 جستجو در پوشه {FOLDER_NAMES.get(folder, folder)}\n\n"
-        "لطفاً کلمه‌ای که دنبالش هستی رو بفرست:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ انصراف", callback_data="user_saves")]])
-    )
+    if not temp_text and not temp_file_id:
+        await call.answer("❌ اطلاعات ناقص است", show_alert=True)
+        return
+        
+    users = await db.execute("SELECT id FROM users")
+    if not users:
+        await call.message.answer("⚠️ هیچ کاربری در دیتابیس وجود ندارد.")
+        await call.answer()
+        return
+        
+    await call.answer("🚀 ارسال همگانی شروع شد...")
+    success_count, fail_count = 0, 0
+    CHUNK_SIZE = 20
+    
+    async def send_to_user(bot_instance: Bot, uid: int, text: str, file: str, mtype: str):
+        caption = text if len(text) <= 1024 else text[:1020] + "..."
+        try:
+            if mtype == "photo" and file:
+                await bot_instance.send_photo(chat_id=uid, photo=file, caption=caption)
+            elif mtype == "document" and file:
+                await bot_instance.send_document(chat_id=uid, document=file, caption=caption)
+            elif mtype == "video" and file:
+                await bot_instance.send_video(chat_id=uid, video=file, caption=caption)
+            elif mtype == "audio" and file:
+                await bot_instance.send_audio(chat_id=uid, audio=file, caption=caption)
+            else:
+                safe_text = text if len(text) <= 4096 else text[:4090] + "..."
+                await bot_instance.send_message(chat_id=uid, text=safe_text or "پیام همگانی")
+            return True
+        except Exception:
+            return False
+
+    for i in range(0, len(users), CHUNK_SIZE):
+        chunk = users[i:i+CHUNK_SIZE]
+        tasks = [send_to_user(bot, u["id"], temp_text, temp_file_id, temp_media_type) for u in chunk]
+        results = await asyncio.gather(*tasks)
+        success_count += sum(1 for r in results if r)
+        fail_count += sum(1 for r in results if not r)
+        await asyncio.sleep(0.1)
+        
+    await state.update_data(temp_text=None, temp_file_id=None, temp_media_type=None)
+    await state.set_state(BotStates.idle)
+    
+    await call.message.answer(f"✅ ارسال همگانی انجام شد.\nموفق: {success_count} نفر\nناموفق: {fail_count} نفر")
+    await call.answer("✅ ارسال همگانی کامل شد!")
+
+@router.callback_query(F.data == "conf_broad_no")
+async def callback_confirm_broadcast_no(call: CallbackQuery, state: FSMContext):
+    await state.update_data(temp_text=None, temp_file_id=None, temp_media_type=None)
+    await state.set_state(BotStates.idle)
+    await call.message.answer("❌ ارسال همگانی لغو شد.")
+    await call.answer("لغو شد")
+
+@router.callback_query(F.data == "noop")
+async def callback_noop_dummy(call: CallbackQuery):
     await call.answer()
 
 # ============================================================
-# سرور Flask (برای Health Check و Keep-Alive)
-# ============================================================
-app = Flask(__name__)
-
-@app.route("/")
-def index():
-    return "Bot is running!"
-
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok", "version": BUILD_VERSION})
-
-def run_flask():
-    app.run(host="0.0.0.0", port=3000)
-
-# ============================================================
-# تابع اصلی (Entry Point)
+# متد اجرایی اصلی ربات (Startup & Main Polling)
 # ============================================================
 async def main():
-    logger.info(f"Starting bot... Version: {BUILD_VERSION}")
+    if not API_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+    if not (CF_ACCOUNT_ID and CF_DATABASE_ID and CF_API_TOKEN):
+        raise RuntimeError("Cloudflare D1 environment variables are not fully configured")
+    bot = Bot(token=API_TOKEN)
+    global BOT_USERNAME
+    try:
+        bot_identity = await bot.get_me()
+        if bot_identity.username:
+            BOT_USERNAME = bot_identity.username
+    except Exception:
+        pass
+    dp = Dispatcher(storage=MemoryStorage())
     
-    bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher()
-    dp.include_router(router)
+    db = D1Database(
+        account_id=CF_ACCOUNT_ID,
+        database_id=CF_DATABASE_ID,
+        api_token=CF_API_TOKEN
+    )
+    await db.start()
+    await get_http_session()
+    dp["db"] = db
     
-    db = D1Database()
     await initialize_database(db)
+    await migrate_unified_user_interactions(db)
     await initialize_automation_database(db)
     
-    dp.message.middleware(RateLimitMiddleware(ADMIN_ID))
-    dp.callback_query.middleware(RateLimitMiddleware(ADMIN_ID))
-
-    automation_task = asyncio.create_task(automation_loop(db, bot))
+    dp.include_router(router)
     
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-
+    automation_task = asyncio.create_task(automation_loop(db, bot))
+    logger.info("Bot started successfully in Long Polling mode with content automation...")
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot, db=db)
-    except Exception as e:
-        logger.error(f"Error in bot polling: {e}")
+        await dp.start_polling(bot)
     finally:
         automation_task.cancel()
+        try:
+            await automation_task
+        except asyncio.CancelledError:
+            pass
+        await db.close()
+        await close_http_session()
         await bot.session.close()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped!")
-
+    asyncio.run(main())
