@@ -49,7 +49,7 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "10.17.0-generation-failover-no-length-gate-final"
+BUILD_VERSION = "10.19.0-all-sources-queue-diagnostics-format-final"
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_AI_WORKERS = 3
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -88,6 +88,7 @@ HTTP_USER_AGENT = os.getenv("HTTP_USER_AGENT", "TechNowAI/2.0 (+content automati
 HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
 MAX_HTTP_BYTES = int(os.getenv("MAX_HTTP_BYTES", "1500000"))
 MAX_SOURCE_ITEMS_PER_CYCLE = int(os.getenv("MAX_SOURCE_ITEMS_PER_CYCLE", "5"))
+MAX_AUTOMATION_SOURCES = max(1, int(os.getenv("MAX_AUTOMATION_SOURCES", "50")))
 
 # تنظیم لاگر برای خطایابی بهتر
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -1381,6 +1382,8 @@ class TelegramHTMLSanitizer(HTMLParser):
 
 def sanitize_telegram_html(value: str) -> str:
     value = normalize_model_text(value)
+    # Some gateways return escaped HTML tags; restore only Telegram-safe structural tags.
+    value = re.sub(r"&lt;\s*(/?\s*(?:blockquote|b|strong|i|em|u|s|del|code|pre|tg-spoiler|a))(.*?)\s*&gt;", r"<\1\2>", value, flags=re.I|re.S)
     value = re.sub(r"<[^>]+>", lambda m: re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", m.group(0)), value)
     if not value: return ""
     try:
@@ -1453,8 +1456,26 @@ def _split_readable_paragraphs(value: str, max_chars: int = 520) -> List[str]:
         if current: out.append(current.strip())
     return out
 
+def _remove_duplicate_title_from_body(title: str, value: str) -> str:
+    text=_normalize_text_blocks(value or "")
+    title_plain=strip_html_text(title or "").strip()
+    if not text or not title_plain: return text
+    blocks=[x.strip() for x in re.split(r"\n\s*\n+", text) if strip_html_text(x).strip()]
+    if not blocks: return text
+    # Remove a repeated title in the first two blocks, including when wrapped in HTML tags/emojis.
+    for idx in range(min(2,len(blocks))):
+        plain=strip_html_text(blocks[idx]).strip()
+        if SequenceMatcher(None, plain.lower(), title_plain.lower()).ratio() >= 0.72 or title_plain.lower() in plain.lower() and len(plain) <= len(title_plain)*1.8:
+            blocks.pop(idx)
+            break
+    return "\n\n".join(blocks)
+
 def _visualize_plain_paragraphs(title: str, value: str, category: str, article: bool=False) -> str:
-    clean=sanitize_telegram_html(_normalize_text_blocks(value or ""))
+    value=_remove_duplicate_title_from_body(title, value or "")
+    # The renderer controls Quote placement; remove model-provided wrappers so one long paragraph
+    # cannot accidentally turn the whole article into a quote.
+    value=re.sub(r"</?blockquote[^>]*>", "", value, flags=re.I)
+    clean=sanitize_telegram_html(_normalize_text_blocks(value))
     plain=strip_html_text(clean)
     if not plain: return ""
     emoji_map={"ai":["🤖","🧠","⚡","🔬","🧩","🚀"],"cyber":["🛡️","🔐","🚨","🧩","⚠️","🔎"],"tech":["💻","⚙️","🚀","🔎","🧪","📱"],"edu":["📚","💡","🧭","📝","🎓","🔍"],"general":["🌐","✨","📌","🔭","🧭","💡"]}
@@ -1518,8 +1539,8 @@ def dedupe_adjacent_emojis(text: str) -> str:
 
 def clean_channel_copy(value: str) -> str:
     text=normalize_model_text(value or "")
-    for pat in [r"(?:📖\s*)?(?:بیشتر بخوانید|ادامه مطلب|برای ادامه(?: متن| مطلب)?(?: روی| از) لینک(?: زیر)? کلیک کنید)\s*", r"(?:روی لینک|از طریق لینک) (?:زیر|بالا) کلیک کنید", r"لینک ادامه مطلب\s*"]:
-        text=re.sub(pat,"",text,flags=re.I)
+    for pat in [r"(?:📖\s*)?(?:بیشتر بخوانید|ادامه مطلب|برای ادامه(?: متن| مطلب)?(?: روی| از) لینک(?: زیر)? کلیک کنید)\s*", r"(?:روی لینک|از طریق لینک) (?:زیر|بالا) کلیک کنید", r"لینک ادامه مطلب\s*", r"<a\s+href=[^>]+>\s*(?:منبع اصلی|منبع)\s*</a>"]:
+        text=re.sub(pat,"",text,flags=re.I|re.S)
     return re.sub(r"\n{3,}","\n\n",text).strip()
 
 def relative_time_label(value: str) -> str:
@@ -1601,6 +1622,7 @@ def append_resource_links(article_html: str, resource_links, source_url: str = "
     main=normalize_url(source_url or "")
     if main:
         clean=re.sub(r'<a\s+href=["\']'+re.escape(main)+r'["\'][^>]*>.*?</a>', '', clean, flags=re.I|re.S)
+    clean=re.sub(r'<a\s+href=["\'][^"\']+["\'][^>]*>\s*(?:منبع اصلی|منبع)\s*</a>', '', clean, flags=re.I|re.S)
     clean=re.sub(r'(?:<u>|<b>|<strong>|<i>|<em>)?\s*🔗?\s*(?:لینک(?:‌| )های مرتبط|منبع اصلی|منبع)\s*(?:</u>|</b>|</strong>|</i>|</em>)?', '', clean, flags=re.I)
     clean=re.sub(r'\n{3,}','\n\n',clean).strip()
     rendered=[]
@@ -2100,7 +2122,7 @@ async def automation_loop(db: D1Database, bot: Bot):
                     cycle_started=datetime.now(timezone.utc)
                     await set_setting(db,'last_cycle_started_at',cycle_started.isoformat())
                     max_workers=max(1,min(4,int(await get_setting(db,'max_workers','2'))))
-                    due_sources=await db.execute("SELECT * FROM sources WHERE enabled=1 AND (next_check_at IS NULL OR next_check_at <= ?) ORDER BY priority ASC,next_check_at ASC LIMIT 8",[cycle_started.isoformat()])
+                    due_sources=await db.execute("SELECT * FROM sources WHERE enabled=1 AND (next_check_at IS NULL OR next_check_at <= ?) ORDER BY priority ASC,next_check_at ASC LIMIT ?",[cycle_started.isoformat(),MAX_AUTOMATION_SOURCES])
                     # Try publication first, then refill queue, then publish again.
                     await publish_next_article(db,bot)
                     sem=asyncio.Semaphore(max_workers)
@@ -3688,7 +3710,7 @@ async def auto_report(call:CallbackQuery,db:D1Database):
 async def auto_sources(call: CallbackQuery, db: D1Database):
     await call.answer()
     rows = await db.execute("SELECT * FROM sources ORDER BY priority ASC, id ASC")
-    text = "🌐 منابع محتوا\n\n"
+    text = "🌐 منابع محتوا\n\n🟢 فعال = بررسی می‌شود\n🔴 خاموش = بررسی نمی‌شود\n📌 اولویت کمتر = زودتر بررسی\n\n"
     if not rows:
         text += "هنوز منبع اضافه نشده است."
     else:
@@ -4292,7 +4314,7 @@ async def health_test_ai(call:CallbackQuery,db:D1Database):
 
 @router.callback_query(F.data == "health_test_source")
 async def health_test_source(call:CallbackQuery,db:D1Database,bot:Bot):
-    rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC LIMIT 8")
+    rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC LIMIT ?", [MAX_AUTOMATION_SOURCES])
     if not rows:
         await call.message.edit_text("❌ هیچ منبع فعالی نیست.",reply_markup=get_admin_back_kb("auto_health")); return
     await call.answer("تست همه منابع شروع شد…")
@@ -4305,13 +4327,18 @@ async def health_test_source(call:CallbackQuery,db:D1Database,bot:Bot):
             try:
                 r=await discover_for_processing(db,src,ai,allow_scout=False,include_old=False)
                 n=len(r.get('items') or []); found=int(r.get('direct_count',0) or 0); method=r.get('method') or 'مستقیم'
-                status='✅' if n else '⚠️'
-                results.append(f"{status} {src.get('name')}: پیدا {found} · تازه {n} · {method}")
+                if n:
+                    marker='🟢 قابل بررسی'
+                elif found:
+                    marker='🟡 محتوا هست، گزینه تازه/جدید ندارد'
+                else:
+                    marker='🔴 دریافت محتوا ناموفق'
+                results.append(f"{marker} · {src.get('name')}: پیدا {found} · تازه {n} · مسیر: {method}")
             except Exception as e:
                 results.append(f"❌ {src.get('name')}: {html.escape(str(e)[:180])}")
     finally: await ai.close()
     await log_automation(db,"INFO","health_test_sources_finished",f"sources={len(rows)}")
-    await edit_health_progress(call.message,"🧪 <b>نتیجه تست همه منابع</b>\n\n"+"\n".join(results), get_admin_back_kb("auto_health")); await call.answer()
+    await edit_health_progress(call.message,"🧪 <b>نتیجه تست همه منابع</b>\n\n"+"\n".join(results)+"\n\n🟢 قابل بررسی = محتوای تازه پیدا شد\n🟡 = سایت پاسخ داد ولی گزینه تازه/جدید نداریم\n🔴 = دریافت مستقیم محتوا موفق نشد", get_admin_back_kb("auto_health")); await call.answer()
 
 async def edit_health_progress(message: Message, text: str, reply_markup=None):
     try:
@@ -4326,7 +4353,7 @@ def health_progress_block(stage: int, total: int, title: str, detail: str = "") 
 async def choose_test_candidate(db, ai, progress=None):
     """Find a fresh test item source-by-source, with visible failover diagnostics.
     Manual tests bypass the source cursor/retry cooldown so a rejected recent article can be retested
-    after the manager changes criteria. Freshness is still hard-limited to the configured 6-hour window.
+    after the manager changes criteria. Freshness allows the last 24 hours; the first 6 hours are prioritized.
     """
     rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC LIMIT 20")
     recent_tested_hashes={str(r.get('content_hash') or '') for r in await db.execute("SELECT content_hash FROM test_history ORDER BY id DESC LIMIT 200") if r.get('content_hash')}
@@ -4430,7 +4457,7 @@ async def health_run_cycle(call:CallbackQuery,db:D1Database,bot:Bot):
     await call.answer('چرخه واقعی شروع شد؛ این بار واقعاً منابع و AI را اجرا می‌کنم…')
     await log_automation(db,"INFO","real_cycle_started","manual real pipeline test")
     await edit_health_progress(call.message,health_progress_block(0,5,'▶️ اجرای یک چرخه واقعی','این همان Pipeline اتوماتیک است؛ داده ساختگی استفاده نمی‌شود.'))
-    ai=AIProviderManager(db,bot); rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC LIMIT 8")
+    ai=AIProviderManager(db,bot); rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC LIMIT ?", [MAX_AUTOMATION_SOURCES])
     results=[]
     try:
         sem=asyncio.Semaphore(max(1,min(4,int(await get_setting(db,'max_workers','2')))))
@@ -4448,7 +4475,22 @@ async def health_run_cycle(call:CallbackQuery,db:D1Database,bot:Bot):
         total_queued=sum((r.get('queued',0) if isinstance(r,dict) else 0) for r in results)
         q=await db.execute("SELECT COUNT(*) c FROM publication_queue WHERE status='queued'")
         await log_automation(db,"INFO","real_cycle_finished",json.dumps({"sources":len(rows),"processed":total_processed,"queued":total_queued,"published":bool(published)},ensure_ascii=False))
-        await edit_health_progress(call.message,f"✅ <b>چرخه واقعی کامل شد.</b>\n\n🌐 منابع: {len(rows)}\n📰 آیتم‌های پیدا شده: {total_found}\n🆕 گزینه‌های تازه/قابل بررسی: {total_new}\n🤖 پردازش‌شده توسط AI: {total_processed}\n📥 اضافه‌شده به صف: {total_queued}\n📦 صف فعلی: <b>{q[0].get('c',0) if q else 0}</b>\n📢 انتشار این چرخه: {'✅ بله' if published else '⏸ خیر'}", get_admin_back_kb("auto_health"))
+        total_rejected=sum((r.get('rejected',0) if isinstance(r,dict) else 0) for r in results)
+        total_errors=sum((r.get('errors',0) if isinstance(r,dict) else 0) for r in results)
+        detail = ('✅ بله' if published else '⏸ خیر')
+        summary_text=(f"✅ <b>چرخه واقعی کامل شد.</b>\n\n"
+                     f"🌐 منابع بررسی‌شده: <b>{len(rows)}</b>\n"
+                     f"📰 مواردی که منبع برگرداند: <b>{total_found}</b>\n"
+                     f"🆕 گزینه‌های تازه/جدید: <b>{total_new}</b>\n"
+                     f"🤖 ارسال‌شده به AI: <b>{total_processed}</b>\n"
+                     f"✅ پذیرفته‌شده: <b>{total_queued}</b>\n"
+                     f"🚫 ردشده: <b>{total_rejected}</b>\n"
+                     f"❌ خطا: <b>{total_errors}</b>\n"
+                     f"📦 صف فعلی: <b>{q[0].get('c',0) if q else 0}</b>\n"
+                     f"📢 انتشار همین چرخه: <b>{detail}</b>\n\n"
+                     "ℹ️ این چرخه همان کاری را اجرا می‌کند که Worker خودکار انجام می‌دهد:\n"
+                     "کشف → تازه/جدید → AI → امتیاز مدیر → تولید → صف → انتشار بر اساس برنامه.")
+        await edit_health_progress(call.message,summary_text, get_admin_back_kb("auto_health"))
     except Exception as e:
         logger.exception('health run cycle failed')
         await edit_health_progress(call.message,"❌ <b>اجرای چرخه شکست خورد</b>\n\n<code>"+html.escape(str(e)[:2500])+"</code>", get_admin_back_kb("auto_health"))
