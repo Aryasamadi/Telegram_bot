@@ -1814,6 +1814,24 @@ def manager_accepts_score(score: float, min_score: float) -> bool:
     return score >= max(0.0, minimum - MANAGER_SCORE_TOLERANCE)
 
 
+def _persian_ratio(text: str) -> float:
+    plain=strip_html_text(text or "")
+    if not plain:
+        return 0.0
+    fa=len(re.findall(r"[\u0600-\u06ff]", plain))
+    return fa/max(1,len(re.sub(r"\s+","",plain)))
+
+def _latin_ratio(text: str) -> float:
+    plain=strip_html_text(text or "")
+    if not plain:
+        return 0.0
+    latin=len(re.findall(r"[A-Za-z]", plain))
+    return latin/max(1,len(re.sub(r"\s+","",plain)))
+
+def _needs_persian_rewrite(title: str, channel: str, article: str) -> bool:
+    sample=" ".join([title or "", channel or "", article or ""])[:5000]
+    return _latin_ratio(sample) > 0.42 and _persian_ratio(sample) < 0.45
+
 async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:Dict[str,Any],recent_titles:List[str],weights:Dict[str,float],manager_prompts:Optional[Dict[str,str]]=None):
     body=(item.get("body") or item.get("description") or "")[:14000]
     manager_prompts=manager_prompts or {}
@@ -1888,11 +1906,30 @@ URL: {item.get('url')}
         retry=await ai.call([{"role":"system","content":"Return valid JSON only."},{"role":"user","content":repair_prompt}],0,4200,"editorial_json_repair")
         obj=parse_json_object(retry.get("content","")); result=retry
     if not obj: return {"error":"پاسخ AI JSON معتبر نبود","ai":result}
-    # اگر مدل فیلدهای HTML را نساخته بود، از متن معمولی fallback می‌سازیم.
-    title=strip_html_text(obj.get("title") or item.get("title") or "")[:240]
+    # یک مرحله اصلاح زبانی فقط وقتی لازم است؛ هدف کاهش مصرف توکن و جلوگیری از خروجی انگلیسی است.
+    raw_title=strip_html_text(obj.get("title") or item.get("title") or "")[:240]
+    raw_ch=str(obj.get("channel_html") or obj.get("channel_text") or "")
+    raw_ar=str(obj.get("article_html") or obj.get("article_text") or "")
+    if _needs_persian_rewrite(raw_title, raw_ch, raw_ar):
+        repair=(
+            "متن زیر خروجی تحریریه است اما بخش زیادی انگلیسی شده. فقط بازنویسی فارسی انجام بده و هیچ واقعیتی را تغییر نده. "
+            "نام شرکت‌ها، مدل‌ها و اصطلاحات فنی شناخته‌شده را همان‌طور نگه دار. خروجی فقط JSON معتبر با سه کلید title, channel_html, article_html باشد. "
+            "قالب Telegram HTML مجاز است و یک Quote کوتاه هم نگه دار/ایجاد کن.\n\n"
+            + json.dumps({"title":raw_title,"channel_html":raw_ch,"article_html":raw_ar},ensure_ascii=False)[:20000]
+        )
+        repaired=await ai.call([{"role":"system","content":"Rewrite to fluent Persian. Return JSON only."},{"role":"user","content":repair}],0.15,4200,"editorial_persian_repair")
+        pobj=parse_json_object(repaired.get("content",""))
+        if pobj:
+            raw_title=strip_html_text(pobj.get("title") or raw_title)[:240]
+            raw_ch=str(pobj.get("channel_html") or raw_ch)
+            raw_ar=str(pobj.get("article_html") or raw_ar)
+            obj["title"]=raw_title; obj["channel_html"]=raw_ch; obj["article_html"]=raw_ar
+            result=repaired
+    title=raw_title
     category=str(obj.get("category") or source.get("category") or "tech")
-    ch=ensure_rich_channel_format(title, obj.get("channel_html") or obj.get("channel_text") or "", category)
-    ar=ensure_rich_article_format(title, obj.get("article_html") or obj.get("article_text") or "", item.get("url") or "")
+    # واحدِ قالب‌بندی قطعی: هر خروجی، حتی اگر AI متن خام داده باشد، یک‌بار از همین renderer عبور می‌کند.
+    ch=ensure_rich_channel_format(title, raw_ch, category)
+    ar=ensure_rich_article_format(title, raw_ar, item.get("url") or "")
     resource_links=sanitize_resource_links(obj.get("resource_links"))
     ar=append_resource_links(ar, resource_links, item.get("url") or "")
     obj["title"]=title; obj["channel_html"]=ch; obj["article_html"]=ar; obj["resource_links"]=resource_links
@@ -1978,8 +2015,11 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                         if existing_status in {'ready','published','analyzing'}:
                             return {'processed':0,'rejected':0,'seen':1,'reason':'seen'}
                     body=item.get('body') or item.get('description') or ''
-                    if not body.strip(): return {'processed':0,'rejected':1,'reason':'no_body'}
-                    content_hash=text_hash(title+' '+body)
+                    body_plain=strip_html_text(body)
+                    if len(body_plain) < 80:
+                        # منبع واقعاً اطلاعاتی برای تولید ندارد؛ خبر را با متن ساختگی پر نمی‌کنیم، Candidate بعدی را امتحان می‌کنیم.
+                        return {'processed':0,'rejected':1,'reason':'source_content_too_thin'}
+                    content_hash=text_hash(title+' '+body_plain)
                     recent_pub=await db.execute("SELECT id FROM articles WHERE status IN ('published','ready','test') AND source_url=? AND COALESCE(published_at,created_at) >= ? LIMIT 1",[url,(now-timedelta(hours=24)).isoformat()])
                     if recent_pub and not allow_old_test:
                         return {'processed':0,'rejected':0,'seen':1,'reason':'published_url_recently'}
@@ -2025,15 +2065,15 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                     # Canonical content pipeline: these are rendered exactly once by ai_editorial_process.
                     # Do not reformat/fallback later; re-rendering was the source of inconsistent channel/article output.
                     title_out=strip_html_text(out.get('title') or title)[:500]
-                    channel_text=sanitize_telegram_html(out.get('channel_html') or out.get('channel_text') or '')
-                    article_text=sanitize_telegram_html(out.get('article_html') or out.get('article_text') or '')
+                    # از خروجی نهایی AI همان یک renderer اصلی را اجرا می‌کنیم؛ دیگر مسیر خام/متفاوت نداریم.
+                    channel_text=ensure_rich_channel_format(title_out, out.get('channel_html') or out.get('channel_text') or body_plain, str(out.get('category') or source.get('category') or 'tech'))
+                    article_text=ensure_rich_article_format(title_out, out.get('article_html') or out.get('article_text') or body_plain, url)
                     channel_text=clean_channel_copy(channel_text)
                     article_text=remove_article_metadata_blocks(article_text)
-                    if not strip_html_text(channel_text):
-                        channel_text=ensure_rich_channel_format(title_out, title_out, str(out.get('category') or source.get('category') or 'tech'))
-                    if not strip_html_text(article_text):
-                        article_text=ensure_rich_article_format(title_out, body or title_out, url)
-                    if plain_len(article_text)<60:
+                    if not strip_html_text(channel_text) or not strip_html_text(article_text):
+                        if item_id: await db.execute("UPDATE source_items SET status='error',last_error=?,retry_after=? WHERE id=?",['generation produced no usable rich content',(now+timedelta(minutes=15)).isoformat(),item_id])
+                        return {'processed':1,'errors':1,'reason':'generation empty'}
+                    if plain_len(article_text)<80:
                         if item_id: await db.execute("UPDATE source_items SET status='error',last_error=?,retry_after=? WHERE id=?",['generation produced no usable text',(now+timedelta(minutes=15)).isoformat(),item_id])
                         return {'processed':1,'errors':1,'reason':'generation empty'}
                     art=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at,source_published_at) VALUES(?,?,?,?,?,?,?,?,'ready',?,?) RETURNING id",
@@ -4547,8 +4587,8 @@ async def health_dry_run(call:CallbackQuery,db:D1Database,bot:Bot):
         if float(out.get('score',0) or 0) < min_score:
             await edit_health_progress(call.message,f"⚠️ <b>این گزینه زیر حداقل امتیاز مدیر بود.</b>\n\nامتیاز: <b>{out.get('score','-')}</b> · حد مدیر: <b>{min_score:g}</b>\nدلیل: {html.escape(str(out.get('why','-'))[:800])}", get_admin_back_kb("auto_health")); return
         await edit_health_progress(call.message,health_progress_block(4,6,"محتوا تولید شد","در حال بررسی Formatting و طول متن…"))
-        ch=sanitize_telegram_html(out.get('channel_html') or out.get('channel_text') or '')
-        ar=sanitize_telegram_html(out.get('article_html') or out.get('article_text') or '')
+        ch=ensure_rich_channel_format(str(out.get('title') or item.get('title') or 'مطلب'), out.get('channel_html') or out.get('channel_text') or item.get('body') or item.get('description') or '', str(out.get('category') or src.get('category') or 'tech'))
+        ar=ensure_rich_article_format(str(out.get('title') or item.get('title') or 'مطلب'), out.get('article_html') or out.get('article_text') or item.get('body') or item.get('description') or '', item.get('url') or '')
         await edit_health_progress(call.message,health_progress_block(5,6,"قالب و محتوا آماده شد","عکس منبع و Deep Link آزمایشی نیز بررسی می‌شوند."))
         ai_info=out.get('ai') or {}
         msg=("✅ <b>تست تولید واقعی موفق شد.</b>\n\n"
