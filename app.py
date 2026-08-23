@@ -49,7 +49,7 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "10.8.0-fresh-news-managed-metrics-ai-fallback-final"
+BUILD_VERSION = "10.17.0-generation-failover-no-length-gate-final"
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_AI_WORKERS = 3
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -909,18 +909,23 @@ def parse_json_object(text: str) -> Dict[str, Any]:
     text = (text or "").strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S).strip()
-    try:
-        obj = json.loads(text)
-        return obj if isinstance(obj, dict) else {}
-    except Exception:
-        m = re.search(r"\{.*\}", text, flags=re.S)
-        if m:
+    def _loads(candidate: str):
+        try:
+            obj = json.loads(candidate)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            # Recover stray backslashes that are illegal JSON escape sequences.
+            repaired = re.sub(r"\\(?![\"/bfnrt]|u[0-9a-fA-F]{4})", lambda m: "\\\\", candidate)
             try:
-                obj = json.loads(m.group(0))
+                obj = json.loads(repaired)
                 return obj if isinstance(obj, dict) else {}
             except Exception:
                 return {}
-        return {}
+    obj = _loads(text)
+    if obj:
+        return obj
+    m = re.search(r"\{.*\}", text, flags=re.S)
+    return _loads(m.group(0)) if m else {}
 
 
 class AIProviderManager:
@@ -1421,7 +1426,7 @@ def _protect_bidi_latin(text: str) -> str:
         if re.match(r"<a\b|<code>|<pre>", part, flags=re.I):
             out.append(part); continue
         # Add LRM around compact Latin/number runs that are likely to reorder inside Persian.
-        part=re.sub(r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9@._+/#:-]{1,64})(?![A-Za-z0-9])", r"\u200e\1\u200e", part)
+        part=re.sub(r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9@._+/#:-]{1,64})(?![A-Za-z0-9])", lambda m: "\u200e" + m.group(1) + "\u200e", part)
         out.append(part)
     return "".join(out)
 
@@ -1884,9 +1889,9 @@ URL: {item.get('url')}
 
 این دو دستور فقط مشخص می‌کنند چه اطلاعات و چه نوع محتوایی پوشش داده شود؛ به هیچ وجه قوانین Formatting را تغییر نده. قالب‌بندی وظیفه موتور تولید و ربات است.
 
-اول فقط برای تصمیم داخلی، امتیاز 0 تا 100 بده. این تصمیم نباید وارد متن نهایی شود و نباید با عبارت‌هایی مثل «این خبر مهم است»، «این خبر ارزشمند است»، «ما توصیه می‌کنیم» یا قضاوت شخصی نوشته شود.
+اول برای امتیازدهی داخلی، امتیاز 0 تا 100 بده. فیلد accept فقط توضیح داخلی است و دروازه مستقل انتشار نیست؛ تصمیم نهایی را معیارهای عددی مدیر می‌گیرند. صرفاً به‌دلیل کوتاه بودن متن accept=false نده.
 تازگی توسط برنامه به‌صورت فنی و مستقل کنترل می‌شود؛ از ساختن تاریخ یا حدس‌زدن آن خودداری کن. مطالب خارج از پنجره ۶ ساعت برنامه اصلاً به این مرحله نمی‌رسند. مقدار accept فقط برای توصیف داخلی پاسخ است و تصمیم انتشار نهایی را برنامه بر اساس امتیاز و تنظیمات مدیر می‌گیرد.
-اگر اطلاعات کافی برای تولید دقیق وجود ندارد، محتوای قابل‌اعتماد تولید نکن و دلیل را در why بنویس.
+کوتاهی متن منبع، کم بودن پاراگراف‌ها یا یک‌جمله‌ای بودن خلاصه به‌تنهایی دلیل رد محتوا نیست. اگر منبع کوتاه است، بهترین محتوای کوتاه و دقیق ممکن را فقط بر اساس همان اطلاعات تولید کن؛ طول محتوا معیار پذیرش نیست و هرگز جزئیات، عدد یا ادعای ساختگی اضافه نکن.
 
 اگر accept=true، همزمان محتوای نهایی را تولید کن:
 1) channel_html: حدود 450 تا 650 کاراکتر «خودِ خبر»؛ نه teaser و نه صرفاً معرفی لینک. ساختار بصری داشته باشد: تیتر/شروع با <b>، حداکثر 1 بخش کوتاه با <i> یا <blockquote> فقط وقتی طبیعی است، پاراگراف‌های کوتاه و 1 تا 3 ایموجی دقیق و مرتبط.
@@ -2013,6 +2018,15 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                     body=item.get('body') or item.get('description') or ''
                     if not body.strip(): return {'processed':0,'rejected':1,'reason':'no_body'}
                     content_hash=text_hash(title+' '+body)
+                    recent_pub=await db.execute("SELECT id FROM articles WHERE status IN ('published','ready','test') AND source_url=? AND COALESCE(published_at,created_at) >= ? LIMIT 1",[url,(now-timedelta(hours=24)).isoformat()])
+                    if recent_pub and not allow_old_test:
+                        return {'processed':0,'rejected':0,'seen':1,'reason':'published_url_recently'}
+                    recent_hash=await db.execute("SELECT id FROM articles WHERE status IN ('published','ready','test') AND COALESCE(published_at,created_at) >= ? LIMIT 200",[(now-timedelta(hours=24)).isoformat()])
+                    # Compare only a small recent window; database remains lightweight.
+                    if recent_hash and not allow_old_test:
+                        recent_bodies=await db.execute("SELECT title,body FROM articles WHERE status IN ('published','ready','test') AND COALESCE(published_at,created_at) >= ? ORDER BY id DESC LIMIT 50",[(now-timedelta(hours=24)).isoformat()])
+                        if any(text_hash(str(r.get('title') or '')+' '+str(r.get('body') or ''))==content_hash for r in recent_bodies):
+                            return {'processed':0,'rejected':0,'seen':1,'reason':'published_hash_recently'}
                     hash_exists=await db.execute('SELECT id,status,retry_after FROM source_items WHERE content_hash=? LIMIT 1',[content_hash])
                     if hash_exists and not allow_old_test and not item_id:
                         hrow=hash_exists[0]; hstatus=str(hrow.get('status') or '')
@@ -2053,9 +2067,11 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                     if plain_len(channel_text)>780: channel_text=rich_channel_fallback(title_out,channel_text)
                     if plain_len(article_text)<1200: article_text=rich_article_fallback(title_out,article_text,url)
                     if plain_len(article_text)>4200: article_text=ensure_rich_article_format(title_out,strip_html_text(article_text)[:4200],url)
-                    if plain_len(article_text)<900:
-                        if item_id: await db.execute("UPDATE source_items SET status='rejected',last_error='article too short',retry_after=? WHERE id=?",[(now+timedelta(minutes=15)).isoformat(),item_id])
-                        return {'processed':1,'rejected':1,'reason':'article too short'}
+                    if plain_len(article_text)<120:
+                        article_text=rich_article_fallback(title_out, article_text or body or title_out, url)
+                    if plain_len(article_text)<60:
+                        if item_id: await db.execute("UPDATE source_items SET status='error',last_error=?,retry_after=? WHERE id=?",['generation produced no usable text',(now+timedelta(minutes=15)).isoformat(),item_id])
+                        return {'processed':1,'errors':1,'reason':'generation empty'}
                     art=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at,source_published_at) VALUES(?,?,?,?,?,?,?,?,'ready',?,?) RETURNING id",
                         [item_id,title_out,channel_text,article_text[:18000],url,'',out.get('category') or source.get('category','tech'),score,now.isoformat(),item.get('published_at','')[:100]])
                     aid=art[0].get('id') if art else 0
@@ -2110,7 +2126,9 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                             channel_text=ensure_rich_channel_format(title_out,out.get('channel_html') or out.get('channel_text') or '',str(out.get('category') or source.get('category') or 'tech'))
                             article_text=ensure_rich_article_format(title_out,out.get('article_html') or out.get('article_text') or '',u)
                             article_text=append_resource_links(article_text,out.get('resource_links'),u)
-                            if plain_len(article_text)<900: continue
+                            if plain_len(article_text)<120:
+                                article_text=rich_article_fallback(title_out, article_text or body or title_out, u)
+                            if plain_len(article_text)<60: continue
                             art=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at,source_published_at) VALUES(?,?,?,?,?,?,?,?,'ready',?,?) RETURNING id",[item_id,title_out,channel_text,article_text[:18000],u,'',out.get('category') or source.get('category','tech'),score,now.isoformat(),raw.get('published_at','')[:100]])
                             aid=art[0].get('id') if art else 0
                             if not aid: continue
@@ -4500,7 +4518,9 @@ async def choose_test_candidate(db, ai, progress=None):
     """
     rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC LIMIT 20")
     recent_tested_hashes={str(r.get('content_hash') or '') for r in await db.execute("SELECT content_hash FROM test_history ORDER BY id DESC LIMIT 200") if r.get('content_hash')}
-    recent_article_urls={normalize_url(r.get('source_url') or '') for r in await db.execute("SELECT source_url FROM articles WHERE status IN ('published','ready') ORDER BY id DESC LIMIT 200") if r.get('source_url')}
+    recent_article_rows=await db.execute("SELECT source_url,body,title FROM articles WHERE status IN ('published','ready','test') ORDER BY id DESC LIMIT 300")
+    recent_article_urls={normalize_url(r.get('source_url') or '') for r in recent_article_rows if r.get('source_url')}
+    recent_article_hashes={text_hash(str(r.get('title') or '')+' '+str(r.get('body') or '')) for r in recent_article_rows}
     diagnostics=[]
     total=len(rows)
     for idx,src in enumerate(rows,1):
@@ -4526,7 +4546,7 @@ async def choose_test_candidate(db, ai, progress=None):
                     continue
                 body=(c.get('body') or c.get('description') or '').strip(); url=normalize_url(c.get('url') or '')
                 chash=text_hash((c.get('title') or '')+' '+body)
-                if len(body)<120 or not url or url in recent_article_urls or chash in recent_tested_hashes:
+                if len(body)<20 or not url or url in recent_article_urls or chash in recent_tested_hashes or chash in recent_article_hashes:
                     continue
                 c['_test_hash']=chash
                 if progress: await progress(f"✅ {idx}/{total} · {name} → گزینه تازه پیدا شد")
@@ -4560,8 +4580,9 @@ async def health_dry_run(call:CallbackQuery,db:D1Database,bot:Bot):
         out=await ai_editorial_process(ai,item,src,[],weights,await get_manager_editorial_prompts(db))
         if out.get('error'):
             await edit_health_progress(call.message,"❌ <b>تست تولید شکست خورد</b>\n\n<code>"+html.escape(str(out['error'])[:1800])+"</code>", get_admin_back_kb("auto_health")); return
-        if not out.get('accept',True):
-            await edit_health_progress(call.message,f"⚠️ <b>AI پاسخ داد اما این Candidate را نپذیرفت.</b>\n\nامتیاز: <b>{out.get('score','-')}</b>\nدلیل: {html.escape(str(out.get('why','-'))[:800])}\n\nبرای تست سیستم می‌توانی یک منبع دیگر را هم امتحان کنی.", get_admin_back_kb("auto_health")); return
+        min_score=float(await get_setting(db,'min_content_score',str(DEFAULT_MIN_CONTENT_SCORE)))
+        if float(out.get('score',0) or 0) < min_score:
+            await edit_health_progress(call.message,f"⚠️ <b>این گزینه زیر حداقل امتیاز مدیر بود.</b>\n\nامتیاز: <b>{out.get('score','-')}</b> · حد مدیر: <b>{min_score:g}</b>\nدلیل: {html.escape(str(out.get('why','-'))[:800])}", get_admin_back_kb("auto_health")); return
         await edit_health_progress(call.message,health_progress_block(4,6,"محتوا تولید شد","در حال بررسی Formatting و طول متن…"))
         ch=sanitize_telegram_html(out.get('channel_html') or '')
         ar=sanitize_telegram_html(out.get('article_html') or '')
@@ -4639,8 +4660,10 @@ async def health_test_publish(call:CallbackQuery,db:D1Database,bot:Bot):
         weights={k:float(await get_setting(db,'weight_'+k,'10')) for k in ['global','technology','ai','cyber','education','iran','freshness','source','novelty']}
         out=await ai_editorial_process(ai,item,src,[],weights,await get_manager_editorial_prompts(db))
         if out.get('error'): raise RuntimeError(out['error'])
-        # For a real test, do not allow an editorial rejection to become a fake post; tell the manager why.
-        if not out.get('accept',True): raise RuntimeError(f"محتوای واقعی در مرحله انتخاب رد شد؛ امتیاز {out.get('score','-')} — {out.get('why','')}")
+        # Test publication obeys only the manager's numeric threshold.
+        min_score=float(await get_setting(db,'min_content_score',str(DEFAULT_MIN_CONTENT_SCORE)))
+        if float(out.get('score',0) or 0) < min_score:
+            raise RuntimeError(f"امتیاز {out.get('score','-')} کمتر از حداقل امتیاز مدیر {min_score:g} است")
         ch=ensure_rich_channel_format(out.get('title') or item.get('title') or '',sanitize_telegram_html(out.get('channel_html') or ''),str(out.get('category') or 'tech'))
         ar=ensure_rich_article_format(out.get('title') or item.get('title') or '',sanitize_telegram_html(out.get('article_html') or ''),item.get('url') or '')
         ar=append_resource_links(ar,out.get('resource_links'),item.get('url') or '')
