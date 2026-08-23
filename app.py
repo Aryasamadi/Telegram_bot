@@ -1,4 +1,4 @@
-# VERSION 10.13.0 — unified user archive, compact saved view, richer formatting, no active rate limiter
+# VERSION 10.21.0 — canonical content pipeline, persistent source cursor, manager-first scoring
 import os
 import io
 import re
@@ -49,7 +49,7 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "10.19.0-all-sources-queue-diagnostics-format-final"
+BUILD_VERSION = "10.21.0-canonical-content-pipeline-db-reset-safe-final"
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_AI_WORKERS = 3
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -1625,63 +1625,106 @@ def extract_xml_locs_resilient(text: str) -> List[str]:
 
 
 async def discover_for_processing(db: D1Database, source: Dict[str,Any], ai: AIProviderManager, allow_scout=False, include_old=False) -> Dict[str,Any]:
-    """Primary discovery is cheap/direct. Only fresh items are eligible for automation.
-    AI Web Scout is a controlled fallback when direct discovery cannot supply a fresh/new item.
-    include_old is reserved for explicit tests and never used by autonomous cycles."""
-    # In autonomous news mode, sitemap crawling is intentionally disabled; it can surface years-old URLs.
-    # Tests may still use sitemap discovery explicitly.
+    """Single direct-discovery path used by tests and automation.
+
+    Design goals:
+    - only direct RSS/feed/API/homepage/article extraction; no Web Scout;
+    - hard freshness window is 24h, with 0-6h handled as priority later;
+    - persistent source cursor prevents re-publishing old feed entries even if content tables are cleared;
+    - when a source has never been seen before, current fresh items are eligible;
+    - after a content-table wipe, the source cursor in `sources` remains the durable boundary.
+    """
     direct = await discover_source_items(source, return_diagnostics=True, use_sitemap=False)
     raw_items=list(direct.get('items') or [])
     diagnostics=list(direct.get('diagnostics') or [])
     now=datetime.now(timezone.utc)
-    # Homepage/HTML discovery often gives a URL without its publication timestamp.
-    # Hydrate only those few candidates before the 6h freshness gate, so a fresh article
-    # is not rejected merely because its feed exposed no date.
+
+    # Homepage/HTML discovery may not expose dates in the feed item; hydrate article pages first.
     needs_hydration=[dict(x) for x in raw_items if not parse_publication_datetime(x.get('published_at') or '') and x.get('url')]
     if needs_hydration:
         hydrated=await asyncio.gather(*(enrich_candidate_content(x) for x in needs_hydration[:MAX_SOURCE_ITEMS_PER_CYCLE]), return_exceptions=True)
         repl={normalize_url(x.get('url') or ''):x for x in hydrated if isinstance(x,dict)}
         for idx,raw in enumerate(raw_items):
             key=normalize_url(raw.get('url') or '')
-            if key in repl: raw_items[idx]=repl[key]
+            if key in repl:
+                merged=dict(raw)
+                merged.update({k:v for k,v in repl[key].items() if v not in (None,'')})
+                raw_items[idx]=merged
+
     fresh_items, fresh_diag, newest_dt, newest_url = ((raw_items[:MAX_SOURCE_ITEMS_PER_CYCLE], [], None, "") if include_old else select_latest_fresh_items(raw_items, now=now))
     diagnostics.extend(fresh_diag)
+
     source_id=source.get('id')
-    unseen=[]; seen_count=0
+    last_seen=parse_publication_datetime(str(source.get('last_seen_published_at') or ''))
+    last_url=normalize_url(source.get('last_seen_url') or '')
+    unseen=[]
+    seen_count=0
+    cursor_filtered=0
+
     for raw in fresh_items:
         u=normalize_url(raw.get('url') or '')
-        if not u: continue
-        # last_seen is telemetry/optimization only; never let an old cursor hide a genuinely fresh article.
-        # We rely on the 6-hour freshness gate plus the item status for deduplication.
+        if not u:
+            continue
+        pub_dt=parse_publication_datetime(raw.get('published_at') or '')
+
         exists=await db.execute('SELECT id,status,retry_after FROM source_items WHERE source_id=? AND canonical_url=?',[source_id,u]) if source_id else []
+        # Existing rejected/error items are allowed back through after cooldown while still fresh.
+        # This means changing the manager's score/weights can take effect without waiting for a new article.
+        existing_status=str(exists[0].get('status') or '') if exists else ''
+        existing_retry=parse_publication_datetime(str(exists[0].get('retry_after') or '')) if exists else None
+        reusable_rejected = bool(exists and existing_status in {'rejected','error'} and (not existing_retry or existing_retry <= now))
+
+        # Durable boundary: this survives deletion of articles/source_items and prevents replay.
+        # Rejected/error entries are the only deliberate exception so manager criteria can be changed.
+        if not include_old and last_seen and not reusable_rejected:
+            if not pub_dt:
+                cursor_filtered += 1
+                continue
+            if pub_dt < last_seen or (pub_dt == last_seen and last_url and u <= last_url):
+                cursor_filtered += 1
+                continue
+
         if exists:
             row=exists[0]
             status=str(row.get('status') or '')
             retry_at=parse_publication_datetime(str(row.get('retry_after') or ''))
             if not include_old and retry_at and retry_at > now:
-                seen_count+=1
+                seen_count += 1
                 continue
             if status in {'ready','published','analyzing'} and not include_old:
-                seen_count+=1
+                seen_count += 1
                 continue
-            # Rejected/error items remain eligible after their short retry cooldown so changing
-            # the manager's threshold can take effect without waiting for the source cursor to move.
-            raw=dict(raw); raw['_existing_source_item_id']=int(row.get('id') or 0)
+            raw=dict(raw)
+            raw['_existing_source_item_id']=int(row.get('id') or 0)
             unseen.append(raw)
         else:
             unseen.append(raw)
-    # Persist cursor only to the newest actually discovered timestamp/url; this is tiny metadata and is not article storage.
+
+    # Advance the durable cursor to the newest item actually discovered, even if it was not queued.
+    # This prevents a later DB cleanup from resurrecting the same historical feed window.
     if newest_dt and newest_url and not include_old:
         try:
             await db.execute('UPDATE sources SET last_seen_published_at=?, last_seen_url=? WHERE id=?',[newest_dt.isoformat(),newest_url,source_id])
         except Exception:
             pass
-    # Web Scout intentionally disabled in 10.18; direct discovery only.
-    method=direct.get('method') or ''
+
+    method=direct.get('method') or 'direct'
     if not unseen and raw_items and not fresh_items:
-        method=(method or 'direct')+'+freshness_gate'
-    return {'items':unseen[:MAX_SOURCE_ITEMS_PER_CYCLE],'method':method,'diagnostics':diagnostics,
-            'direct_count':len(raw_items),'fresh_count':len(fresh_items),'seen_count':seen_count,'new_count':len(unseen)}
+        method += '+freshness_gate'
+    elif cursor_filtered and not unseen:
+        method += '+cursor'
+    elif unseen:
+        method += '+new'
+    return {
+        'items': unseen[:MAX_SOURCE_ITEMS_PER_CYCLE],
+        'method': method,
+        'diagnostics': diagnostics,
+        'direct_count': len(raw_items),
+        'fresh_count': len(fresh_items),
+        'seen_count': seen_count,
+        'cursor_filtered': cursor_filtered,
+        'new_count': len(unseen),
+    }
 
 
 def format_source_publication_date(raw: str) -> str:
@@ -1889,9 +1932,11 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                         if item_id: await db.execute("UPDATE source_items SET status='error',last_error=?,retry_after=? WHERE id=?",[out['error'][:1200],(now+timedelta(minutes=15)).isoformat(),item_id])
                         return {'processed':1,'errors':1,'reason':out['error'][:220]}
                     score=float(out.get('score',0) or 0); min_score=float(await get_setting(db,'min_content_score',str(DEFAULT_MIN_CONTENT_SCORE)))
-                    # Manager-controlled threshold is the publication gate. Duplicate risk is already
-                    # represented by the novelty weight and the persistent duplicate/cursor checks.
-                    accept=score>=min_score
+                    # Manager controls the gate. Special low-threshold mode is intentional: when the
+                    # manager sets the minimum to 0/1, every fresh, non-duplicate item is eligible.
+                    # The AI is still used for extraction/formatting; it is not a hidden veto.
+                    low_threshold_mode = min_score <= 1
+                    accept = True if low_threshold_mode else (score >= min_score)
                     if not accept:
                         if item_id: await db.execute("UPDATE source_items SET status='rejected',score=?,category=?,last_error=?,retry_after=? WHERE id=?",[score,out.get('category',source.get('category','tech')),str(out.get('why') or 'score below threshold')[:1000],(now+timedelta(minutes=15)).isoformat(),item_id])
                         return {'processed':1,'rejected':1,'score':score,'reason':str(out.get('why') or 'score below threshold')[:220]}
@@ -1902,16 +1947,17 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                         if not verify.get('ok') or float(verify.get('confidence',0) or 0)<80:
                             if item_id: await db.execute("UPDATE source_items SET status='rejected',score=?,last_error=?,retry_after=? WHERE id=?",[score,json.dumps(verify,ensure_ascii=False)[:1200],(now+timedelta(minutes=15)).isoformat(),item_id])
                             return {'processed':1,'rejected':1,'score':score,'reason':'verification'}
+                    # Canonical content pipeline: these are rendered exactly once by ai_editorial_process.
+                    # Do not reformat/fallback later; re-rendering was the source of inconsistent channel/article output.
                     title_out=strip_html_text(out.get('title') or title)[:500]
-                    article_text=ensure_rich_article_format(title_out,out.get('article_html') or out.get('article_text') or '',url)
-                    article_text=append_resource_links(article_text,out.get('resource_links'),url)
+                    channel_text=sanitize_telegram_html(out.get('channel_html') or out.get('channel_text') or '')
+                    article_text=sanitize_telegram_html(out.get('article_html') or out.get('article_text') or '')
+                    channel_text=clean_channel_copy(channel_text)
                     article_text=remove_article_metadata_blocks(article_text)
-                    channel_text=ensure_rich_channel_format(title_out,out.get('channel_html') or out.get('channel_text') or '',str(out.get('category') or source.get('category') or 'tech'))
-                    if plain_len(channel_text)>780: channel_text=rich_channel_fallback(title_out,channel_text)
-                    if plain_len(article_text)<1200: article_text=rich_article_fallback(title_out,article_text,url)
-                    if plain_len(article_text)>4200: article_text=ensure_rich_article_format(title_out,strip_html_text(article_text)[:4200],url)
-                    if plain_len(article_text)<120:
-                        article_text=rich_article_fallback(title_out, article_text or body or title_out, url)
+                    if not strip_html_text(channel_text):
+                        channel_text=ensure_rich_channel_format(title_out, title_out, str(out.get('category') or source.get('category') or 'tech'))
+                    if not strip_html_text(article_text):
+                        article_text=ensure_rich_article_format(title_out, body or title_out, url)
                     if plain_len(article_text)<60:
                         if item_id: await db.execute("UPDATE source_items SET status='error',last_error=?,retry_after=? WHERE id=?",['generation produced no usable text',(now+timedelta(minutes=15)).isoformat(),item_id])
                         return {'processed':1,'errors':1,'reason':'generation empty'}
@@ -1999,16 +2045,26 @@ def _trim_rich_blocks_to_limit(value: str, max_plain_chars: int = 760) -> str:
     return trimmed
 
 def publication_caption(title: str, channel_html: str, deep_link: str) -> str:
-    clean=_trim_rich_blocks_to_limit(channel_html, 760)
+    """Build a single rich caption under Telegram's 1024-char caption limit."""
     link=f'<a href="{html.escape(deep_link,quote=True)}">📖 بیشتر بخوانید</a>'
+    clean=_trim_rich_blocks_to_limit(channel_html, 760)
     caption=(clean.strip()+"\n\n"+link).strip()
     if len(caption) <= 1024:
         return caption
-    # Preserve rich formatting as far as possible; only fall back to plain text as a last resort.
-    plain=strip_html_text(clean)
+    # Drop whole rich blocks before ever stripping formatting.
+    blocks=[b.strip() for b in re.split(r"\n\s*\n+", sanitize_telegram_html(clean)) if strip_html_text(b).strip()]
+    while len(blocks)>1 and len("\n\n".join(blocks)+"\n\n"+link)>1024:
+        blocks.pop()
+    candidate=("\n\n".join(blocks)+"\n\n"+link).strip()
+    if len(candidate) <= 1024:
+        return candidate
+    # Last-resort: keep Telegram-safe HTML by truncating the current final block as plain text,
+    # then escaping only that truncated block. This path is rare because channel content is short.
+    plain=strip_html_text("\n\n".join(blocks))
     budget=max(120, 1024-len(strip_html_text(link))-8)
     plain=plain[:budget].rsplit(' ',1)[0]+"…"
     return html.escape(plain,quote=False)+"\n\n"+link
+
 
 async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> bool:
     if force:
@@ -2035,7 +2091,7 @@ async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> b
         deep_link=f"https://t.me/{bot_username}?start=article_{token}"
         channel_id=await get_channel_id(db)
         title_out=str(row.get("title") or "مطلب")
-        channel_text=ensure_rich_channel_format(title_out,row.get("channel_text") or "",str(row.get("category") or "tech"))
+        channel_text=sanitize_telegram_html(row.get("channel_text") or "")
         source_url=normalize_url(row.get("source_url") or "")
         # The channel contains exactly one navigation link: the article Deep Link.
         # The real source link lives inside the full article behind that Deep Link.
@@ -2104,9 +2160,13 @@ async def automation_loop(db: D1Database, bot: Bot):
                         results=await asyncio.gather(*(run_source(src) for src in due_sources),return_exceptions=True)
                     published=await publish_next_article(db,bot)
                     summary={
-                        'sources':len(due_sources),'processed':sum((r.get('processed',0) if isinstance(r,dict) else 0) for r in results),
+                        'sources':len(due_sources),
+                        'processed':sum((r.get('processed',0) if isinstance(r,dict) else 0) for r in results),
                         'accepted':sum((r.get('accepted',0) if isinstance(r,dict) else 0) for r in results),
-                        'queued':sum((r.get('queued',0) if isinstance(r,dict) else 0) for r in results),'published':bool(published)
+                        'rejected':sum((r.get('rejected',0) if isinstance(r,dict) else 0) for r in results),
+                        'errors':sum((r.get('errors',0) if isinstance(r,dict) else 0) for r in results),
+                        'queued':sum((r.get('queued',0) if isinstance(r,dict) else 0) for r in results),
+                        'published':bool(published)
                     }
                     await set_setting(db,'last_cycle_result',json.dumps(summary,ensure_ascii=False))
                     await set_setting(db,'last_cycle_finished_at',datetime.now(timezone.utc).isoformat())
@@ -2704,7 +2764,9 @@ async def deliver_article_by_token(message: Message, bot: Bot, db: D1Database, t
     image=await resolve_article_image(db,article)
     if image:
         try:
-            photo_caption=f"<b>📖 {title}</b>\n\n<i>⏱ {relative}</i>"
+            photo_caption=f"<b>📖 {title}</b>"
+            if relative != 'زمان نامشخص':
+                photo_caption += f"\n\n<i>⏱ {relative}</i>"
             await bot.send_photo(message.chat.id,photo=image,caption=photo_caption,parse_mode='HTML')
         except Exception:
             pass
@@ -4311,6 +4373,7 @@ async def health_test_source(call:CallbackQuery,db:D1Database,bot:Bot):
             try:
                 r=await discover_for_processing(db,src,ai,allow_scout=False,include_old=False)
                 n=len(r.get('items') or []); found=int(r.get('direct_count',0) or 0); method=r.get('method') or 'مستقیم'
+                if 'sitemap' in method.lower(): method='direct'
                 if n:
                     marker='🟢 قابل بررسی'
                 elif found:
@@ -4407,10 +4470,8 @@ async def health_dry_run(call:CallbackQuery,db:D1Database,bot:Bot):
         if float(out.get('score',0) or 0) < min_score:
             await edit_health_progress(call.message,f"⚠️ <b>این گزینه زیر حداقل امتیاز مدیر بود.</b>\n\nامتیاز: <b>{out.get('score','-')}</b> · حد مدیر: <b>{min_score:g}</b>\nدلیل: {html.escape(str(out.get('why','-'))[:800])}", get_admin_back_kb("auto_health")); return
         await edit_health_progress(call.message,health_progress_block(4,6,"محتوا تولید شد","در حال بررسی Formatting و طول متن…"))
-        ch=sanitize_telegram_html(out.get('channel_html') or '')
-        ar=sanitize_telegram_html(out.get('article_html') or '')
-        ch=ensure_rich_channel_format(out.get('title') or item.get('title') or '',ch,str(out.get('category') or 'tech'))
-        ar=ensure_rich_article_format(out.get('title') or item.get('title') or '',ar,item.get('url') or '')
+        ch=sanitize_telegram_html(out.get('channel_html') or out.get('channel_text') or '')
+        ar=sanitize_telegram_html(out.get('article_html') or out.get('article_text') or '')
         await edit_health_progress(call.message,health_progress_block(5,6,"قالب و محتوا آماده شد","عکس منبع و Deep Link آزمایشی نیز بررسی می‌شوند."))
         ai_info=out.get('ai') or {}
         msg=("✅ <b>تست تولید واقعی موفق شد.</b>\n\n"
@@ -4500,10 +4561,10 @@ async def health_test_publish(call:CallbackQuery,db:D1Database,bot:Bot):
         if out.get('error'): raise RuntimeError(out['error'])
         # Test publication obeys only the manager's numeric threshold.
         min_score=float(await get_setting(db,'min_content_score',str(DEFAULT_MIN_CONTENT_SCORE)))
-        if float(out.get('score',0) or 0) < min_score:
+        if min_score > 1 and float(out.get('score',0) or 0) < min_score:
             raise RuntimeError(f"امتیاز {out.get('score','-')} کمتر از حداقل امتیاز مدیر {min_score:g} است")
-        ch=ensure_rich_channel_format(out.get('title') or item.get('title') or '',sanitize_telegram_html(out.get('channel_html') or ''),str(out.get('category') or 'tech'))
-        ar=ensure_rich_article_format(out.get('title') or item.get('title') or '',sanitize_telegram_html(out.get('article_html') or ''),item.get('url') or '')
+        ch=sanitize_telegram_html(out.get('channel_html') or out.get('channel_text') or '')
+        ar=sanitize_telegram_html(out.get('article_html') or out.get('article_text') or '')
         ar=append_resource_links(ar,out.get('resource_links'),item.get('url') or '')
         ar=remove_article_metadata_blocks(ar)
         await edit_health_progress(call.message,health_progress_block(3,6,'محتوا و Formatting آماده شد','در حال ذخیره مقاله تست و ساخت Deep Link…'))
