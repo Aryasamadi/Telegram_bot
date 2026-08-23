@@ -49,7 +49,7 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "10.25.0-webscout-v1-db-light"
+BUILD_VERSION = "10.25.1-webscout-v2-provider"
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_AI_WORKERS = 3
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -627,7 +627,7 @@ class AIProviderManager:
     async def providers(self):
         now=datetime.now(timezone.utc).isoformat()
         return await self.db.execute(
-            "SELECT * FROM ai_providers WHERE enabled=1 AND (status IS NULL OR status!='invalid' OR cooldown_until IS NULL OR cooldown_until<=?) ORDER BY priority ASC,id ASC",[now]
+            "SELECT * FROM ai_providers WHERE enabled=1 AND (status IS NULL OR status!='invalid') AND (cooldown_until IS NULL OR cooldown_until<=?) ORDER BY priority ASC,id ASC",[now]
         )
 
     @staticmethod
@@ -669,6 +669,21 @@ class AIProviderManager:
     def _extract_content(protocol:str, data:dict)->str:
         if protocol=="anthropic":
             return "".join((b.get("text","") for b in data.get("content",[]) if isinstance(b,dict) and b.get("type")=="text"))
+        if protocol in {"responses", "openai_responses", "xai_responses"}:
+            parts=[]
+            for item in data.get("output") or []:
+                if not isinstance(item,dict):
+                    continue
+                content=item.get("content") or []
+                if isinstance(content,list):
+                    for part in content:
+                        if isinstance(part,dict) and part.get("type") in {"output_text","text"} and part.get("text"):
+                            parts.append(str(part.get("text")))
+                elif isinstance(content,str):
+                    parts.append(content)
+            if parts:
+                return "".join(parts).strip()
+            return str(data.get("output_text") or "").strip()
         if protocol=="gemini":
             parts=[]
             for candidate in data.get("candidates") or []:
@@ -688,6 +703,10 @@ class AIProviderManager:
     @staticmethod
     def _empty_response_reason(protocol:str, data:dict)->str:
         if not isinstance(data,dict): return "بدنه پاسخ JSON قابل تشخیص نبود."
+        if protocol in {"responses", "openai_responses", "xai_responses"}:
+            output=data.get("output") or []
+            kinds=[str(x.get("type")) for x in output[:8] if isinstance(x,dict) and x.get("type")]
+            return ("Responses output متن قابل استخراجی نداشت؛ انواع خروجی: "+", ".join(kinds)) if kinds else str(data.get("error") or data.get("status") or "Responses API متن قابل استخراجی نداشت.")
         if protocol=="gemini":
             reasons=[]
             pf=data.get("promptFeedback") or {}
@@ -705,51 +724,57 @@ class AIProviderManager:
             return f"finish_reason={c.get('finish_reason') or '-'}؛ message.content خالی است."
         return "پاسخ API فاقد choices بود."
 
-        async def _request(self, provider, messages, temperature, max_tokens, forced_protocol:Optional[str]=None, forced_endpoint:Optional[str]=None, webscout:bool=False):
-            await self.start()
-            key=decrypt_secret(provider.get("encrypted_api_key") or "")
-            model=(provider.get("model_name") or "").strip()
-            base=provider.get("base_url") or ""
-            protocol=forced_protocol or self.protocol(base)
-            endpoint=forced_endpoint or self.endpoint(base,protocol,model)
-            headers={"Content-Type":"application/json","User-Agent":HTTP_USER_AGENT}
-            started=time.perf_counter()
+    async def _request(self, provider, messages, temperature, max_tokens, forced_protocol:Optional[str]=None, forced_endpoint:Optional[str]=None, webscout:bool=False):
+        await self.start()
+        key=decrypt_secret(provider.get("encrypted_api_key") or "")
+        model=(provider.get("model_name") or "").strip()
+        base=provider.get("base_url") or ""
+        protocol=forced_protocol or self.protocol(base)
+        endpoint=forced_endpoint or self.endpoint(base,protocol,model)
+        headers={"Content-Type":"application/json","User-Agent":HTTP_USER_AGENT}
+        started=time.perf_counter()
 
-            if protocol=="anthropic":
-                headers["x-api-key"]=key
-                headers["anthropic-version"]="2023-06-01"
-                system="\n".join(m.get("content","") for m in messages if m.get("role")=="system").strip()
-                msgs=[{"role":"assistant" if m.get("role")=="assistant" else "user","content":m.get("content","")} for m in messages if m.get("role")!="system"]
-                payload={"model":model,"messages":msgs,"max_tokens":max_tokens,"temperature":temperature}
-                if system: payload["system"]=system
-            elif protocol=="gemini":
-                headers["x-goog-api-key"]=key
-                parts=[{"text":m.get("content","")} for m in messages if m.get("role")!="system"]
-                payload={"contents":[{"role":"user","parts":parts or [{"text":""}]}],"generationConfig":{"temperature":temperature,"maxOutputTokens":max_tokens}}
-                sys="\n".join(m.get("content","") for m in messages if m.get("role")=="system").strip()
-                if sys: payload["systemInstruction"]={"parts":[{"text":sys}]}
-                if webscout:
-                    payload["tools"]=[{"url_context":{}},{"google_search":{}}]
-            else:
-                headers["Authorization"]=f"Bearer {key}"
-                payload={"model":model,"messages":messages,"temperature":temperature,"max_tokens":max_tokens}
-                if webscout and "openrouter.ai" in (base or "").lower():
-                    payload["tools"]=[{"type":"openrouter:web_search"},{"type":"openrouter:web_fetch"}]
-                    payload["max_tool_calls"]=6
-                    payload["web_search_options"]={"search_context_size":"high"}
+        if protocol=="anthropic":
+            headers["x-api-key"]=key
+            headers["anthropic-version"]="2023-06-01"
+            system="\n".join(m.get("content","") for m in messages if m.get("role")=="system").strip()
+            msgs=[{"role":"assistant" if m.get("role")=="assistant" else "user","content":m.get("content","")} for m in messages if m.get("role")!="system"]
+            payload={"model":model,"messages":msgs,"max_tokens":max_tokens,"temperature":temperature}
+            if system: payload["system"]=system
+        elif protocol=="gemini":
+            headers["x-goog-api-key"]=key
+            parts=[{"text":m.get("content","")} for m in messages if m.get("role")!="system"]
+            payload={"contents":[{"role":"user","parts":parts or [{"text":""}]}],"generationConfig":{"temperature":temperature,"maxOutputTokens":max_tokens}}
+            sys="\n".join(m.get("content","") for m in messages if m.get("role")=="system").strip()
+            if sys: payload["systemInstruction"]={"parts":[{"text":sys}]}
+            if webscout:
+                payload["tools"]=[{"url_context":{}},{"google_search":{}}]
+        elif protocol in {"responses", "openai_responses", "xai_responses"}:
+            headers["Authorization"]=f"Bearer {key}"
+            inputs=[{"role":m.get("role") if m.get("role") in {"system","user","assistant"} else "user","content":m.get("content","")} for m in messages]
+            payload={"model":model,"input":inputs or [{"role":"user","content":""}],"max_output_tokens":max_tokens}
+            if webscout:
+                payload["tools"]=[{"type":"web_search"}]
+        else:
+            headers["Authorization"]=f"Bearer {key}"
+            payload={"model":model,"messages":messages,"temperature":temperature,"max_tokens":max_tokens}
+            if webscout and "openrouter.ai" in (base or "").lower():
+                payload["tools"]=[{"type":"openrouter:web_search"},{"type":"openrouter:web_fetch"}]
+                payload["max_tool_calls"]=6
+                payload["web_search_options"]={"search_context_size":"high"}
 
-            async with self._session.post(endpoint,headers=headers,json=payload) as resp:
-                raw=await resp.text()
-                latency=int((time.perf_counter()-started)*1000)
-                if resp.status!=200:
-                    raise RuntimeError(f"HTTP {resp.status} | endpoint={endpoint} | body={raw[:1600]}")
-                try: data=json.loads(raw)
-                except Exception as e: raise RuntimeError(f"HTTP 200 ولی JSON نامعتبر بود: {e} | body={raw[:900]}")
-                content=self._extract_content(protocol,data)
-                usage=(data.get("usageMetadata") if protocol=="gemini" else data.get("usage")) or {}
-                if not content:
-                    raise RuntimeError(f"پاسخ مدل خالی بود | protocol={protocol} | model={model} | {self._empty_response_reason(protocol,data)} | response={json.dumps(data,ensure_ascii=False)[:2200]}")
-                return content,data,latency,usage,protocol,endpoint
+        async with self._session.post(endpoint,headers=headers,json=payload) as resp:
+            raw=await resp.text()
+            latency=int((time.perf_counter()-started)*1000)
+            if resp.status!=200:
+                raise RuntimeError(f"HTTP {resp.status} | endpoint={endpoint} | body={raw[:1600]}")
+            try: data=json.loads(raw)
+            except Exception as e: raise RuntimeError(f"HTTP 200 ولی JSON نامعتبر بود: {e} | body={raw[:900]}")
+            content=self._extract_content(protocol,data)
+            usage=(data.get("usageMetadata") if protocol=="gemini" else data.get("usage")) or {}
+            if not content:
+                raise RuntimeError(f"پاسخ مدل خالی بود | protocol={protocol} | model={model} | {self._empty_response_reason(protocol,data)} | response={json.dumps(data,ensure_ascii=False)[:2200]}")
+            return content,data,latency,usage,protocol,endpoint
 
     async def test_provider_values(self, base_url, api_key, model):
         """Universal provider test.
@@ -782,6 +807,15 @@ class AIProviderManager:
             native=self.endpoint("https://generativelanguage.googleapis.com/v1beta","gemini",mdl)
             if all(ep != native for _,ep in candidates):
                 candidates.append(("gemini",native))
+        base_lower=base.lower()
+        if "api.openai.com" in base_lower:
+            responses_endpoint="https://api.openai.com/v1/responses"
+            if all(ep != responses_endpoint for _,ep in candidates):
+                candidates.append(("openai_responses",responses_endpoint))
+        elif "api.x.ai" in base_lower:
+            responses_endpoint="https://api.x.ai/v1/responses"
+            if all(ep != responses_endpoint for _,ep in candidates):
+                candidates.append(("xai_responses",responses_endpoint))
 
         diagnostics=[]
         for proto, endpoint in candidates:
@@ -801,6 +835,13 @@ class AIProviderManager:
                     payload={
                         "contents":[{"role":"user","parts":[{"text":"Reply with exactly: TEST_OK"}]}],
                         "generationConfig":{"maxOutputTokens":32},
+                    }
+                elif proto in {"openai_responses","xai_responses"}:
+                    headers["Authorization"]=f"Bearer {key}"
+                    payload={
+                        "model":mdl,
+                        "input":[{"role":"user","content":"Reply with exactly: TEST_OK"}],
+                        "max_output_tokens":32,
                     }
                 else:
                     # Deliberately minimal: this is the same compatibility trick as
@@ -902,101 +943,112 @@ class AIProviderManager:
         if any(x in m for x in ("404","model_not_found","401","403","authentication","invalid api")): return "invalid"
         return "temporary"
 
-        async def call(self,messages,temperature=0.2,max_tokens=2500,purpose="generic",persist_health=True):
-            providers=await self.providers()
-            if not providers:
-                return {"content":"","provider":None,"model":None,"tokens":0,"error":"هیچ مدل فعالی در پنل AI وجود ندارد."}
-            errors=[]; tried=0; now=datetime.now(timezone.utc)
-            for p in providers:
-                cooldown=p.get("cooldown_until") or ""
-                if cooldown:
-                    try:
-                        if datetime.fromisoformat(cooldown.replace("Z","+00:00"))>now: continue
-                    except Exception: pass
-                tried+=1
+    async def call(self,messages,temperature=0.2,max_tokens=2500,purpose="generic",persist_health=True):
+        providers=await self.providers()
+        if not providers:
+            return {"content":"","provider":None,"model":None,"tokens":0,"error":"هیچ مدل فعالی در پنل AI وجود ندارد."}
+        errors=[]; tried=0; now=datetime.now(timezone.utc)
+        for p in providers:
+            cooldown=p.get("cooldown_until") or ""
+            if cooldown:
                 try:
-                    content,data,latency,usage,_,_=await self._request(p,messages,temperature,max_tokens)
-                    if persist_health:
-                        t=datetime.now(timezone.utc).isoformat()
-                        was_unhealthy=bool(p.get("last_error")) or p.get("status") in {"invalid","cooldown"}
-                        await self.db.execute("UPDATE ai_providers SET status='healthy',last_error=NULL,cooldown_until=NULL,last_checked_at=?,last_latency_ms=?,consecutive_failures=0,updated_at=? WHERE id=?",[t,latency,t,p["id"]])
-                        if was_unhealthy and self.bot and ADMIN_ID:
-                            try: await self.bot.send_message(ADMIN_ID,f"✅ <b>مدل دوباره فعال شد</b>\n\nModel: <code>{html.escape(str(p.get('model_name')))}</code>\nLatency: {latency}ms",parse_mode="HTML")
-                            except Exception: pass
-                    return {"content":content,"provider":p.get("name"),"model":p.get("model_name"),"tokens":usage.get("total_tokens",0) if isinstance(usage,dict) else 0,"error":None}
-                except Exception as e:
-                    msg=str(e); errors.append(f"{p.get('name')}: {msg[:260]}")
-                    if persist_health:
-                        kind=self.classify_error(msg)
-                        status="invalid" if kind=="invalid" else "cooldown"
-                        cd=(datetime.now(timezone.utc)+timedelta(minutes=AI_PROVIDER_RECHECK_MINUTES if kind=="invalid" else 5)).isoformat()
-                        await self.db.execute("UPDATE ai_providers SET status=?,last_error=?,cooldown_until=?,consecutive_failures=COALESCE(consecutive_failures,0)+1,last_checked_at=?,updated_at=? WHERE id=?",[status,msg[:1200],cd,datetime.now(timezone.utc).isoformat(),datetime.now(timezone.utc).isoformat(),p["id"]])
-            final=("همه مدل‌ها در cooldown یا نامعتبر هستند." if tried==0 else "تمام مدل‌های قابل استفاده خطا دادند.")+" | "+" | ".join(errors)
-            if purpose!="user_chat" and time.time()-self._last_final_notice>600 and self.bot:
-                self._last_final_notice=time.time()
-                try: await self.bot.send_message(ADMIN_ID,"🚨 خطای نهایی AI\n"+html.escape(final[:1500]))
+                    if datetime.fromisoformat(cooldown.replace("Z","+00:00"))>now: continue
                 except Exception: pass
-            return {"content":"","provider":None,"model":None,"tokens":0,"error":final}
+            tried+=1
+            try:
+                content,data,latency,usage,_,_=await self._request(p,messages,temperature,max_tokens)
+                if persist_health:
+                    t=datetime.now(timezone.utc).isoformat()
+                    was_unhealthy=bool(p.get("last_error")) or p.get("status") in {"invalid","cooldown"}
+                    await self.db.execute("UPDATE ai_providers SET status='healthy',last_error=NULL,cooldown_until=NULL,last_checked_at=?,last_latency_ms=?,consecutive_failures=0,updated_at=? WHERE id=?",[t,latency,t,p["id"]])
+                    if was_unhealthy and self.bot and ADMIN_ID:
+                        try: await self.bot.send_message(ADMIN_ID,f"✅ <b>مدل دوباره فعال شد</b>\n\nModel: <code>{html.escape(str(p.get('model_name')))}</code>\nLatency: {latency}ms",parse_mode="HTML")
+                        except Exception: pass
+                return {"content":content,"provider":p.get("name"),"model":p.get("model_name"),"tokens":usage.get("total_tokens",0) if isinstance(usage,dict) else 0,"error":None}
+            except Exception as e:
+                msg=str(e); errors.append(f"{p.get('name')}: {msg[:260]}")
+                if persist_health:
+                    kind=self.classify_error(msg)
+                    status="invalid" if kind=="invalid" else "cooldown"
+                    cd=(datetime.now(timezone.utc)+timedelta(minutes=AI_PROVIDER_RECHECK_MINUTES if kind=="invalid" else 5)).isoformat()
+                    await self.db.execute("UPDATE ai_providers SET status=?,last_error=?,cooldown_until=?,consecutive_failures=COALESCE(consecutive_failures,0)+1,last_checked_at=?,updated_at=? WHERE id=?",[status,msg[:1200],cd,datetime.now(timezone.utc).isoformat(),datetime.now(timezone.utc).isoformat(),p["id"]])
+        final=("همه مدل‌ها در cooldown یا نامعتبر هستند." if tried==0 else "تمام مدل‌های قابل استفاده خطا دادند.")+" | "+" | ".join(errors)
+        if purpose!="user_chat" and time.time()-self._last_final_notice>600 and self.bot:
+            self._last_final_notice=time.time()
+            try: await self.bot.send_message(ADMIN_ID,"🚨 خطای نهایی AI\n"+html.escape(final[:1500]))
+            except Exception: pass
+        return {"content":"","provider":None,"model":None,"tokens":0,"error":final}
 
-        async def webscout_call(self, url: str, scout_prompt: str, max_tokens: int = 7000):
-            providers=await self.db.execute("SELECT * FROM ai_providers WHERE enabled=1 AND web_enabled=1 ORDER BY priority ASC,id ASC")
-            if not providers:
-                return {"ok":False,"error":"هیچ WebScout فعالی در پنل AI وجود ندارد."}
-            errors=[]
-            for p in providers:
-                pid=int(p.get("id") or 0)
-                if pid and time.time() < self._webscout_cooldowns.get(pid, 0):
-                    continue
-                model=str(p.get("model_name") or "")
-                base=str(p.get("base_url") or "")
-                protocol=self.protocol(base)
-                if "generativelanguage.googleapis.com" in base.lower():
-                    protocol="gemini"
-                    endpoint=self.endpoint("https://generativelanguage.googleapis.com/v1beta", "gemini", model)
-                elif "openrouter.ai" in base.lower():
-                    protocol="openai"
-                    endpoint=self.endpoint(base,"openai",model)
-                else:
-                    msg=f"Provider {p.get('name')} قابلیت WebScout پشتیبانی‌شده ندارد؛ برای WebScout از Gemini Native یا OpenRouter استفاده کن."
-                    errors.append(msg)
-                    if self.bot and ADMIN_ID:
-                        try:
-                            await self.bot.send_message(ADMIN_ID,"⚠️ <b>WebScout provider رد شد</b>\n\n"+html.escape(msg),parse_mode="HTML")
-                        except Exception:
-                            pass
-                    continue
-                messages=[
-                    {"role":"system","content":"You are the WebScout research engine. You must use the enabled web tools, inspect the supplied website URL, and never rely on memory for the target site's current content."},
-                    {"role":"user","content":scout_prompt+f"\n\nTARGET URL:\n{url}"}
-                ]
-                try:
-                    content,data,latency,usage,_,_=await self._request(
-                        p,messages,0.1,max_tokens,
-                        forced_protocol=protocol,forced_endpoint=endpoint,webscout=True
-                    )
-                    if pid:
-                        self._webscout_cooldowns.pop(pid,None)
-                    return {"ok":True,"content":content,"provider":p.get("name"),"model":model,"latency_ms":latency,"usage":usage,"raw":data}
-                except Exception as e:
-                    msg=str(e)
-                    errors.append(f"{p.get('name')}: {msg[:900]}")
-                    if pid:
-                        self._webscout_cooldowns[pid]=time.time()+300
-                    if self.bot and ADMIN_ID:
-                        try:
-                            await self.bot.send_message(
-                                ADMIN_ID,
-                                "⚠️ <b>خطای WebScout</b>\n\n"
-                                + f"Provider: <code>{html.escape(str(p.get('name')))}</code>\n"
-                                + f"Model: <code>{html.escape(model)}</code>\n"
-                                + f"خطا: <code>{html.escape(msg[:1200])}</code>\n\n"
-                                + "↪️ ربات به WebScout بعدی می‌رود.",
-                                parse_mode="HTML"
-                            )
-                        except Exception:
-                            pass
-                    continue
-            return {"ok":False,"error":"\n\n".join(errors)[:7000]}
+    async def webscout_call(self, url: str, scout_prompt: str, max_tokens: int = 7000):
+        now_iso=datetime.now(timezone.utc).isoformat()
+        providers=await self.db.execute("SELECT * FROM ai_providers WHERE enabled=1 AND web_enabled=1 AND (status IS NULL OR status!='invalid') AND (cooldown_until IS NULL OR cooldown_until<=?) ORDER BY priority ASC,id ASC",[now_iso])
+        if not providers:
+            return {"ok":False,"error":"هیچ WebScout فعالی در پنل AI وجود ندارد."}
+        errors=[]
+        for p in providers:
+            pid=int(p.get("id") or 0)
+            if pid and time.time() < self._webscout_cooldowns.get(pid, 0):
+                continue
+            model=str(p.get("model_name") or "")
+            base=str(p.get("base_url") or "")
+            base_lower=base.lower()
+            protocol=self.protocol(base)
+            if "generativelanguage.googleapis.com" in base_lower:
+                protocol="gemini"
+                endpoint=self.endpoint("https://generativelanguage.googleapis.com/v1beta", "gemini", model)
+            elif "openrouter.ai" in base_lower:
+                protocol="openai"
+                endpoint=self.endpoint(base,"openai",model)
+            elif "api.openai.com" in base_lower:
+                protocol="openai_responses"
+                endpoint="https://api.openai.com/v1/responses"
+            elif "api.x.ai" in base_lower:
+                protocol="xai_responses"
+                endpoint="https://api.x.ai/v1/responses"
+            else:
+                msg=f"Provider {p.get('name')} قابلیت WebScout سروری شناخته‌شده ندارد؛ برای WebScout از Gemini Native، OpenRouter، OpenAI Responses یا xAI Responses استفاده کن."
+                errors.append(msg)
+                notice_key=-(pid or 1)
+                if self.bot and ADMIN_ID and time.time() >= self._webscout_cooldowns.get(notice_key,0):
+                    self._webscout_cooldowns[notice_key]=time.time()+300
+                    try:
+                        await self.bot.send_message(ADMIN_ID,"⚠️ <b>WebScout provider رد شد</b>\n\n"+html.escape(msg),parse_mode="HTML")
+                    except Exception:
+                        pass
+                continue
+            messages=[
+                {"role":"system","content":"You are the WebScout research engine. You must use the enabled web tools, inspect the supplied website URL, and never rely on memory for the target site's current content."},
+                {"role":"user","content":scout_prompt+f"\n\nTARGET URL:\n{url}"}
+            ]
+            try:
+                content,data,latency,usage,_,_=await self._request(
+                    p,messages,0.1,max_tokens,
+                    forced_protocol=protocol,forced_endpoint=endpoint,webscout=True
+                )
+                if pid:
+                    self._webscout_cooldowns.pop(pid,None)
+                return {"ok":True,"content":content,"provider":p.get("name"),"model":model,"latency_ms":latency,"usage":usage,"raw":data}
+            except Exception as e:
+                msg=str(e)
+                errors.append(f"{p.get('name')}: {msg[:900]}")
+                if pid:
+                    self._webscout_cooldowns[pid]=time.time()+300
+                if self.bot and ADMIN_ID:
+                    try:
+                        await self.bot.send_message(
+                            ADMIN_ID,
+                            "⚠️ <b>خطای WebScout</b>\n\n"
+                            + f"Provider: <code>{html.escape(str(p.get('name')))}</code>\n"
+                            + f"Model: <code>{html.escape(model)}</code>\n"
+                            + f"خطا: <code>{html.escape(msg[:1200])}</code>\n\n"
+                            + "↪️ ربات به WebScout بعدی می‌رود.",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+                continue
+        return {"ok":False,"error":"\n\n".join(errors)[:7000]}
+
 
 async def ai_analyze_candidate(ai: AIProviderManager, item: Dict[str, Any], source: Dict[str, Any], recent_titles: List[str]) -> Dict[str, Any]:
     body = (item.get("body") or item.get("description") or "")[:10000]
@@ -1837,7 +1889,7 @@ async def automation_loop(db: D1Database, bot: Bot):
                         cycle_started=now_dt
                         await set_setting(db,'last_cycle_started_at',cycle_started.isoformat())
                         await publish_next_article(db,bot)
-                        rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC")
+                        rows=await db.execute("SELECT * FROM sources WHERE enabled=1 AND (next_check_at IS NULL OR next_check_at<=?) ORDER BY priority ASC,id ASC",[now_dt.isoformat()])
                         if rows:
                             ordered=[rows[(cursor+i)%len(rows)] for i in range(len(rows))]
                         else:
@@ -1845,24 +1897,41 @@ async def automation_loop(db: D1Database, bot: Bot):
                         results=[]; success=None
                         for idx,src in enumerate(ordered):
                             cursor=(cursor+1)%len(rows) if rows else 0
+                            source_error=None
                             try:
                                 r=await fetch_source_cycle(db,src,ai)
                                 results.append(r)
+                                diags=r.get('diagnostics') if isinstance(r,dict) else None
+                                if isinstance(r,dict) and r.get('errors'):
+                                    source_error="; ".join(str(x) for x in (diags or [])[:3])[:1200] or "WebScout source cycle failed"
                                 if r.get('accepted'):
-                                    success=r; break
+                                    success=r
                             except Exception as exc:
-                                r={'errors':1,'found':0,'candidates':0,'processed':0,'accepted':0,'queued':0,'rejected':0,'diagnostics':[str(exc)[:300]]}
+                                source_error=f"{type(exc).__name__}: {str(exc)[:1000]}"
+                                r={'errors':1,'found':0,'candidates':0,'processed':0,'accepted':0,'queued':0,'rejected':0,'diagnostics':[source_error]}
                                 results.append(r)
                                 if ai.bot and ADMIN_ID:
                                     try: await ai.bot.send_message(ADMIN_ID,f"❌ <b>WebScout source error</b>\n{html.escape(str(src.get('name') or src.get('url')))}\n<code>{html.escape(str(exc)[:800])}</code>",parse_mode='HTML')
                                     except Exception: pass
-                            # FALSE means immediately move to next URL; no DB write here.
+                            # Every source now gets its own next_check_at, so a global WebScout cycle
+                            # cannot repeatedly hammer all enabled sites. The content pipeline itself is unchanged.
+                            try:
+                                interval_minutes=max(1,int(src.get('interval_minutes') or await get_setting(db,'default_source_interval',str(DEFAULT_SOURCE_INTERVAL_MINUTES)) or DEFAULT_SOURCE_INTERVAL_MINUTES))
+                                next_source_check=(datetime.now(timezone.utc)+timedelta(minutes=interval_minutes)).isoformat()
+                                await db.execute("UPDATE sources SET last_checked_at=?,next_check_at=?,last_error=? WHERE id=?",[datetime.now(timezone.utc).isoformat(),next_source_check,source_error,src.get('id')])
+                            except Exception as source_state_error:
+                                await log_automation(db,'WARN','source_state_update_failed',f"source={src.get('id')} {type(source_state_error).__name__}: {str(source_state_error)[:500]}")
+                            if success:
+                                break
                         if success:
                             wait_minutes=max(1,int(success.get('interval_minutes') or await get_setting(db,'webscout_success_interval_minutes',str(WEBSCOUT_SUCCESS_INTERVAL_MINUTES)) or WEBSCOUT_SUCCESS_INTERVAL_MINUTES))
                             await set_setting(db,'webscout_next_run_at',(now_dt+timedelta(minutes=wait_minutes)).isoformat())
                         else:
-                            retry_minutes=max(1,int(await get_setting(db,'webscout_empty_retry_minutes',str(WEBSCOUT_EMPTY_RETRY_MINUTES)) or WEBSCOUT_EMPTY_RETRY_MINUTES))
-                            await set_setting(db,'webscout_next_run_at',(now_dt+timedelta(minutes=retry_minutes)).isoformat())
+                            if ordered:
+                                retry_minutes=max(1,int(await get_setting(db,'webscout_empty_retry_minutes',str(WEBSCOUT_EMPTY_RETRY_MINUTES)) or WEBSCOUT_EMPTY_RETRY_MINUTES))
+                                await set_setting(db,'webscout_next_run_at',(now_dt+timedelta(minutes=retry_minutes)).isoformat())
+                            else:
+                                await set_setting(db,'webscout_next_run_at',(now_dt+timedelta(seconds=WEBSCOUT_LOOP_SLEEP_SECONDS)).isoformat())
                         summary={'sources_checked':len(results),'accepted':sum((r.get('accepted',0) if isinstance(r,dict) else 0) for r in results),'rejected':sum((r.get('rejected',0) if isinstance(r,dict) else 0) for r in results),'errors':sum((r.get('errors',0) if isinstance(r,dict) else 0) for r in results),'queued':sum((r.get('queued',0) if isinstance(r,dict) else 0) for r in results),'published':False,'mode':'webscout'}
                         published=await publish_next_article(db,bot)
                         summary['published']=bool(published)
@@ -3742,7 +3811,7 @@ async def provider_help(call: CallbackQuery):
             "1️⃣ Base URL\n2️⃣ Token / API Key\n3️⃣ نام دقیق Model\n\n"
             "ربات قبل از ذخیره یک درخواست واقعی آزمایشی می‌فرستد. فقط مدل‌هایی که تستشان موفق باشد ذخیره می‌شوند.\n\n"
             "🔢 عدد اولویت کمتر = اولویت بالاتر\n"
-            "🌐 Web Scout برای Providerهای دارای Web واقعی فعال است. Gemini از URL Context + Google Search و OpenRouter از Web Search/Fetch استفاده می‌کند. حداقل یک WebScout باید روشن بماند.\n"
+            "🌐 Web Scout برای Providerهای دارای ابزار وب واقعی فعال است. Gemini از URL Context + Google Search، OpenRouter از Web Search/Fetch و OpenAI/xAI از Responses Web Search استفاده می‌کنند. حداقل یک WebScout باید روشن بماند.\n"
             "🟡 خطاهای موقت مثل 429/503 باعث cooldown می‌شوند و مدل «خراب» اعلام نمی‌شود.\n"
             "🔴 خطاهایی مثل 404/401/403 به‌عنوان مشکل تنظیمات علامت‌گذاری می‌شوند.\n\n"
             "از صفحه هر مدل می‌توانی آن را ویرایش، تست، فعال/غیرفعال، اولویت‌بندی یا حذف کنی.\n\n"
