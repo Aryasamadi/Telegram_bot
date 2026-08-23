@@ -79,7 +79,7 @@ DEFAULT_PUBLISH_END_HOUR = int(os.getenv("PUBLISH_END_HOUR", "23"))
 CONTENT_RETENTION_DAYS = int(os.getenv("CONTENT_RETENTION_DAYS", "1"))
 # News freshness policy: automation accepts only items with a verifiable publication
 # timestamp within this window. Tests may opt into archived items explicitly.
-NEWS_FRESHNESS_MAX_HOURS = float(os.getenv("NEWS_FRESHNESS_MAX_HOURS", "24"))
+NEWS_FRESHNESS_MAX_HOURS = float(os.getenv("NEWS_FRESHNESS_MAX_HOURS", "6"))
 NEWS_FRESHNESS_STRICT = os.getenv("NEWS_FRESHNESS_STRICT", "true").lower() in {"1", "true", "yes", "on"}
 LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "14"))
 AI_PROVIDER_ENCRYPTION_KEY = os.getenv("AI_PROVIDER_ENCRYPTION_KEY", "")
@@ -294,6 +294,7 @@ async def initialize_automation_database(db: D1Database):
         "ALTER TABLE articles ADD COLUMN source_published_at TEXT",
         "ALTER TABLE sources ADD COLUMN last_seen_published_at TEXT",
         "ALTER TABLE sources ADD COLUMN last_seen_url TEXT",
+        "ALTER TABLE source_items ADD COLUMN retry_after TEXT",
     ]:
         try:
             await db.execute(sql)
@@ -1462,7 +1463,7 @@ def _visualize_plain_paragraphs(title: str, value: str, category: str, article: 
         elif i==2 and len(pplain)>=60:
             # A real paragraph is used as a visual quote; wording is untouched.
             formatted=f"<blockquote>{icon} {formatted}</blockquote>"
-        elif article and i in (5,8) and len(pplain)>=60:
+        elif article and i in (2,5,8) and len(pplain)>=55:
             formatted=f"<blockquote>{icon} {formatted}</blockquote>"
         elif i==3 and len(pplain)<=140:
             formatted=f"{icon} <i>{formatted}</i>"
@@ -1748,7 +1749,7 @@ async def discover_for_processing(db: D1Database, source: Dict[str,Any], ai: AIP
     diagnostics=list(direct.get('diagnostics') or [])
     now=datetime.now(timezone.utc)
     # Homepage/HTML discovery often gives a URL without its publication timestamp.
-    # Hydrate only those few candidates before the 24h freshness gate, so a fresh article
+    # Hydrate only those few candidates before the 6h freshness gate, so a fresh article
     # is not rejected merely because its feed exposed no date.
     needs_hydration=[dict(x) for x in raw_items if not parse_publication_datetime(x.get('published_at') or '') and x.get('url')]
     if needs_hydration:
@@ -1761,21 +1762,26 @@ async def discover_for_processing(db: D1Database, source: Dict[str,Any], ai: AIP
     diagnostics.extend(fresh_diag)
     source_id=source.get('id')
     unseen=[]; seen_count=0
-    last_seen=parse_publication_datetime(source.get('last_seen_published_at') or "")
     for raw in fresh_items:
         u=normalize_url(raw.get('url') or '')
         if not u: continue
-        pub_dt=parse_publication_datetime(raw.get('published_at') or '')
-        # A persistent source cursor prevents reprocessing after the 1-day content cache expires.
-        if not include_old and last_seen and pub_dt:
-            last_url=normalize_url(source.get('last_seen_url') or '')
-            if pub_dt < last_seen or (pub_dt == last_seen and u <= last_url):
-                seen_count += 1
-                continue
-        exists=await db.execute('SELECT id FROM source_items WHERE source_id=? AND canonical_url=?',[source_id,u]) if source_id else []
+        # last_seen is telemetry/optimization only; never let an old cursor hide a genuinely fresh article.
+        # We rely on the 6-hour freshness gate plus the item status for deduplication.
+        exists=await db.execute('SELECT id,status,retry_after FROM source_items WHERE source_id=? AND canonical_url=?',[source_id,u]) if source_id else []
         if exists:
-            seen_count+=1
-            if include_old: unseen.append(raw)
+            row=exists[0]
+            status=str(row.get('status') or '')
+            retry_at=parse_publication_datetime(str(row.get('retry_after') or ''))
+            if not include_old and retry_at and retry_at > now:
+                seen_count+=1
+                continue
+            if status in {'ready','published','analyzing'} and not include_old:
+                seen_count+=1
+                continue
+            # Rejected/error items remain eligible after their short retry cooldown so changing
+            # the manager's threshold can take effect without waiting for the source cursor to move.
+            raw=dict(raw); raw['_existing_source_item_id']=int(row.get('id') or 0)
+            unseen.append(raw)
         else:
             unseen.append(raw)
     # Persist cursor only to the newest actually discovered timestamp/url; this is tiny metadata and is not article storage.
@@ -1868,7 +1874,7 @@ URL: {item.get('url')}
 این دو دستور فقط مشخص می‌کنند چه اطلاعات و چه نوع محتوایی پوشش داده شود؛ به هیچ وجه قوانین Formatting را تغییر نده. قالب‌بندی وظیفه موتور تولید و ربات است.
 
 اول فقط برای تصمیم داخلی، امتیاز 0 تا 100 بده. این تصمیم نباید وارد متن نهایی شود و نباید با عبارت‌هایی مثل «این خبر مهم است»، «این خبر ارزشمند است»، «ما توصیه می‌کنیم» یا قضاوت شخصی نوشته شود.
-تازگی توسط برنامه به‌صورت فنی و مستقل کنترل می‌شود؛ از ساختن تاریخ یا حدس‌زدن آن خودداری کن. مطالب خارج از پنجره ۲۴ ساعت برنامه اصلاً به این مرحله نمی‌رسند. مقدار accept فقط برای توصیف داخلی پاسخ است و تصمیم انتشار نهایی را برنامه بر اساس امتیاز و تنظیمات مدیر می‌گیرد.
+تازگی توسط برنامه به‌صورت فنی و مستقل کنترل می‌شود؛ از ساختن تاریخ یا حدس‌زدن آن خودداری کن. مطالب خارج از پنجره ۶ ساعت برنامه اصلاً به این مرحله نمی‌رسند. مقدار accept فقط برای توصیف داخلی پاسخ است و تصمیم انتشار نهایی را برنامه بر اساس امتیاز و تنظیمات مدیر می‌گیرد.
 اگر اطلاعات کافی برای تولید دقیق وجود ندارد، محتوای قابل‌اعتماد تولید نکن و دلیل را در why بنویس.
 
 اگر accept=true، همزمان محتوای نهایی را تولید کن:
@@ -1984,33 +1990,49 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                 title=strip_html_text(item.get('title') or raw_title)[:500]; url=normalize_url(item.get('url') or raw_url)
                 if not url or not title: return {'processed':0,'rejected':1,'reason':'missing'}
                 async with sem:
-                    exists=await db.execute('SELECT id FROM source_items WHERE source_id=? AND canonical_url=?',[source_id,url])
-                    if exists and not allow_old_test: return {'processed':0,'rejected':0,'seen':1,'reason':'seen'}
+                    exists=await db.execute('SELECT id,status,retry_after FROM source_items WHERE source_id=? AND canonical_url=?',[source_id,url])
+                    item_id=int(exists[0].get('id') or 0) if exists else 0
+                    existing_status=str(exists[0].get('status') or '') if exists else ''
+                    retry_at=parse_publication_datetime(str(exists[0].get('retry_after') or '')) if exists else None
+                    if exists and not allow_old_test:
+                        if retry_at and retry_at > now:
+                            return {'processed':0,'rejected':0,'seen':1,'reason':'retry cooldown'}
+                        if existing_status in {'ready','published','analyzing'}:
+                            return {'processed':0,'rejected':0,'seen':1,'reason':'seen'}
                     body=item.get('body') or item.get('description') or ''
                     if not body.strip(): return {'processed':0,'rejected':1,'reason':'no_body'}
                     content_hash=text_hash(title+' '+body)
-                    hash_exists=await db.execute('SELECT id FROM source_items WHERE content_hash=? LIMIT 1',[content_hash])
-                    if hash_exists and not allow_old_test: return {'processed':0,'rejected':0,'seen':1,'reason':'hash'}
-                    ins=await db.execute("INSERT INTO source_items(source_id,canonical_url,title,description,content,image_url,published_at,discovered_at,content_hash,status,category) VALUES(?,?,?,?,?,?,?,?,?,'analyzing',?) RETURNING id",
-                        [source_id,url,title,item.get('description','')[:2000],body[:14000],'',item.get('published_at','')[:100],now.isoformat(),content_hash,source.get('category','tech')])
-                    item_id=ins[0].get('id') if ins else 0
+                    hash_exists=await db.execute('SELECT id,status,retry_after FROM source_items WHERE content_hash=? LIMIT 1',[content_hash])
+                    if hash_exists and not allow_old_test and not item_id:
+                        hrow=hash_exists[0]; hstatus=str(hrow.get('status') or '')
+                        hretry=parse_publication_datetime(str(hrow.get('retry_after') or ''))
+                        if hretry and hretry > now: return {'processed':0,'rejected':0,'seen':1,'reason':'hash cooldown'}
+                        if hstatus in {'ready','published','analyzing'}: return {'processed':0,'rejected':0,'seen':1,'reason':'hash'}
+                        item_id=int(hrow.get('id') or 0)
+                    if item_id:
+                        await db.execute("UPDATE source_items SET title=?,description=?,content=?,published_at=?,discovered_at=?,content_hash=?,status='analyzing',last_error=NULL,retry_after=NULL WHERE id=?",
+                                          [title,item.get('description','')[:2000],body[:14000],item.get('published_at','')[:100],now.isoformat(),content_hash,item_id])
+                    else:
+                        ins=await db.execute("INSERT INTO source_items(source_id,canonical_url,title,description,content,image_url,published_at,discovered_at,content_hash,status,category) VALUES(?,?,?,?,?,?,?,?,?,'analyzing',?) RETURNING id",
+                            [source_id,url,title,item.get('description','')[:2000],body[:14000],'',item.get('published_at','')[:100],now.isoformat(),content_hash,source.get('category','tech')])
+                        item_id=ins[0].get('id') if ins else 0
                     out=await ai_editorial_process(ai,item,source,recent_titles,weights,await get_manager_editorial_prompts(db))
                     if out.get('error'):
-                        if item_id: await db.execute('UPDATE source_items SET status=\'error\',last_error=? WHERE id=?',[out['error'][:1200],item_id])
+                        if item_id: await db.execute("UPDATE source_items SET status='error',last_error=?,retry_after=? WHERE id=?",[out['error'][:1200],(now+timedelta(minutes=15)).isoformat(),item_id])
                         return {'processed':1,'errors':1,'reason':out['error'][:220]}
                     score=float(out.get('score',0) or 0); min_score=float(await get_setting(db,'min_content_score',str(DEFAULT_MIN_CONTENT_SCORE)))
                     # Manager-controlled threshold is the publication gate. Duplicate risk is already
                     # represented by the novelty weight and the persistent duplicate/cursor checks.
                     accept=score>=min_score
                     if not accept:
-                        if item_id: await db.execute("UPDATE source_items SET status='rejected',score=?,category=?,last_error=? WHERE id=?",[score,out.get('category',source.get('category','tech')),str(out.get('why') or 'score below threshold')[:1000],item_id])
+                        if item_id: await db.execute("UPDATE source_items SET status='rejected',score=?,category=?,last_error=?,retry_after=? WHERE id=?",[score,out.get('category',source.get('category','tech')),str(out.get('why') or 'score below threshold')[:1000],(now+timedelta(minutes=15)).isoformat(),item_id])
                         return {'processed':1,'rejected':1,'score':score,'reason':str(out.get('why') or 'score below threshold')[:220]}
                     verify_mode=await get_setting(db,'ai_verify_mode','auto')
-                    need_verify=(verify_mode=='always') or (verify_mode=='auto' and (score<90 or float(source.get('trust_score') or 80)<85))
+                    need_verify=(verify_mode=='always')
                     if need_verify:
                         verify=await ai_verify_content(ai,item,out)
                         if not verify.get('ok') or float(verify.get('confidence',0) or 0)<80:
-                            if item_id: await db.execute("UPDATE source_items SET status='rejected',score=?,last_error=? WHERE id=?",[score,json.dumps(verify,ensure_ascii=False)[:1200],item_id])
+                            if item_id: await db.execute("UPDATE source_items SET status='rejected',score=?,last_error=?,retry_after=? WHERE id=?",[score,json.dumps(verify,ensure_ascii=False)[:1200],(now+timedelta(minutes=15)).isoformat(),item_id])
                             return {'processed':1,'rejected':1,'score':score,'reason':'verification'}
                     title_out=strip_html_text(out.get('title') or title)[:500]
                     article_text=ensure_rich_article_format(title_out,out.get('article_html') or out.get('article_text') or '',url)
@@ -2021,13 +2043,13 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                     if plain_len(article_text)<1200: article_text=rich_article_fallback(title_out,article_text,url)
                     if plain_len(article_text)>4200: article_text=ensure_rich_article_format(title_out,strip_html_text(article_text)[:4200],url)
                     if plain_len(article_text)<900:
-                        if item_id: await db.execute("UPDATE source_items SET status='rejected',last_error='article too short' WHERE id=?",[item_id])
+                        if item_id: await db.execute("UPDATE source_items SET status='rejected',last_error='article too short',retry_after=? WHERE id=?",[(now+timedelta(minutes=15)).isoformat(),item_id])
                         return {'processed':1,'rejected':1,'reason':'article too short'}
                     art=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at,source_published_at) VALUES(?,?,?,?,?,?,?,?,'ready',?,?) RETURNING id",
                         [item_id,title_out,channel_text,article_text[:18000],url,'',out.get('category') or source.get('category','tech'),score,now.isoformat(),item.get('published_at','')[:100]])
                     aid=art[0].get('id') if art else 0
                     token=make_deep_token(int(aid)); await db.execute('UPDATE articles SET deep_token=? WHERE id=?',[token,aid])
-                    if item_id: await db.execute('UPDATE source_items SET status=\'ready\',article_id=?,score=? WHERE id=?',[aid,score,item_id])
+                    if item_id: await db.execute("UPDATE source_items SET status='ready',article_id=?,score=?,retry_after=NULL WHERE id=?",[aid,score,item_id])
                     await db.execute("INSERT OR IGNORE INTO publication_queue(article_id,scheduled_at,status,attempts,created_at) VALUES(?,?, 'queued',0,?)",[aid,now.isoformat(),now.isoformat()])
                     return {'processed':1,'accepted':1,'queued':1,'score':score,'reason':'queued'}
             except Exception as e:
@@ -2169,7 +2191,7 @@ async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> b
     now_iso=datetime.now(timezone.utc).isoformat()
     schedule_filter="" if force else " AND (q.scheduled_at IS NULL OR q.scheduled_at <= ?)"
     params=[now_iso] if not force else []
-    rows=await db.execute("SELECT q.id as queue_id,q.article_id,a.* FROM publication_queue q JOIN articles a ON a.id=q.article_id WHERE q.status='queued' AND a.status='ready'"+schedule_filter+" ORDER BY a.score DESC,q.created_at ASC LIMIT 1",params)
+    rows=await db.execute("SELECT q.id as queue_id,q.article_id,a.* FROM publication_queue q JOIN articles a ON a.id=q.article_id WHERE q.status='queued' AND a.status='ready'"+schedule_filter+" ORDER BY COALESCE(a.source_published_at,a.created_at) DESC, a.score DESC, q.created_at ASC LIMIT 1",params)
     if not rows:
         return False
     row=rows[0]; queue_id=row["queue_id"]; article_id=row["article_id"]
@@ -4438,14 +4460,14 @@ async def health_test_source(call:CallbackQuery,db:D1Database,bot:Bot):
     ai=AIProviderManager(db,bot); results=[]
     try:
         for i,src in enumerate(rows,1):
-            await edit_health_progress(call.message,health_progress_block(i,len(rows),"تست همه منابع",f"{i}/{len(rows)} — {src.get('name')} در حال بررسی است…"))
+            await edit_health_progress(call.message,health_progress_block(i,len(rows),"تست همه منابع",f"🌐 {i}/{len(rows)} · {src.get('name')} → کشف"))
             try:
-                r=await discover_for_processing(db,src,ai,allow_scout=True,include_old=True)
-                n=len(r.get('items') or [])
+                r=await discover_for_processing(db,src,ai,allow_scout=True,include_old=False)
+                n=len(r.get('items') or []); found=int(r.get('direct_count',0) or 0); method=r.get('method') or 'مستقیم'
                 status='✅' if n else '⚠️'
-                results.append(f"{status} {src.get('name')}: {n} candidate | {r.get('method') or 'AI/none'}")
+                results.append(f"{status} {src.get('name')}: پیدا {found} · تازه {n} · {method}")
             except Exception as e:
-                results.append(f"❌ {src.get('name')}: {html.escape(str(e)[:220])}")
+                results.append(f"❌ {src.get('name')}: {html.escape(str(e)[:180])}")
     finally: await ai.close()
     await log_automation(db,"INFO","health_test_sources_finished",f"sources={len(rows)}")
     await edit_health_progress(call.message,"🧪 <b>نتیجه تست همه منابع</b>\n\n"+"\n".join(results), get_admin_back_kb("auto_health")); await call.answer()
@@ -4460,38 +4482,49 @@ def health_progress_block(stage: int, total: int, title: str, detail: str = "") 
     total=max(1,total); filled=max(0,min(total,stage)); bar="█"*filled+"░"*(total-filled); pct=int((filled/total)*100)
     return f"🧪 <b>{html.escape(title)}</b>\n\n<code>{bar}</code> {pct}%\n{html.escape(detail)}\n\n⏳ لطفاً منتظر بمان؛ نتیجه نهایی همین پیام نمایش داده می‌شود."
 
-async def choose_test_candidate(db, ai):
-    """Select the first genuinely usable fresh candidate by source priority.
-    If source #1 fails, immediately continue to #2, #3 ...; no random re-selection.
-    The real-test path uses the same 24h freshness rule as automation.
+async def choose_test_candidate(db, ai, progress=None):
+    """Find a fresh test item source-by-source, with visible failover diagnostics.
+    Manual tests bypass the source cursor/retry cooldown so a rejected recent article can be retested
+    after the manager changes criteria. Freshness is still hard-limited to the configured 6-hour window.
     """
     rows=await db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY priority ASC,id ASC LIMIT 20")
     recent_tested_hashes={str(r.get('content_hash') or '') for r in await db.execute("SELECT content_hash FROM test_history ORDER BY id DESC LIMIT 200") if r.get('content_hash')}
     recent_article_urls={normalize_url(r.get('source_url') or '') for r in await db.execute("SELECT source_url FROM articles WHERE status IN ('published','ready') ORDER BY id DESC LIMIT 200") if r.get('source_url')}
     diagnostics=[]
-    for src in rows:
+    total=len(rows)
+    for idx,src in enumerate(rows,1):
+        name=str(src.get('name') or src.get('url') or f'منبع {idx}')
         try:
-            r=await discover_for_processing(db,src,ai,allow_scout=True,include_old=False)
-            items=sorted(list(r.get('items') or []), key=lambda x: parse_publication_datetime(x.get('published_at') or '') or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+            if progress: await progress(f"🌐 {idx}/{total} · {name} → کشف مستقیم")
+            r=await discover_for_processing(db,src,ai,allow_scout=True,include_old=True)
+            raw_items=list(r.get('items') or [])
+            method=r.get('method') or 'مستقیم'
+            if progress: await progress(f"🌐 {idx}/{total} · {name} → {len(raw_items)} گزینه ({method})")
+            items=sorted(raw_items,key=lambda x: parse_publication_datetime(x.get('published_at') or '') or datetime.min.replace(tzinfo=timezone.utc),reverse=True)
+            if not items and progress: await progress(f"🌐 {idx}/{total} · {name} → رد شد؛ مورد تازه‌ای پیدا نشد")
             for c in items:
                 c=await enrich_candidate_content(dict(c))
-                fresh_ok, fresh_reason, _=candidate_is_fresh(c)
-                if not fresh_ok: continue
-                body=(c.get('body') or c.get('description') or '').strip()
-                url=normalize_url(c.get('url') or '')
+                fresh_ok,fresh_reason,_=candidate_is_fresh(c)
+                if not fresh_ok:
+                    continue
+                body=(c.get('body') or c.get('description') or '').strip(); url=normalize_url(c.get('url') or '')
                 chash=text_hash((c.get('title') or '')+' '+body)
-                if len(body)<120 or not url or url in recent_article_urls or chash in recent_tested_hashes: continue
+                if len(body)<120 or not url or url in recent_article_urls or chash in recent_tested_hashes:
+                    continue
                 c['_test_hash']=chash
+                if progress: await progress(f"✅ {idx}/{total} · {name} → گزینه تازه پیدا شد")
                 return src,c
-            diagnostics.append(f"{src.get('name')}: هیچ candidate تازه و جدیدی نداشت")
+            diagnostics.append(f"{name}: مورد تازه/جدیدِ قابل تست نداشت")
+            if progress: await progress(f"➡️ {idx}/{total} · {name} → رد شد؛ رفتیم سراغ منبع بعدی")
         except Exception as exc:
-            diagnostics.append(f"{src.get('name')}: {type(exc).__name__}: {str(exc)[:160]}")
+            msg=f"{type(exc).__name__}: {str(exc)[:120]}"
+            diagnostics.append(f"{name}: {msg}")
+            if progress: await progress(f"⚠️ {idx}/{total} · {name} → خطا؛ منبع بعدی")
             continue
-    try:
-        await log_automation(db,'WARN','test_candidate_exhausted',' | '.join(diagnostics)[:1800])
-    except Exception:
-        pass
+    try: await log_automation(db,'WARN','test_candidate_exhausted',' | '.join(diagnostics)[:1800])
+    except Exception: pass
     return None,None
+
 
 @router.callback_query(F.data == "health_dry_run")
 async def health_dry_run(call:CallbackQuery,db:D1Database,bot:Bot):
@@ -4500,9 +4533,9 @@ async def health_dry_run(call:CallbackQuery,db:D1Database,bot:Bot):
     await edit_health_progress(call.message,health_progress_block(1,6,"تست تولید بدون انتشار شروع شد","یک Candidate واقعی از بین منابع انتخاب می‌شود؛ محتوای ثابت استفاده نمی‌شود."))
     ai=AIProviderManager(db,bot)
     try:
-        src,item=await choose_test_candidate(db,ai)
+        src,item=await choose_test_candidate(db,ai,lambda detail: edit_health_progress(call.message,health_progress_block(2,6,'تست تولید بدون انتشار',detail)))
         if not item:
-            await edit_health_progress(call.message,"❌ <b>هیچ Candidate قابل استفاده‌ای برای تست پیدا نشد.</b>\n\nهمه منابع، آرشیو و Web Scout بررسی شدند.", get_admin_back_kb("auto_health")); return
+            await edit_health_progress(call.message,"❌ <b>هیچ گزینه محتوای تازه‌ای برای تست پیدا نشد.</b>\n\nهمه منابع به‌ترتیب بررسی شدند.", get_admin_back_kb("auto_health")); return
         await edit_health_progress(call.message,health_progress_block(2,6,"محتوا پیدا شد",f"منبع: {src.get('name')}\nعنوان: {item.get('title')[:180]}"))
         test_hash=item.get('_test_hash') or text_hash((item.get('title') or '')+' '+(item.get('body') or item.get('description') or ''))
         await db.execute("INSERT INTO test_history(source_url,content_hash,title,tested_at) VALUES(?,?,?,?)",[item.get('url') or '',test_hash,item.get('title') or '',datetime.now(timezone.utc).isoformat()])
@@ -4565,7 +4598,7 @@ async def health_run_cycle(call:CallbackQuery,db:D1Database,bot:Bot):
         total_queued=sum((r.get('queued',0) if isinstance(r,dict) else 0) for r in results)
         q=await db.execute("SELECT COUNT(*) c FROM publication_queue WHERE status='queued'")
         await log_automation(db,"INFO","real_cycle_finished",json.dumps({"sources":len(rows),"processed":total_processed,"queued":total_queued,"published":bool(published)},ensure_ascii=False))
-        await edit_health_progress(call.message,f"✅ <b>چرخه واقعی کامل شد.</b>\n\n🌐 منابع: {len(rows)}\n📰 آیتم‌های پیدا شده: {total_found}\n🆕 Candidateهای جدید/قابل بررسی: {total_new}\n🤖 پردازش‌شده توسط AI: {total_processed}\n📥 اضافه‌شده به صف: {total_queued}\n📦 صف فعلی: <b>{q[0].get('c',0) if q else 0}</b>\n📢 انتشار این چرخه: {'✅ بله' if published else '⏸ خیر'}", get_admin_back_kb("auto_health"))
+        await edit_health_progress(call.message,f"✅ <b>چرخه واقعی کامل شد.</b>\n\n🌐 منابع: {len(rows)}\n📰 آیتم‌های پیدا شده: {total_found}\n🆕 گزینه‌های تازه/قابل بررسی: {total_new}\n🤖 پردازش‌شده توسط AI: {total_processed}\n📥 اضافه‌شده به صف: {total_queued}\n📦 صف فعلی: <b>{q[0].get('c',0) if q else 0}</b>\n📢 انتشار این چرخه: {'✅ بله' if published else '⏸ خیر'}", get_admin_back_kb("auto_health"))
     except Exception as e:
         logger.exception('health run cycle failed')
         await edit_health_progress(call.message,"❌ <b>اجرای چرخه شکست خورد</b>\n\n<code>"+html.escape(str(e)[:2500])+"</code>", get_admin_back_kb("auto_health"))
@@ -4578,11 +4611,11 @@ async def health_test_publish(call:CallbackQuery,db:D1Database,bot:Bot):
     if not channel:
         await call.message.edit_text("❌ <b>کانال تنظیم نشده است.</b>",parse_mode='HTML',reply_markup=get_admin_back_kb('auto_health')); return
     await call.answer('تست انتشار واقعی شروع شد…')
-    await edit_health_progress(call.message,health_progress_block(1,6,'📢 تست انتشار واقعی','یک Candidate واقعی از منابع گرفته و با AI تولید می‌شود؛ متن ثابت استفاده نمی‌شود.'))
+    await edit_health_progress(call.message,health_progress_block(1,6,'📢 تست انتشار واقعی','یک گزینه محتوای تازه از منابع واقعی گرفته و با AI تولید می‌شود؛ متن ثابت استفاده نمی‌شود.'))
     ai=AIProviderManager(db,bot)
     try:
-        src,item=await choose_test_candidate(db,ai)
-        if not item: raise RuntimeError('هیچ Candidate واقعی برای تست انتشار پیدا نشد.')
+        src,item=await choose_test_candidate(db,ai,lambda detail: edit_health_progress(call.message,health_progress_block(2,6,'📢 تست انتشار واقعی',detail)))
+        if not item: raise RuntimeError('هیچ گزینه محتوای تازه‌ای برای تست انتشار پیدا نشد.')
         await edit_health_progress(call.message,health_progress_block(2,6,'Candidate واقعی پیدا شد',f"منبع: {src.get('name')}\n{item.get('title')[:180]}"))
         test_hash=item.get('_test_hash') or text_hash((item.get('title') or '')+' '+(item.get('body') or item.get('description') or ''))
         await db.execute("INSERT INTO test_history(source_url,content_hash,title,tested_at) VALUES(?,?,?,?)",[item.get('url') or '',test_hash,item.get('title') or '',datetime.now(timezone.utc).isoformat()])
@@ -4730,7 +4763,7 @@ async def auto_publish_now(call:CallbackQuery,db:D1Database,bot:Bot):
 async def auto_queue(call: CallbackQuery, db: D1Database):
     await call.answer()
     est=await next_publication_estimate(db)
-    rows=await db.execute("SELECT q.id,q.article_id,q.status,q.attempts,a.title,a.score,a.category,a.deep_views FROM publication_queue q JOIN articles a ON a.id=q.article_id WHERE q.status='queued' ORDER BY a.score DESC,q.created_at ASC LIMIT 20")
+    rows=await db.execute("SELECT q.id,q.article_id,q.status,q.attempts,a.title,a.score,a.category,a.deep_views FROM publication_queue q JOIN articles a ON a.id=q.article_id WHERE q.status='queued' ORDER BY COALESCE(a.source_published_at,a.created_at) DESC, a.score DESC, q.created_at ASC LIMIT 20")
     last_txt=est['latest'].astimezone(pytz.timezone('Asia/Tehran')).strftime('%H:%M') if est['latest'] else 'هنوز منتشر نشده'
     if est['minutes']<=0: next_txt='آماده انتشار طبق برنامه'
     elif est['minutes']<60: next_txt=f"حدود {est['minutes']} دقیقه دیگر"
