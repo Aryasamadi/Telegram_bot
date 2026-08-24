@@ -49,7 +49,7 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "10.27.7-help-menu-about-format"
+BUILD_VERSION = "10.27.8-help-exact-token-optimized"
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_AI_WORKERS = 3
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -91,6 +91,10 @@ MAX_HTTP_BYTES = int(os.getenv("MAX_HTTP_BYTES", "1500000"))
 # Full source body is retained for editorial processing; raise only when needed.
 MAX_SOURCE_CONTENT_CHARS = int(os.getenv("MAX_SOURCE_CONTENT_CHARS", "50000"))
 MAX_SOURCE_ITEMS_PER_CYCLE = int(os.getenv("MAX_SOURCE_ITEMS_PER_CYCLE", "5"))
+# Token-efficiency: process only the most promising few candidates per source cycle.
+MAX_AI_CANDIDATES_PER_SOURCE = max(1, int(os.getenv("MAX_AI_CANDIDATES_PER_SOURCE", "2")))
+AI_EDITORIAL_INPUT_CHARS = max(12000, int(os.getenv("AI_EDITORIAL_INPUT_CHARS", "18000")))
+AI_EDITORIAL_MAX_OUTPUT_TOKENS = max(2200, int(os.getenv("AI_EDITORIAL_MAX_OUTPUT_TOKENS", "4200")))
 MAX_AUTOMATION_SOURCES = max(1, int(os.getenv("MAX_AUTOMATION_SOURCES", "50")))
 
 # تنظیم لاگر برای خطایابی بهتر
@@ -2558,7 +2562,12 @@ def _dedupe_leading_semantics(value: str, title: str) -> str:
     return "\n\n".join(kept)
 
 async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:Dict[str,Any],recent_titles:List[str],weights:Dict[str,float],manager_prompts:Optional[Dict[str,str]]=None):
-    body=(item.get("body") or item.get("description") or "")[:MAX_SOURCE_CONTENT_CHARS]
+    raw_body=str(item.get("body") or item.get("description") or "")[:MAX_SOURCE_CONTENT_CHARS]
+    if len(raw_body) > AI_EDITORIAL_INPUT_CHARS:
+        head=max(8000, AI_EDITORIAL_INPUT_CHARS-5000)
+        body=raw_body[:head] + "\n\n[بخش میانی منبع برای کاهش مصرف توکن حذف شد؛ انتهای منبع نیز در ادامه آمده است.]\n\n" + raw_body[-5000:]
+    else:
+        body=raw_body
     manager_prompts=manager_prompts or {}
     channel_scope=manager_prompts.get("channel") or "تمرکز روی خبرهای فنی و ارزشمند؛ محتوای سطحی و کلیشه‌ای را کنار بگذار."
     article_scope=manager_prompts.get("article") or "نسخه کامل را فنی، غنی و مبتنی بر واقعیت‌های منبع بنویس."
@@ -2640,7 +2649,7 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
     obj=parse_json_object(result.get("content",""))
     if not obj:
         repair_prompt=("پاسخ زیر را فقط به JSON معتبر تبدیل کن؛ محتوای آن را تغییر نده. فیلدها: accept,score,category,iran_relevance,freshness,reliability,duplicate_risk,why,title,channel_html,article_html,facts.\n\n"+str(result.get("content",""))[:14000])
-        retry=await ai.call([{"role":"system","content":"Return valid JSON only."},{"role":"user","content":repair_prompt}],0,4200,"editorial_json_repair")
+        retry=await ai.call([{"role":"system","content":"Return valid JSON only."},{"role":"user","content":repair_prompt}],0,2600,"editorial_json_repair")
         obj=parse_json_object(retry.get("content","")); result=retry
     if not obj: return {"error":"پاسخ AI JSON معتبر نبود","ai":result}
     # یک مرحله اصلاح زبانی فقط وقتی لازم است؛ هدف کاهش مصرف توکن و جلوگیری از خروجی انگلیسی است.
@@ -2654,7 +2663,7 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
             "قالب Telegram HTML مجاز است و یک Quote کوتاه هم نگه دار/ایجاد کن.\n\n"
             + json.dumps({"title":raw_title,"channel_html":raw_ch,"article_html":raw_ar},ensure_ascii=False)[:20000]
         )
-        repaired=await ai.call([{"role":"system","content":"Rewrite to fluent Persian. Return JSON only."},{"role":"user","content":repair}],0.15,4200,"editorial_persian_repair")
+        repaired=await ai.call([{"role":"system","content":"Rewrite to fluent Persian. Return JSON only."},{"role":"user","content":repair}],0.15,2800,"editorial_persian_repair")
         pobj=parse_json_object(repaired.get("content",""))
         if pobj:
             raw_title=strip_html_text(pobj.get("title") or raw_title)[:240]
@@ -2744,6 +2753,8 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
         recent_titles=[r.get('title','') for r in recent_rows]
         recent_urls={normalize_url(r.get('source_url') or '') for r in recent_rows if r.get('source_url')}
         recent_hashes={text_hash(str(r.get('title') or '')+' '+str(r.get('body') or '')) for r in recent_rows}
+        # Deterministic duplicate-title gate: avoid an AI call for near-identical headlines.
+        recent_title_norms=[strip_html_text(str(r.get('title') or '')).lower() for r in recent_rows]
 
         candidate_urls=[normalize_url(x.get('url') or '') for x in items if x.get('url')]
         existing_item_map={}
@@ -2764,6 +2775,9 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                         return {'processed':0,'rejected':1,'reason':f'freshness: {fresh_reason}'}
                 if not raw_url or not raw_title:
                     return {'processed':0,'rejected':1,'reason':'missing'}
+                raw_title_norm=strip_html_text(raw_title).lower()
+                if raw_title_norm and any(SequenceMatcher(None, raw_title_norm, rt).ratio() >= 0.94 for rt in recent_title_norms if rt):
+                    return {'processed':0,'rejected':0,'seen':1,'reason':'title_near_duplicate_recent'}
                 item=await enrich_candidate_content(dict(raw))
                 title=strip_html_text(item.get('title') or raw_title)[:500]; url=normalize_url(item.get('url') or raw_url)
                 if not url or not title: return {'processed':0,'rejected':1,'reason':'missing'}
@@ -2880,7 +2894,10 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                     return {'processed':1,'accepted':1,'queued':1,'score':score,'reason':'queued'}
             except Exception as e:
                 return {'processed':1,'errors':1,'reason':f"{type(e).__name__}: {str(e)[:220]}"}
-        results=await asyncio.gather(*(process_one(x) for x in items[:MAX_SOURCE_ITEMS_PER_CYCLE]),return_exceptions=True)
+        # Avoid wasting AI requests on a long tail of candidates from the same source.
+        # Discovery may find several items, but only the top few are sent through the expensive editorial model.
+        ai_items=items[:min(MAX_SOURCE_ITEMS_PER_CYCLE, MAX_AI_CANDIDATES_PER_SOURCE)]
+        results=await asyncio.gather(*(process_one(x) for x in ai_items),return_exceptions=True)
         for r in results:
             if isinstance(r,Exception): stats['errors']+=1
             else:
@@ -3802,9 +3819,9 @@ async def cmd_about(message: Message, db: D1Database):
 
 @router.message(Command("help"))
 async def cmd_help(message: Message, db: D1Database):
-    about=await get_setting(db,"bot_about_text","")
-    about=sanitize_telegram_html(about or "🤖 <b>این ربات چیست؟</b>\n\nربات هوشمند تولید و انتشار محتوای فناوری، هوش مصنوعی و امنیت سایبری است.")
-    help_text=about+"\n\n❓ <b>راهنمای دستورات</b>\n\nℹ️ /about • این ربات چه میکند\n📞 /man • تماس با مدیر\n🚀 /start • شروع مجدد"
+    help_text=("❓ <b>راهنمای دستورات</b>\n\n"
+               "ℹ️ /about • این ربات چه میکند ؟\n"
+               "📞 /man • ارتباط")
     await message.answer(help_text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی",callback_data="user_home")]]))
 
 @router.message(Command("man"))
