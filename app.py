@@ -272,6 +272,9 @@ async def initialize_automation_database(db: D1Database):
         {"sql": "CREATE TABLE IF NOT EXISTS source_items(id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER NOT NULL, canonical_url TEXT NOT NULL, title TEXT, description TEXT, content TEXT, image_url TEXT, published_at TEXT, discovered_at TEXT, content_hash TEXT, status TEXT DEFAULT 'new', score REAL DEFAULT 0, category TEXT, article_id INTEGER, last_error TEXT, retry_after TEXT, UNIQUE(source_id, canonical_url))"},
         {"sql": "CREATE INDEX IF NOT EXISTS idx_source_items_status ON source_items(status)"},
         {"sql": "CREATE INDEX IF NOT EXISTS idx_source_items_hash ON source_items(content_hash)"},
+        {"sql": "CREATE TABLE IF NOT EXISTS content_failures(id INTEGER PRIMARY KEY AUTOINCREMENT, canonical_url TEXT NOT NULL DEFAULT '', content_hash TEXT NOT NULL DEFAULT '', title TEXT, failure_type TEXT NOT NULL, reason TEXT, failed_at TEXT NOT NULL, UNIQUE(canonical_url, content_hash))"},
+        {"sql": "CREATE INDEX IF NOT EXISTS idx_content_failures_url ON content_failures(canonical_url)"},
+        {"sql": "CREATE INDEX IF NOT EXISTS idx_content_failures_hash ON content_failures(content_hash)"},
         {"sql": "CREATE TABLE IF NOT EXISTS articles(id INTEGER PRIMARY KEY AUTOINCREMENT, source_item_id INTEGER UNIQUE, title TEXT, channel_text TEXT, body TEXT, source_url TEXT, image_url TEXT, category TEXT, score REAL, status TEXT DEFAULT 'ready', deep_token TEXT UNIQUE, created_at TEXT, verified_at TEXT, published_message_id INTEGER, source_published_at TEXT, deep_views INTEGER DEFAULT 0)"},
         {"sql": "CREATE TABLE IF NOT EXISTS publication_queue(id INTEGER PRIMARY KEY AUTOINCREMENT, article_id INTEGER UNIQUE, scheduled_at TEXT, status TEXT DEFAULT 'queued', attempts INTEGER DEFAULT 0, last_error TEXT, created_at TEXT, published_at TEXT)"},
         {"sql": "CREATE INDEX IF NOT EXISTS idx_publication_queue_due ON publication_queue(status, scheduled_at)"},
@@ -468,6 +471,38 @@ def same_domain(a: str, b: str) -> bool:
 
 def text_hash(text: str) -> str:
     return hashlib.sha256(re.sub(r"\s+", " ", text or "").strip().lower().encode("utf-8", errors="ignore")).hexdigest()
+
+
+async def has_content_failure(db: D1Database, canonical_url: str = "", content_hash: str = "") -> Optional[Dict[str, Any]]:
+    url=normalize_url(canonical_url or ""); h=str(content_hash or "").strip()
+    clauses=[]; params=[]
+    if url: clauses.append("canonical_url=?"); params.append(url)
+    if h: clauses.append("content_hash=?"); params.append(h)
+    if not clauses: return None
+    rows=await db.execute("SELECT * FROM content_failures WHERE " + " OR ".join(clauses) + " ORDER BY id DESC LIMIT 1",params)
+    return rows[0] if rows else None
+
+
+async def record_content_failure(db: D1Database, canonical_url: str, content_hash: str, title: str, failure_type: str, reason: str):
+    url=normalize_url(canonical_url or ""); h=str(content_hash or "").strip()
+    if not url and not h: return
+    await db.execute("INSERT OR IGNORE INTO content_failures(canonical_url,content_hash,title,failure_type,reason,failed_at) VALUES(?,?,?,?,?,?)",[url,h,str(title or "")[:500],str(failure_type or "quality")[:80],str(reason or "")[:2000],datetime.now(timezone.utc).isoformat()])
+
+
+PROMOTION_EXPLICIT_MARKERS=("sponsored","sponsored content","advertorial","paid content","promoted content","affiliate","affiliate link","affiliate commission","رپورتاژ","رپورتاژ آگهی","محتوای اسپانسری","اسپانسر","همکاری تبلیغاتی","افیلیت","پورسانت از خرید","لینک همکاری")
+PROMOTION_ACTION_MARKERS=("buy now","shop now","add to cart","order now","get yours","limited offer","کد تخفیف","خرید کنید","سفارش دهید","افزودن به سبد","تخفیف ویژه","پیشنهاد ویژه","همین حالا بخرید","قیمت ویژه")
+PROMOTION_PRICE_MARKERS=("price","pricing","قیمت","تومان","دلار","€","$","٪ تخفیف","% تخفیف")
+
+def is_high_confidence_promotional_page(title: str, body: str, description: str = "", links: Optional[List[Any]] = None) -> Tuple[bool,str]:
+    plain=strip_html_text(" ".join([title or "",description or "",body or ""])).lower()
+    link_text=" ".join(strip_html_text(str((x.get("label") or x.get("title") or ""))) if isinstance(x,dict) else strip_html_text(str(x)) for x in (links or [])).lower()
+    combined=(plain+" "+link_text).strip()
+    explicit=[m for m in PROMOTION_EXPLICIT_MARKERS if m in combined]
+    if explicit: return True,"explicit commercial/sponsored marker: "+", ".join(explicit[:3])
+    actions=sum(1 for m in PROMOTION_ACTION_MARKERS if m in combined); prices=sum(1 for m in PROMOTION_PRICE_MARKERS if m in combined)
+    if actions>=1 and prices>=2: return True,"strong commercial purchase/pricing intent"
+    if actions>=2 and prices>=1: return True,"strong commercial purchase intent"
+    return False,""
 
 
 def normalize_model_text(value: str) -> str:
@@ -1728,89 +1763,76 @@ def _remove_duplicate_title_from_body(title: str, value: str) -> str:
         kept.append(block)
     return "\n\n".join(kept)
 
-def _mandatory_quote_block(paragraphs: List[str], start_index: int = 1) -> Tuple[str, int]:
-    """Create a short safe quote only when the model did not already provide one."""
-    if not paragraphs:
-        return "", -1
-    order=list(range(start_index,len(paragraphs)))+list(range(0,start_index))
-    for idx in order:
-        # Never turn an existing rich quote/block into a second synthetic quote.
-        if re.search(r"<blockquote\b", paragraphs[idx] or "", flags=re.I):
-            continue
-        plain=strip_html_text(paragraphs[idx]).strip()
-        if len(plain) < 20:
-            continue
-        sentences=[x.strip() for x in re.split(r"(?<=[.!?؟])\s+", plain) if x.strip()]
-        excerpt=next((x for x in sentences if 20 <= len(x) <= 220), "")
-        if not excerpt:
-            excerpt=plain[:180].rsplit(" ",1)[0]+("…" if len(plain)>180 else "")
-        return f"<blockquote>🔎 {html.escape(excerpt, quote=False)}</blockquote>", idx
-    return "", -1
+def _quote_target_for_length(value: str) -> int:
+    n=plain_len(value or "")
+    if n<=1000: return 1
+    if n<=1800: return 2
+    return 3
 
 
-def _visualize_plain_paragraphs(title: str, value: str, category: str, article: bool=False) -> str:
-    # IMPORTANT: Preserve model-provided Telegram HTML blocks. The previous renderer
-    # stripped every <blockquote>, which made intentionally formatted educational
-    # content lose its visual structure. Only sanitize unsafe tags; do not flatten
-    # valid rich blocks.
-    value=_remove_duplicate_title_from_body(title, value or "")
-    clean=sanitize_telegram_html(_normalize_text_blocks(value))
-    plain=strip_html_text(clean)
+def _remove_extra_quote_wrappers(value: str, keep: int) -> str:
+    count=0
+    def repl(m):
+        nonlocal count
+        count+=1
+        return m.group(0) if count<=keep else m.group(1)
+    return re.sub(r"<blockquote\b[^>]*>(.*?)</blockquote>",repl,value or "",flags=re.I|re.S)
+
+
+def _ensure_quote_count(value: str) -> str:
+    clean=sanitize_telegram_html(_normalize_text_blocks(value or ""))
+    if not strip_html_text(clean): return ""
+    target=_quote_target_for_length(clean); count=len(re.findall(r"<blockquote\b",clean,flags=re.I))
+    if count>target:
+        clean=_remove_extra_quote_wrappers(clean,target); count=target
+    if count<target:
+        blocks=[x.strip() for x in re.split(r"\n\s*\n+",clean) if strip_html_text(x).strip()]
+        for i,b in enumerate(blocks):
+            if len(strip_html_text(b))<28 or re.search(r"<blockquote\b",b,flags=re.I): continue
+            pp=strip_html_text(b); sentences=[x.strip() for x in re.split(r"(?<=[.!?؟])\s+",pp) if x.strip()]
+            excerpt=next((x for x in sentences if 28<=len(x)<=220),"")
+            if not excerpt: excerpt=pp[:190].rsplit(" ",1)[0]+("…" if len(pp)>190 else "")
+            blocks[i]=f"<blockquote>{html.escape(excerpt,quote=False)}</blockquote>"; count+=1
+            if count>=target: break
+        clean="\n\n".join(blocks)
+    return clean.strip()
+
+
+CONTENT_TYPE_HEADER_ICONS={"tutorial":"📚","tool":"🛠️","security":"🛡️","comparison":"⚖️","list":"📋","analysis":"🔎","news":"📰","general":"📌"}
+
+def _visualize_plain_paragraphs(title: str, value: str, category: str, article: bool=False, content_type: str="general") -> str:
+    value=_remove_duplicate_title_from_body(title,value or ""); clean=sanitize_telegram_html(_normalize_text_blocks(value)); plain=strip_html_text(clean)
     if not plain: return ""
-    emoji_map={
-        "ai":["🤖","🧠","🔬","⚡","🧩"],
-        "cyber":["🛡️","🔐","🚨","⚠️","🔎"],
-        "tech":["💻","⚙️","🚀","🔎","🧪"],
-        "edu":["📚","💡","🧭","📝","🎓"],
-        "general":["🌐","✨","📌","🔭","🧭"]
-    }
-    icons=emoji_map.get(category,emoji_map["tech"])
-    paragraphs=_split_readable_paragraphs(clean, max_chars=470 if not article else 620) or [clean]
-    out=[f"<b>{icons[0]} {html.escape(strip_html_text(title)[:220])}</b>"]
-    has_existing_quote=any(re.search(r"<blockquote\b", p or "", flags=re.I) for p in paragraphs)
-    quote, quote_index = ("", -1) if has_existing_quote else _mandatory_quote_block(paragraphs, start_index=1)
-    last_icon=None
-    for i,para in enumerate(paragraphs[:16]):
+    emoji_map={"ai":["🤖","🧠","🔬","⚡","🧩"],"cyber":["🛡️","🔐","🚨","⚠️","🔎"],"tech":["💻","⚙️","🚀","🔎","🧪"],"edu":["📚","💡","🧭","📝","🎓"],"general":["🌐","✨","📌","🔭","🧭"]}
+    icons=emoji_map.get(category,emoji_map["tech"]); header_icon=CONTENT_TYPE_HEADER_ICONS.get(content_type,icons[0])
+    paragraphs=_split_readable_paragraphs(clean,max_chars=470 if not article else 620) or [clean]; out=[f"<b>{header_icon} {html.escape(strip_html_text(title)[:220])}</b>"]; last_icon=None
+    for i,para in enumerate(paragraphs[:18]):
         pplain=strip_html_text(para).strip()
-        title_similarity=SequenceMatcher(None,pplain.lower(),strip_html_text(title).lower()).ratio()
-        if not pplain or title_similarity>0.82: continue
-
-        # Preserve explicit quotes exactly (after Telegram sanitization). This is the
-        # semantic formatting the model requested; the renderer must not destroy it.
-        if re.search(r"<blockquote\b", para or "", flags=re.I):
-            out.append(_protect_bidi_latin(para.strip()))
-            continue
-        if i==quote_index:
-            out.append(quote)
-            continue
-
-        icon=icons[i%len(icons)]
+        if not pplain or SequenceMatcher(None,pplain.lower(),strip_html_text(title).lower()).ratio()>0.82: continue
+        if re.search(r"<blockquote\b",para or "",flags=re.I): out.append(_protect_bidi_latin(para.strip())); continue
+        icon=icons[i%len(icons)];
         if icon==last_icon: icon=icons[(i+1)%len(icons)]
         last_icon=icon
-        has_rich=any(tag in para.lower() for tag in ("<b>","<strong>","<i>","<em>","<u>","<s>","<a ","<pre>","<code>","<blockquote"))
-        if has_rich:
-            formatted=_protect_bidi_latin(para.strip())
-        else:
-            formatted=_format_technical_tokens(_protect_bidi_latin(html.escape(pplain,quote=False)))
-        if i==1:
-            # Only bold an actually plain first body paragraph. Never nest formatting.
-            formatted=f"{icon} <b>{formatted}</b>" if not has_rich else f"{icon} {formatted}"
-        elif i==3 and len(pplain)<=140 and not has_rich:
-            formatted=f"{icon} <i>{formatted}</i>"
-        else:
-            formatted=f"{icon} {formatted}"
+        has_rich=any(tag in para.lower() for tag in ("<b>","<strong>","<i>","<em>","<u>","<s>","<a ","<pre>","<code>"))
+        formatted=_protect_bidi_latin(para.strip()) if has_rich else _format_technical_tokens(_protect_bidi_latin(html.escape(pplain,quote=False)))
+        numbered=(content_type=="tutorial" and bool(re.match(r"^(?:\d+\s*[.)-]|مرحله\s+\d+|گام\s+\d+)",pplain,flags=re.I)))
+        if numbered: formatted=f"🔵 <b>{formatted}</b>" if not has_rich else f"🔵 {formatted}"
+        elif i==1: formatted=f"{icon} <b>{formatted}</b>" if not has_rich else f"{icon} {formatted}"
+        elif i==3 and len(pplain)<=140 and not has_rich: formatted=f"{icon} <i>{formatted}</i>"
+        else: formatted=f"{icon} {formatted}"
         out.append(formatted)
     return dedupe_adjacent_emojis("\n\n".join(out))
 
-def ensure_rich_channel_format(title: str, value: str, category: str = "tech") -> str:
-    return _visualize_plain_paragraphs(title, clean_channel_copy(value or ""), category, article=False)
 
-def ensure_rich_article_format(title: str, value: str, source_url: str, category: str = "tech") -> str:
+def ensure_rich_channel_format(title: str, value: str, category: str="tech", content_type: str="general") -> str:
+    return _ensure_quote_count(_visualize_plain_paragraphs(title,clean_channel_copy(value or ""),category,False,content_type))
+
+
+def ensure_rich_article_format(title: str, value: str, source_url: str, category: str="tech", content_type: str="general") -> str:
     clean=_normalize_text_blocks(value or "")
-    if not strip_html_text(sanitize_telegram_html(clean)):
-        # Do not return placeholder; return empty so the pipeline can reject.
-        return ""
-    return _visualize_plain_paragraphs(title, clean, category or "tech", article=True)
+    if not strip_html_text(sanitize_telegram_html(clean)): return ""
+    return _ensure_quote_count(_visualize_plain_paragraphs(title,clean,category or "tech",True,content_type))
+
 
 def remove_article_metadata_blocks(value: str) -> str:
     text=_normalize_text_blocks(value or "")
@@ -2212,7 +2234,10 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
         "why": "...", "title": "...", "channel_html": "...", "article_html": "...",
         "facts": ["..."], "resource_links": [],
         "content_type": "news|tutorial|tool|security|comparison|list|analysis|general",
-        "has_more_details": False
+        "has_more_details": False,
+        "is_promotional": False,
+        "promotional_confidence": 0,
+        "promotion_reason": ""
     }
     prompt=f"""تو موتور تحریریه و تولید محتوای یک کانال فارسی حرفه‌ای هستی؛ نه قاضی، نه مفسر سیاسی و نه منتقد.
 وظیفه تو این است که از منبع داده‌شده محتوای فنی، غنی، دقیق، بی‌طرف و قابل‌فهم بسازی. انتخاب نهایی فقط بر اساس معیارهای عددی مدیر انجام می‌شود؛ در متن نهایی قضاوت، توصیه یا ارزش‌گذاری ننویس.
@@ -2229,19 +2254,21 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
 وزن‌های تعیین‌شده توسط مدیر:
 {json.dumps(weights,ensure_ascii=False)}
 
-دستور محتوایی مدیر برای نسخه کوتاه کانال (معمولاً حدود 600 تا 900 کاراکتر، فقط وقتی محتوای منبع اجازه می‌دهد):
+اولویت دستور مدیر: متن‌های بین BEGIN_MANAGER_INSTRUCTION و END_MANAGER_INSTRUCTION دستورهای مستقیم مدیر هستند و در زبان، لحن، طول، سطح جزئیات و نوع پوشش محتوا بر پیش‌فرض داخلی مقدم‌اند. فقط JSON امن، HTML امن و عدم جعل اطلاعات غیرقابل Override هستند.
+
+BEGIN_MANAGER_INSTRUCTION
+CHANNEL:
 {channel_scope}
 
-دستور محتوایی مدیر برای نسخه کامل داخل ربات (بدون طول ثابت؛ فقط به اندازه جزئیات واقعی منبع):
+ARTICLE:
 {article_scope}
-
-اولویت دستور مدیر: دستورهای بالا، سیاست محتوایی مدیر هستند و باید در تولید نهایی رعایت شوند. دستورهای کلی این prompt فقط در صورت نبودِ دستور مدیر یا برای جلوگیری از ساختن اطلاعات، آن را تکمیل می‌کنند و نباید با آن تعارض داشته باشند.
+END_MANAGER_INSTRUCTION
 
 قانون ضدتکرار: عنوان و پاراگراف آغازین نباید یک مفهوم را چند بار با عبارت‌های مختلف تکرار کنند. هر نکته فقط یک‌بار و در مناسب‌ترین جای متن بیان شود. در نسخه کانال، چند جمله اول باید یک چکیده مفهومی واحد بسازند و سپس فقط جزئیات جدید اضافه کنند. از قرار دادن چند تیتر متوالی یا تیترهای هم‌معنی خودداری کن؛ متن باید با یک عنوان اصلی شروع شود و بلافاصله وارد محتوای واقعی خبر شود.
 
-قانون زبان: متن نهایی باید فارسی باشد. نام مدل، شرکت، محصول و اصطلاح فنی را فقط در حد لازم نگه دار. هیچ جمله یا پاراگراف انگلیسی تولید نکن و هیچ جمله‌ای را با یک کلمه انگلیسی آغاز نکن، مگر اینکه خودِ نام رسمی یک مدل/محصول/شرکت باشد و جایگزین فارسی طبیعی نداشته باشد.
+قانون زبان و سبک: زبان، لحن و سبک را دستور مدیر تعیین می‌کند. اگر مدیر صریحاً گفت خروجی کاملاً انگلیسی باشد، همان باید اجرا شود؛ اگر زبان را مشخص نکرد، پیش‌فرض فارسی است. هیچ قانون داخلیِ زبان نباید دستور صریح مدیر را override کند.
 
-این دو دستور فقط سیاست محتوایی را تعیین می‌کنند؛ قوانین Formatting، ایموجی، Bold، Italic، Quote و زیباسازی همان renderer فعلی ربات هستند و نباید تغییر کنند.
+قوانین داخلی ثابت فقط اینها هستند: JSON معتبر، Telegram HTML امن، عدم جعل اطلاعات و حفظ واقعیت منبع.
 
 اول برای امتیازدهی داخلی، امتیاز 0 تا 100 بده. فیلد accept فقط توضیح داخلی است و دروازه مستقل انتشار نیست؛ تصمیم نهایی را معیارهای عددی مدیر می‌گیرند. صرفاً به‌دلیل کوتاه بودن متن accept=false نده.
 تازگی توسط برنامه به‌صورت فنی و مستقل کنترل می‌شود؛ از ساختن تاریخ یا حدس‌زدن آن خودداری کن. مطالب خارج از پنجره ۶ ساعت برنامه اصلاً به این مرحله نمی‌رسند. مقدار accept فقط برای توصیف داخلی پاسخ است و تصمیم انتشار نهایی را برنامه بر اساس امتیاز و تنظیمات مدیر می‌گیرد.
@@ -2252,19 +2279,22 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
 2) article_html: طول ثابت ندارد و فقط وقتی جزئیات واقعی بیشتری در منبع وجود دارد از channel_html کامل‌تر باشد. اگر منبع کوتاه است، همین کوتاهی را حفظ کن؛ برای رسیدن به 1000 یا 2000 یا 3000 کاراکتر چیزی نساز. اگر واقعاً ادامه، مراحل، زمینه، جزئیات، نکات، منابع یا توضیحات اضافه وجود دارد، آنها را در نسخه کامل قرار بده.
 3) content_type: دقیقاً نوع غالب محتوا را تشخیص بده (news/tutorial/tool/security/comparison/list/analysis/general).
 4) has_more_details: فقط وقتی true باشد که نسخه ربات واقعاً اطلاعات معنادار و بیشتری از نسخه کانال دارد؛ صرف تفاوت عنوان/فرمت یا چند جمله تکراری کافی نیست.
-5) title, category و facts.
+5) is_promotional: فقط برای صفحه‌ای true است که صراحتاً اسپانسری، رپورتاژی، افیلیت، تبلیغاتی یا فروش‌محور باشد. صرف محصول بودن، اعلام قیمت در یک خبر، بررسی محصول، مستندات محصول، عرضه یا معرفی یک محصول مهم جهانی به‌تنهایی تبلیغاتی نیست.
+6) promotional_confidence: اگر is_promotional=true، میزان اطمینان 0 تا 1 و promotion_reason کوتاه بده.
+7) title, category و facts.
 
 قواعد نگارش:
-- فارسی روان، دوستانه، عامیانه و خوش‌خوان؛ رسمی و خشک نباش.
-- اگر اصطلاح فنی لازم است، معادل فارسی را اول بیاور و اصطلاح انگلیسی را فقط داخل پرانتز یا <code>...</code> قرار بده. پاراگراف کامل انگلیسی ممنوع است؛ فقط نام مدل‌ها، شرکت‌ها، محصولات و اصطلاح‌های فنی شناخته‌شده می‌توانند انگلیسی بمانند.
+- زبان و لحن را از دستور مدیر بگیر؛ اگر مشخص نشده بود، فارسی روان، دوستانه و خوش‌خوان را پیش‌فرض کن.
 - در هر پاراگراف اصلی حداکثر یک ایموجی مرتبط داشته باش؛ دو یا چند ایموجی کنار هم نگذار و ایموجی تکراری پشت‌سرهم هم استفاده نکن.
-- نسخه کانال باید فاصله‌گذاری طبیعی موبایلی داشته باشد، چند پاراگراف کوتاه داشته باشد و در صورت مناسب یک بخش Quote کوتاه داشته باشد.
-- Quote اجباری نیست. اگر خود محتوا نقل‌قول، نکته کلیدی، هشدار یا جمله‌ای دارد که با Quote بهتر خوانده می‌شود، از <blockquote> استفاده کن. اگر Quote معنایی ندارد، آن را مصنوعی نساز. renderer فقط در صورت نبودن Quote و مناسب بودن متن می‌تواند یک excerpt کوتاه بسازد.
+- Quoteها فقط باید از جملات واقعی منبع یا عین جمله موجود در متن منبع ساخته شوند؛ Quote ساختگی ممنوع. برای نقل‌قول مستقیم از هر فرد، نام او و معرفی کوتاه در پرانتز بیاور؛ مثال: <blockquote>«متن دقیق گفته‌شده» — نام فرد (سمت/معرفی کوتاه)</blockquote>.
+- تعداد Quote: تا 1000 کاراکتر 1 عدد، تا 1800 حداکثر 2 عدد، بالای 1800 حداکثر 3 عدد؛ بیشتر از 3 عدد ممنوع.
 - متن را با تیترهای کوتاه Bold، Italic فقط برای کلمه/عبارت کوتاه، Underline در موارد محدود، Code و Quote در جاهای طبیعی خوش‌خوان کن؛ روی یک جمله طولانی Italic نزن و از فرمت‌ها افراطی استفاده نکن.
 - اگر کد، دستور، نام API یا عبارت فنی دقیق وجود دارد از <code>...</code> استفاده کن؛ اگر متن شامل قطعه‌کد واقعی است از <pre>...</pre> استفاده کن.
 - هیچ‌وقت کاراکترهای متنی "\\n" را برای فاصله‌گذاری خروجی نده؛ برای خط جدید از newline واقعی استفاده کن.
 - سؤال‌هایی مثل «هدف چیست؟» یا «چه معنایی دارد؟» را به عنوان سؤال رها نکن؛ پاسخ و اطلاعات موجود در منبع را مستقیم بیان کن.
-- هیچ نتیجه‌گیری شخصی یا قضاوتی به کاربر تحمیل نکن.
+- هیچ نتیجه‌گیری شخصی، تحلیل مستقل، توصیه یا جهت‌گیری به کاربر تحمیل نکن.
+- فقط آنچه منبع بیان یا از داده‌های خود منبع به‌طور روشن قابل برداشت است منتقل کن؛ تحلیل شخصی نساز.
+- اگر منبع چند دیدگاه یا چند نقل‌قول دارد، هر دیدگاه را جدا و بی‌طرفانه با نام گوینده و معرفی کوتاه همان فرد منتقل کن؛ هیچ طرفی را ترجیح نده.
 - «طبق منبع»، «گزارش شده» و «این شرکت گفته» را فقط وقتی لازم است برای نسبت‌دادن ادعا استفاده کن.
 - چیزی را که در منبع نیست به عنوان واقعیت نساز.
 - تمام بخش‌های منبع را بررسی کن و به چند پاراگراف اول اکتفا نکن؛ نکات مهم میانی و پایانی را نیز در article_html پوشش بده.
@@ -2274,25 +2304,31 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
 
 فقط JSON معتبر:
 {json.dumps(editorial_schema, ensure_ascii=False)}"""
-    result=await ai.call([{"role":"system","content":"You are a Persian technology content producer. Be neutral and factual. Return JSON only."},{"role":"user","content":prompt}],0.35,5000,"editorial")
+    result=await ai.call([{"role":"system","content":"You are a technology content producer. Be neutral and factual. The manager instruction controls editorial language, style, length and coverage. Return JSON only."},{"role":"user","content":prompt}],0.35,5000,"editorial")
     obj=parse_json_object(result.get("content",""))
     if not obj:
         repair_prompt=("پاسخ زیر را فقط به JSON معتبر تبدیل کن؛ محتوای آن را تغییر نده. فیلدها: accept,score,category,iran_relevance,freshness,reliability,duplicate_risk,why,title,channel_html,article_html,facts.\n\n"+str(result.get("content",""))[:14000])
         retry=await ai.call([{"role":"system","content":"Return valid JSON only."},{"role":"user","content":repair_prompt}],0,4200,"editorial_json_repair")
         obj=parse_json_object(retry.get("content","")); result=retry
     if not obj: return {"error":"پاسخ AI JSON معتبر نبود","ai":result}
+    if bool(obj.get("is_promotional")) and float(obj.get("promotional_confidence",0) or 0) >= 0.8:
+        return {"error":"content marked as promotional","failure_type":"promotional","promotion_reason":str(obj.get("promotion_reason") or "commercial/sponsored intent")[:1200],"ai":result}
     # یک مرحله اصلاح زبانی فقط وقتی لازم است؛ هدف کاهش مصرف توکن و جلوگیری از خروجی انگلیسی است.
     raw_title=strip_html_text(obj.get("title") or item.get("title") or "")[:240]
     raw_ch=str(obj.get("channel_html") or obj.get("channel_text") or "")
     raw_ar=str(obj.get("article_html") or obj.get("article_text") or "")
-    if _needs_persian_rewrite(raw_title, raw_ch, raw_ar) or _has_long_english_blocks(raw_ch) or _has_long_english_blocks(raw_ar):
-        repair=(
-            "متن زیر خروجی تحریریه است اما بخشی از آن انگلیسی یا نیمه‌انگلیسی شده. فقط زبان متن را به فارسی روان اصلاح کن؛ هیچ واقعیتی را تغییر نده و ساختار HTML، تیترها، Quoteها، ترتیب نکات و formatting فعلی را حفظ کن. "
-            "نام شرکت‌ها، مدل‌ها و اصطلاحات فنی شناخته‌شده را همان‌طور نگه دار. خروجی فقط JSON معتبر با سه کلید title, channel_html, article_html باشد. "
-            "قالب Telegram HTML مجاز است و یک Quote کوتاه هم نگه دار/ایجاد کن.\n\n"
-            + json.dumps({"title":raw_title,"channel_html":raw_ch,"article_html":raw_ar},ensure_ascii=False)[:20000]
-        )
-        repaired=await ai.call([{"role":"system","content":"Rewrite to fluent Persian. Return JSON only."},{"role":"user","content":repair}],0.15,4200,"editorial_persian_repair")
+    manager_text=(channel_scope+" "+article_scope).strip().lower()
+    explicit_english=bool(re.search(r"(?:all|entire|everything|only)\s+(?:the\s+)?(?:text|content|words|output)\s+(?:must\s+be\s+)?english|english\s+only|(?:all|every|entire)\s+(?:text|words|content).{0,60}\benglish\b|(?:تمام|همه).{0,60}(?:باید|باشه|باشد).{0,20}انگلیسی|(?:تمام|همه).{0,60}انگلیسی.{0,20}(?:باشه|باشد)|فقط\s+انگلیسی|به\s*هیچ\s*عنوان.{0,30}فارسی",manager_text,flags=re.I|re.S))
+    explicit_persian=bool(re.search(r"(?:all|entire|everything|only)\s+(?:the\s+)?(?:text|content|words|output)\s+(?:must\s+be\s+)?persian|persian\s+only|(?:all|every|entire)\s+(?:text|words|content).{0,60}\bpersian\b|(?:تمام|همه).{0,60}(?:باید|باشه|باشد).{0,20}فارسی|(?:تمام|همه).{0,60}فارسی.{0,20}(?:باشه|باشد)|فقط\s+فارسی|به\s*هیچ\s*عنوان.{0,30}انگلیسی",manager_text,flags=re.I|re.S))
+    if explicit_english:
+        language_needs_fix=_latin_ratio(" ".join([raw_title,raw_ch,raw_ar]))<0.62; target_language="English"
+    elif explicit_persian:
+        language_needs_fix=(_needs_persian_rewrite(raw_title,raw_ch,raw_ar) or _has_long_english_blocks(raw_ch) or _has_long_english_blocks(raw_ar)); target_language="Persian"
+    else:
+        language_needs_fix=(_needs_persian_rewrite(raw_title,raw_ch,raw_ar) or _has_long_english_blocks(raw_ch) or _has_long_english_blocks(raw_ar)); target_language="Persian"
+    if language_needs_fix:
+        repair=(f"Rewrite only the language of the following editorial output into fluent {target_language}. Do not change facts, numbers, names, quote wording, ordering, HTML structure, or meaning. Preserve Quote blocks and attributions. Return only valid JSON with title, channel_html, article_html.\n\n"+json.dumps({"title":raw_title,"channel_html":raw_ch,"article_html":raw_ar},ensure_ascii=False)[:20000])
+        repaired=await ai.call([{"role":"system","content":f"Rewrite to fluent {target_language}. Return JSON only. Do not add or remove facts."},{"role":"user","content":repair}],0.15,4200,"editorial_language_repair")
         pobj=parse_json_object(repaired.get("content",""))
         if pobj:
             raw_title=strip_html_text(pobj.get("title") or raw_title)[:240]
@@ -2309,8 +2345,8 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
     obj["content_type"]=content_type
     obj["has_more_details"]=bool(obj.get("has_more_details"))
     # واحدِ قالب‌بندی قطعی: هر خروجی، حتی اگر AI متن خام داده باشد، یک‌بار از همین renderer عبور می‌کند.
-    ch=ensure_rich_channel_format(title, raw_ch, category)
-    ar=ensure_rich_article_format(title, raw_ar, item.get("url") or "", category)
+    ch=ensure_rich_channel_format(title, raw_ch, category, content_type)
+    ar=ensure_rich_article_format(title, raw_ar, item.get("url") or "", category, content_type)
     # If ensure_rich_article_format returns empty (due to no content), we treat as error.
     if not ar:
         return {"error": "تولید محتوای کامل ناموفق بود - خروجی خالی", "ai": result}
@@ -2424,6 +2460,13 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                     if len(body_plain) < 20:
                         return {'processed':0,'rejected':1,'reason':'source_content_too_thin'}
                     content_hash=text_hash(title+' '+body_plain)
+                    if not allow_old_test and await has_content_failure(db,url,content_hash):
+                        return {'processed':0,'rejected':0,'seen':1,'reason':'permanent_content_failure'}
+                    promo,promo_reason=is_high_confidence_promotional_page(title,body_plain,item.get('description',''),item.get('links') or [])
+                    if promo:
+                        if not allow_old_test:
+                            await record_content_failure(db,url,content_hash,title,'promotional',promo_reason)
+                        return {'processed':1,'rejected':1,'reason':'promotional: '+promo_reason}
                     if url in recent_urls and not allow_old_test:
                         return {'processed':0,'rejected':0,'seen':1,'reason':'published_url_recently'}
                     if content_hash in recent_hashes and not allow_old_test:
@@ -2444,40 +2487,55 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                         item_id=ins[0].get('id') if ins else 0
                     out=await ai_editorial_process(ai,item,source,recent_titles,weights,await get_manager_editorial_prompts(db))
                     if out.get('error'):
-                        if item_id: await db.execute("UPDATE source_items SET status='error',last_error=?,retry_after=? WHERE id=?",[out['error'][:1200],(now+timedelta(minutes=15)).isoformat(),item_id])
-                        return {'processed':1,'errors':1,'reason':out['error'][:220]}
+                        failure_type=str(out.get('failure_type') or '')
+                        reason=str(out.get('promotion_reason') or out.get('error') or 'content generation failure')[:2000]
+                        permanent=failure_type in {'promotional','generation_empty','quality_gate','verification'} or 'خروجی خالی' in reason or 'generation produced no usable' in reason
+                        status='rejected' if failure_type=='promotional' else 'error'
+                        retry_value=None if permanent else (now+timedelta(minutes=15)).isoformat()
+                        if item_id: await db.execute("UPDATE source_items SET status=?,last_error=?,retry_after=? WHERE id=?",[status,reason[:1200],retry_value,item_id])
+                        if permanent:
+                            await record_content_failure(db,url,content_hash,title,failure_type or 'generation_empty',reason)
+                        return {'processed':1,'rejected':1 if failure_type=='promotional' else 0,'errors':0 if failure_type=='promotional' or permanent else 1,'reason':reason[:220]}
                     score=float(out.get('score',0) or 0); min_score=float(await get_setting(db,'min_content_score',str(DEFAULT_MIN_CONTENT_SCORE)))
                     # Manager controls the gate. Special low-threshold mode is intentional: when the
                     # manager sets the minimum to 0/1, every fresh, non-duplicate item is eligible.
                     # The AI is still used for extraction/formatting; it is not a hidden veto.
                     accept = manager_accepts_score(score, min_score)
                     if not accept:
-                        if item_id: await db.execute("UPDATE source_items SET status='rejected',score=?,category=?,last_error=?,retry_after=? WHERE id=?",[score,out.get('category',source.get('category','tech')),str(out.get('why') or 'score below threshold')[:1000],(now+timedelta(minutes=15)).isoformat(),item_id])
-                        return {'processed':1,'rejected':1,'score':score,'reason':str(out.get('why') or 'score below threshold')[:220]}
+                        reason_text=str(out.get('why') or 'score below threshold')[:2000]
+                        if item_id: await db.execute("UPDATE source_items SET status='rejected',score=?,category=?,last_error=?,retry_after=NULL WHERE id=?",[score,out.get('category',source.get('category','tech')),reason_text[:1000],item_id])
+                        await record_content_failure(db,url,content_hash,title,'quality_gate',reason_text)
+                        return {'processed':1,'rejected':1,'score':score,'reason':reason_text[:220]}
                     verify_mode=await get_setting(db,'ai_verify_mode','auto')
                     need_verify=(verify_mode=='always')
                     if need_verify:
                         verify=await ai_verify_content(ai,item,out)
                         if not verify.get('ok') or float(verify.get('confidence',0) or 0)<80:
-                            if item_id: await db.execute("UPDATE source_items SET status='rejected',score=?,last_error=?,retry_after=? WHERE id=?",[score,json.dumps(verify,ensure_ascii=False)[:1200],(now+timedelta(minutes=15)).isoformat(),item_id])
+                            verify_reason=json.dumps(verify,ensure_ascii=False)[:2000]
+                            if item_id: await db.execute("UPDATE source_items SET status='rejected',score=?,last_error=?,retry_after=NULL WHERE id=?",[score,verify_reason[:1200],item_id])
+                            await record_content_failure(db,url,content_hash,title,'verification',verify_reason)
                             return {'processed':1,'rejected':1,'score':score,'reason':'verification'}
                     # Canonical content pipeline: these are rendered exactly once by ai_editorial_process.
                     # Do not reformat/fallback later; re-rendering was the source of inconsistent channel/article output.
                     title_out=strip_html_text(out.get('title') or title)[:500]
                     # از خروجی نهایی AI همان یک renderer اصلی را اجرا می‌کنیم؛ دیگر مسیر خام/متفاوت نداریم.
-                    channel_text=ensure_rich_channel_format(title_out, out.get('channel_html') or out.get('channel_text') or body_plain, str(out.get('category') or source.get('category') or 'tech'))
-                    article_text=ensure_rich_article_format(title_out, out.get('article_html') or out.get('article_text') or body_plain, url, str(out.get('category') or source.get('category') or 'tech'))
+                    content_type_out=str(out.get('content_type') or classify_content_type(title_out,out.get('channel_html') or out.get('channel_text') or body_plain,str(out.get('category') or source.get('category') or 'tech')))
+                    channel_text=ensure_rich_channel_format(title_out, out.get('channel_html') or out.get('channel_text') or body_plain, str(out.get('category') or source.get('category') or 'tech'), content_type_out)
+                    article_text=ensure_rich_article_format(title_out, out.get('article_html') or out.get('article_text') or body_plain, url, str(out.get('category') or source.get('category') or 'tech'), content_type_out)
                     # IMPORTANT: Ensure article_text is not the placeholder fallback. If it contains the placeholder string, reject.
                     if not article_text or "اطلاعات کافی برای تهیه متن کامل" in article_text:
-                        if item_id: await db.execute("UPDATE source_items SET status='error',last_error=?,retry_after=? WHERE id=?",['generation produced fallback placeholder',(now+timedelta(minutes=15)).isoformat(),item_id])
+                        if item_id: await db.execute("UPDATE source_items SET status='error',last_error=?,retry_after=NULL WHERE id=?",['generation produced fallback placeholder',item_id])
+                        await record_content_failure(db,url,content_hash,title,'generation_error','generation produced fallback placeholder')
                         return {'processed':1,'errors':1,'reason':'generation fallback placeholder'}
                     channel_text=clean_channel_copy(channel_text)
                     article_text=remove_article_metadata_blocks(article_text)
                     if not strip_html_text(channel_text) or not strip_html_text(article_text):
-                        if item_id: await db.execute("UPDATE source_items SET status='error',last_error=?,retry_after=? WHERE id=?",['generation produced no usable rich content',(now+timedelta(minutes=15)).isoformat(),item_id])
+                        if item_id: await db.execute("UPDATE source_items SET status='error',last_error=?,retry_after=NULL WHERE id=?",['generation produced no usable rich content',item_id])
+                        await record_content_failure(db,url,content_hash,title,'generation_error','generation produced no usable rich content')
                         return {'processed':1,'errors':1,'reason':'generation empty'}
                     if plain_len(article_text)<80:
-                        if item_id: await db.execute("UPDATE source_items SET status='error',last_error=?,retry_after=? WHERE id=?",['generation produced no usable text',(now+timedelta(minutes=15)).isoformat(),item_id])
+                        if item_id: await db.execute("UPDATE source_items SET status='error',last_error=?,retry_after=NULL WHERE id=?",['generation produced no usable text',item_id])
+                        await record_content_failure(db,url,content_hash,title,'generation_error','generation produced no usable text')
                         return {'processed':1,'errors':1,'reason':'generation empty'}
                     art=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at,source_published_at) VALUES(?,?,?,?,?,?,?,?,'ready',?,?) RETURNING id",
                         [item_id,title_out,channel_text,article_text[:18000],url,str(item.get('image_url') or '')[:1000],out.get('category') or source.get('category','tech'),score,now.isoformat(),item.get('published_at','')[:100]])
@@ -2592,24 +2650,12 @@ def split_channel_footer(value: str) -> Tuple[str,str]:
     return text[:m.start()].rstrip(), m.group(1).strip()
 
 def should_attach_bot_link(channel_html: str, article_html: str, content_type: str = "general") -> bool:
-    """Link to the bot only when there is genuinely more to read.
-
-    Length is a signal, not a quota: a short complete item stays channel-only.
-    The bot link appears when the stored article has a meaningful extra body.
-    """
-    ch=max(0,plain_len(channel_html or ""))
-    ar=max(0,plain_len(article_html or ""))
-    if not ch or not ar or ar<=ch:
-        return False
-    extra=ar-ch
-    # A clearly longer article needs navigation; tiny formatting/title differences do not.
-    if extra>=260:
-        return True
-    if ar>1000 and extra>=180:
-        return True
-    if content_type in {"tutorial","analysis","comparison","list","security"} and ar>=900 and extra>=180:
-        return True
-    return False
+    """Add the bot CTA only when the channel body itself exceeds ~1000 chars and the bot has real extra detail."""
+    channel_body,_footer=split_channel_footer(channel_html or "")
+    ch=max(0,plain_len(channel_body)); ar=max(0,plain_len(article_html or ""))
+    if not ch or not ar or ar<=ch: return False
+    if ch<=1000: return False
+    return (ar-ch)>=140
 
 def _trim_rich_blocks_to_limit(value: str, max_plain_chars: int = 760) -> str:
     clean=sanitize_telegram_html(clean_channel_copy(value or ''))
@@ -2630,10 +2676,10 @@ def publication_caption(title: str, channel_html: str, deep_link: Optional[str] 
     A bot CTA is optional and is added only when substantial extra content exists.
     """
     body, footer = split_channel_footer(channel_html)
-    link=(f'<a href="{html.escape(deep_link,quote=True)}">📖 جزئیات کامل در ربات</a>' if deep_link else "")
+    link=(f'<a href="{html.escape(deep_link,quote=True)}">📖 بیشتر ...</a>' if deep_link else "")
     # Photo captions have a 1024-character limit. Give channel-only posts more room,
     # while leaving enough space for the optional navigation link when necessary.
-    body_limit=820 if deep_link else 930
+    body_limit=820 if deep_link else 995
     clean=_trim_rich_blocks_to_limit(body, body_limit)
     tail=[]
     if footer: tail.append(footer)
@@ -4844,7 +4890,7 @@ async def set_editorial_prompt_channel(call: CallbackQuery, state: FSMContext, d
     current=await get_setting(db,"editorial_prompt_channel","")
     await prompt_for_setting(
         call,state,"editorial_prompt_channel",
-        "✍️ <b>پرامپت محتوای کوتاه کانال</b>\n\nاین متن فقط مشخص می‌کند چه چیزهایی در نسخه حدود 500 کاراکتری پوشش داده شود؛ Formatting را تغییر نمی‌دهد.\n\nپرامپت جدید را بفرست.\n\nفعلی:\n<code>"+html.escape(current[:1800])+"</code>",
+        "✍️ <b>پرامپت محتوای کوتاه کانال</b>\n\nاین دستور مدیر مستقیماً روی موضوع، زبان، لحن و سطح جزئیات نسخه کوتاه اثر می‌گذارد. فقط JSON امن، HTML امن و عدم جعل اطلاعات ثابت‌اند.\n\nپرامپت جدید را بفرست.\n\nفعلی:\n<code>"+html.escape(current[:1800])+"</code>",
         "editorial_prompts"
     )
 
@@ -4854,7 +4900,7 @@ async def set_editorial_prompt_article(call: CallbackQuery, state: FSMContext, d
     current=await get_setting(db,"editorial_prompt_article","")
     await prompt_for_setting(
         call,state,"editorial_prompt_article",
-        "📝 <b>پرامپت محتوای کامل داخل ربات</b>\n\nاین متن فقط مشخص می‌کند چه اطلاعاتی در نسخه حدود 2000 کاراکتری پوشش داده شود؛ Formatting و زیبایی متن وظیفه ربات است.\n\nپرامپت جدید را بفرست.\n\nفعلی:\n<code>"+html.escape(current[:1800])+"</code>",
+        "📝 <b>پرامپت محتوای کامل داخل ربات</b>\n\nاین دستور مدیر مستقیماً روی موضوع، زبان، لحن و سطح جزئیات نسخه کامل اثر می‌گذارد. فقط JSON امن، HTML امن و عدم جعل اطلاعات ثابت‌اند.\n\nپرامپت جدید را بفرست.\n\nفعلی:\n<code>"+html.escape(current[:1800])+"</code>",
         "editorial_prompts"
     )
 
