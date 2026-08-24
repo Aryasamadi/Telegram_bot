@@ -89,7 +89,7 @@ HTTP_USER_AGENT = os.getenv("HTTP_USER_AGENT", "TechNowAI/2.0 (+content automati
 HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
 MAX_HTTP_BYTES = int(os.getenv("MAX_HTTP_BYTES", "1500000"))
 # Full source body is retained for editorial processing; raise only when needed.
-MAX_SOURCE_CONTENT_CHARS = int(os.getenv("MAX_SOURCE_CONTENT_CHARS", "60000"))
+MAX_SOURCE_CONTENT_CHARS = int(os.getenv("MAX_SOURCE_CONTENT_CHARS", "50000"))
 MAX_SOURCE_ITEMS_PER_CYCLE = int(os.getenv("MAX_SOURCE_ITEMS_PER_CYCLE", "5"))
 MAX_AUTOMATION_SOURCES = max(1, int(os.getenv("MAX_AUTOMATION_SOURCES", "50")))
 
@@ -680,9 +680,14 @@ class SimpleHTMLParser(HTMLParser):
             return ""
         def score(item):
             text, priority = item
-            wc = len(re.findall(r"\w+", text))
-            sentence_like = text.count(".") + text.count("؟") + text.count("!")
-            return (priority, len(text), wc + min(sentence_like, 20) * 50)
+            plain=strip_html_text(text)
+            wc=len(re.findall(r"\w+", plain))
+            sentence_like=plain.count(".")+plain.count("؟")+plain.count("!")
+            # Length/coverage dominates. The old implementation ranked priority
+            # before length, so a short JSON-LD teaser could incorrectly beat the
+            # full <article>/<main> body. Priority is now only a tie-break/bonus.
+            coverage=min(len(plain), MAX_SOURCE_CONTENT_CHARS)
+            return (coverage + priority*50, wc + min(sentence_like, 20)*50, priority)
         return max(candidates, key=score)[0].strip()
 
 
@@ -2023,6 +2028,19 @@ def _latin_ratio(text: str) -> float:
     latin=len(re.findall(r"[A-Za-z]", plain))
     return latin/max(1,len(re.sub(r"\s+","",plain)))
 
+def _has_long_english_blocks(text: str) -> bool:
+    clean=strip_html_text(text or "")
+    for block in re.split(r"\n\s*\n+", clean):
+        b=block.strip()
+        if len(b)<80:
+            continue
+        latin=len(re.findall(r"[A-Za-z]",b))
+        pers=len(re.findall(r"[\u0600-\u06FF]",b))
+        words=len(re.findall(r"\b[A-Za-z]{2,}\b",b))
+        if words>=12 and latin>=45 and latin>max(20,pers*1.5):
+            return True
+    return False
+
 def _needs_persian_rewrite(title: str, channel: str, article: str) -> bool:
     sample=" ".join([title or "", channel or "", article or ""])[:5000]
     return _latin_ratio(sample) > 0.42 and _persian_ratio(sample) < 0.45
@@ -2085,6 +2103,7 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
 - هیچ نتیجه‌گیری شخصی یا قضاوتی به کاربر تحمیل نکن.
 - «طبق منبع»، «گزارش شده» و «این شرکت گفته» را فقط وقتی لازم است برای نسبت‌دادن ادعا استفاده کن.
 - چیزی را که در منبع نیست به عنوان واقعیت نساز.
+- تمام بخش‌های منبع را بررسی کن و به چند پاراگراف اول اکتفا نکن؛ نکات مهم میانی و پایانی را نیز در article_html پوشش بده.
 - channel_html و article_html را با HTML سازگار با Telegram بده؛ Markdown استفاده نکن.
 - لینک یا URL تولید نکن و هیچ لینک منبعی را در پاسخ خودت وارد نکن؛ URL فقط در اختیار برنامه است.
 - لینک Deep Link مقاله توسط برنامه اضافه می‌شود؛ در متن کانال هیچ عبارت «ادامه مطلب را از لینک زیر بخوانید» یا مشابه آن ننویس.
@@ -2102,9 +2121,9 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
     raw_title=strip_html_text(obj.get("title") or item.get("title") or "")[:240]
     raw_ch=str(obj.get("channel_html") or obj.get("channel_text") or "")
     raw_ar=str(obj.get("article_html") or obj.get("article_text") or "")
-    if _needs_persian_rewrite(raw_title, raw_ch, raw_ar):
+    if _needs_persian_rewrite(raw_title, raw_ch, raw_ar) or _has_long_english_blocks(raw_ch) or _has_long_english_blocks(raw_ar):
         repair=(
-            "متن زیر خروجی تحریریه است اما بخش زیادی انگلیسی شده. فقط بازنویسی فارسی انجام بده و هیچ واقعیتی را تغییر نده. "
+            "متن زیر خروجی تحریریه است اما بخشی از آن انگلیسی یا نیمه‌انگلیسی شده. فقط زبان متن را به فارسی روان اصلاح کن؛ هیچ واقعیتی را تغییر نده و ساختار HTML، تیترها، Quoteها، ترتیب نکات و formatting فعلی را حفظ کن. "
             "نام شرکت‌ها، مدل‌ها و اصطلاحات فنی شناخته‌شده را همان‌طور نگه دار. خروجی فقط JSON معتبر با سه کلید title, channel_html, article_html باشد. "
             "قالب Telegram HTML مجاز است و یک Quote کوتاه هم نگه دار/ایجاد کن.\n\n"
             + json.dumps({"title":raw_title,"channel_html":raw_ch,"article_html":raw_ar},ensure_ascii=False)[:20000]
