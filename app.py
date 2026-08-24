@@ -1655,7 +1655,8 @@ def plain_len(value: str) -> int:
 def _format_technical_tokens(text: str) -> str:
     # Add <code> only to clearly technical tokens; never invent facts.
     patterns = [
-        r"\b(?:GPT-\d+(?:\.\d+)?|GPT-4o|LLM|API|JSON|Python|JavaScript|TypeScript|HTML|CSS|SQL|HTTP|HTTPS|OAuth|WebSocket|RAG|GPU|CPU|SDK)\b",
+        r"\b(?:GPT-\d+(?:\.\d+)?|GPT-4o|LLM|API|JSON|Python|JavaScript|TypeScript|HTML|CSS|SQL|HTTP|HTTPS|OAuth|WebSocket|RAG|GPU|CPU|SDK|SNMP|SMTP|WPF|PDF|XML|YAML|CLI|SSH|DNS|TCP|UDP|TLS|SSL|CVSS|RCE|XSS|SQLi)\b",
+        r"(?:CVE-\d{4}-\d{4,7}|\.NET(?:\s+Framework)?|command injection|remote code execution|SNMP monitoring|SNMP notifications)",
         r"\b(?:Generative AI|Machine Learning|Zero[- ]Day|Phishing|Ransomware)\b",
     ]
     out=text
@@ -1736,92 +1737,191 @@ def _remove_duplicate_title_from_body(title: str, value: str) -> str:
     return "\n\n".join(kept)
 
 def _quote_target_count(total_chars: int) -> int:
-    """Approximate quote density: ~1 per 500 chars, capped at 4."""
-    return max(1, min(4, int(math.ceil(max(1, total_chars) / 500.0))))
+    """Soft maximum for quote blocks; the renderer never forces quotes into the article."""
+    if total_chars < 700:
+        return 1
+    if total_chars < 1250:
+        return 2
+    if total_chars < 1750:
+        return 3
+    return 4
+
+
+def _normalize_semantic_tokens(text: str) -> set:
+    plain=strip_html_text(text or "").lower()
+    words=re.findall(r"[\u0600-\u06ffA-Za-z0-9][\u0600-\u06ffA-Za-z0-9_-]{2,}", plain)
+    stop={
+        "این","آن","است","بود","شد","شود","برای","در","به","از","با","که","را","و","یک","اما","هم","روی","بر","تا","نیز","دارد","داده","همین","های","هایِ","the","and","for","with","from","that","this","into","will","has","have","are","was"
+    }
+    return {w for w in words if w not in stop}
+
+
+def _semantic_similarity(a: str, b: str) -> Tuple[float, float]:
+    pa=strip_html_text(a or "").lower(); pb=strip_html_text(b or "").lower()
+    ratio=SequenceMatcher(None, pa, pb).ratio() if pa and pb else 0.0
+    ta=_normalize_semantic_tokens(pa); tb=_normalize_semantic_tokens(pb)
+    overlap=(len(ta & tb)/max(1,min(len(ta),len(tb)))) if ta and tb else 0.0
+    return ratio, overlap
+
+
+def _remove_semantic_repeats(value: str, title: str = "") -> str:
+    """Remove clear restatements, especially title+opening paragraph or adjacent duplicate facts."""
+    text=_normalize_text_blocks(value or "")
+    blocks=[x.strip() for x in re.split(r"\n\s*\n+",text) if strip_html_text(x).strip()]
+    if not blocks:
+        return ""
+
+    title_plain=strip_html_text(title or "").strip().lower()
+    kept=[]
+    for idx, block in enumerate(blocks):
+        plain=strip_html_text(block).strip()
+        if not plain:
+            continue
+
+        # Remove an explicit model title/header because renderer supplies the canonical title.
+        if idx == 0 and title_plain:
+            tr,to=_semantic_similarity(plain,title_plain)
+            if tr >= 0.72 or to >= 0.82:
+                continue
+
+        # Strong protection against the common "title -> same fact rephrased" bug.
+        if not kept and title_plain and len(plain) >= 45:
+            tr,to=_semantic_similarity(plain,title_plain)
+            if tr >= 0.52 and to >= 0.58:
+                continue
+
+        duplicate=False
+        # Compare against the last few retained blocks only; this avoids deleting legitimate
+        # recurring topic words spread throughout a long report.
+        for prev in kept[-4:]:
+            pr,po=_semantic_similarity(prev,plain)
+            if pr >= 0.82 or po >= 0.88 or (pr >= 0.70 and po >= 0.78):
+                duplicate=True
+                break
+        if duplicate:
+            continue
+        kept.append(block)
+    return "\n\n".join(kept)
+
 
 def _build_quote_excerpt(paragraph: str) -> str:
     plain=strip_html_text(paragraph or "").strip()
     if len(plain) < 20:
         return ""
     sentences=[x.strip() for x in re.split(r"(?<=[.!?؟؛])\s+", plain) if x.strip()]
-    excerpt=next((x for x in sentences if 20 <= len(x) <= 220), "")
-    if not excerpt:
-        excerpt=plain[:180].rsplit(" ",1)[0] + ("…" if len(plain)>180 else "")
+    # Synthetic quotes are intentionally conservative. Prefer a sentence that already looks
+    # self-contained; never convert an arbitrary technical paragraph into a giant quote box.
+    excerpt=next((x for x in sentences if 35 <= len(x) <= 180), "")
     return excerpt
 
-def _insert_synthetic_quotes(paragraphs: List[str], target_count: int) -> List[Tuple[str,bool]]:
-    """Return paragraphs plus quote markers, preserving any explicit model quotes."""
-    items=[(p, bool(re.search(r"<blockquote\b", p or "", flags=re.I))) for p in paragraphs]
-    existing=sum(1 for _,is_q in items if is_q)
-    need=max(0, target_count-existing)
-    if need <= 0:
-        return items
-    candidates=[i for i,(p,is_q) in enumerate(items) if not is_q and len(strip_html_text(p))>=20]
-    if not candidates:
-        return items
-    # Spread synthetic quotes across the article instead of clustering them.
-    picks=[]
-    for n in range(need):
-        pos=round((n+1)*(len(candidates)+1)/(need+1))-1
-        pos=max(0,min(len(candidates)-1,pos))
-        pick=candidates[pos]
-        if pick not in picks:
-            picks.append(pick)
-    for idx in sorted(picks, reverse=True):
-        excerpt=_build_quote_excerpt(items[idx][0])
-        if excerpt:
-            items[idx]=(f"<blockquote>🔎 {html.escape(excerpt, quote=False)}</blockquote>", True)
-    return items
+
+def _rebalance_quotes(paragraphs: List[str], max_quotes: int) -> List[str]:
+    """Keep quotes as accents, not as the entire article. Never force a quote into text."""
+    quote_positions=[i for i,p in enumerate(paragraphs) if re.search(r"<blockquote\b", p or "", flags=re.I)]
+    if not quote_positions:
+        return paragraphs
+    # A rich article should not become a wall of quote cards. Roughly one quote per three
+    # body blocks is the visual ceiling, while the length-based max remains the hard ceiling.
+    visual_cap=max(1, min(max_quotes, math.ceil(max(1,len(paragraphs))/3)))
+    if len(quote_positions) <= visual_cap:
+        return paragraphs
+    # Prefer quotes distributed across the article rather than the first N quote blocks.
+    selected=[]
+    for n in range(visual_cap):
+        pos=round((n+0.5)*len(quote_positions)/visual_cap)-1
+        pos=max(0,min(len(quote_positions)-1,pos))
+        idx=quote_positions[pos]
+        if idx not in selected:
+            selected.append(idx)
+    selected=set(selected)
+    out=[]
+    for i,p in enumerate(paragraphs):
+        if i in quote_positions and i not in selected:
+            plain=strip_html_text(p)
+            if plain:
+                out.append(html.escape(plain,quote=False))
+        else:
+            out.append(p)
+    return out
+
+
+def _looks_like_heading(text: str) -> bool:
+    plain=strip_html_text(text or "").strip()
+    if not plain or len(plain) > 110:
+        return False
+    if re.match(r"^(?:\d+|[❶❷❸❹❺❻❼❽❾])\s*[.):-]", plain):
+        return True
+    if plain.endswith(":") and len(plain.split()) <= 14:
+        return True
+    if re.match(r"^(?:نکته|هشدار|توضیح|توضیح فنی|نتیجه|جمع‌بندی|چرا|چطور|مراحل|مرحله|بررسی|جزئیات|ویژگی‌ها|تفاوت|مقایسه|راهکار|اثرات|وضعیت)\b", plain, re.I):
+        return True
+    return False
+
+
+def _apply_visual_richness(para: str, icon: str, is_first_body: bool=False) -> str:
+    pplain=strip_html_text(para).strip()
+    if not pplain:
+        return ""
+    has_rich=any(tag in para.lower() for tag in ("<b>","<strong>","<i>","<em>","<u>","<s>","<a ","<pre>","<code>","<blockquote"))
+    if has_rich:
+        base=_protect_bidi_latin(para.strip())
+    else:
+        base=_format_technical_tokens(_protect_bidi_latin(html.escape(pplain,quote=False)))
+
+    if _looks_like_heading(pplain):
+        return f"{icon} <b>{base}</b>" if not has_rich else f"{icon} {base}"
+    if is_first_body and not has_rich:
+        return f"{icon} <b>{base}</b>"
+
+    lower=pplain.lower()
+    emphasis_words=("نکته", "هشدار", "توجه", "در عمل", "به‌طور خلاصه", "خلاصه")
+    if not has_rich and len(pplain) <= 190 and any(w in lower for w in emphasis_words):
+        return f"{icon} <i>{base}</i>"
+    return f"{icon} {base}"
 
 
 def _visualize_plain_paragraphs(title: str, value: str, category: str, article: bool=False) -> str:
-    # IMPORTANT: Preserve model-provided Telegram HTML blocks. The previous renderer
-    # stripped every <blockquote>, which made intentionally formatted educational
-    # content lose its visual structure. Only sanitize unsafe tags; do not flatten
-    # valid rich blocks.
-    value=_remove_duplicate_title_from_body(title, value or "")
-    clean=sanitize_telegram_html(_normalize_text_blocks(value))
+    value=_remove_semantic_repeats(title and value or "", title)
+    clean=sanitize_telegram_html(value)
     plain=strip_html_text(clean)
-    if not plain: return ""
+    if not plain:
+        return ""
+
     emoji_map={
-        "ai":["🤖","🧠","🔬","⚡","🧩"],
-        "cyber":["🛡️","🔐","🚨","⚠️","🔎"],
-        "tech":["💻","⚙️","🚀","🔎","🧪"],
-        "edu":["📚","💡","🧭","📝","🎓"],
-        "general":["🌐","✨","📌","🔭","🧭"]
+        "ai":["🤖","🧠","🔬","⚡","🧩","🚀","💡"],
+        "cyber":["🛡️","🔐","🚨","⚠️","🔎","🧩","💻"],
+        "tech":["💻","⚙️","🚀","🔎","🧪","📱","💡"],
+        "edu":["📚","💡","🧭","📝","🎓","🔍","🛠️"],
+        "general":["🌐","✨","📌","🔭","🧭","💡","📰"]
     }
     icons=emoji_map.get(category,emoji_map["tech"])
     paragraphs=_split_readable_paragraphs(clean, max_chars=430 if not article else 560) or [clean]
-    # Desired density: 1 quote per ~500 chars, capped at 4. Preserve explicit model quotes.
-    quote_target=_quote_target_count(len(strip_html_text("\n\n".join(paragraphs))))
-    marked_paragraphs=_insert_synthetic_quotes(paragraphs[:16], quote_target)
-    out=[f"<b>{icons[0]} {html.escape(strip_html_text(title)[:220])}</b>"]
-    last_icon=None
-    for i,(para,is_quote) in enumerate(marked_paragraphs):
-        pplain=strip_html_text(para).strip()
-        title_similarity=SequenceMatcher(None,pplain.lower(),strip_html_text(title).lower()).ratio()
-        if not pplain or title_similarity>0.82: continue
+    paragraphs=_rebalance_quotes(paragraphs, _quote_target_count(len(strip_html_text("\n\n".join(paragraphs)))))
 
-        if is_quote:
-            out.append(_protect_bidi_latin(para.strip()))
+    out=[f"<b>{icons[0]} {html.escape(strip_html_text(title)[:220])}</b>"]
+    icon_offset=0
+    first_body=True
+    for para in paragraphs[:18]:
+        pplain=strip_html_text(para).strip()
+        if not pplain:
+            continue
+        title_similarity=SequenceMatcher(None,pplain.lower(),strip_html_text(title).lower()).ratio()
+        if title_similarity>0.84 and len(pplain)<=max(60,len(strip_html_text(title))*1.7):
             continue
 
-        icon=icons[i%len(icons)]
-        if icon==last_icon: icon=icons[(i+1)%len(icons)]
-        last_icon=icon
-        has_rich=any(tag in para.lower() for tag in ("<b>","<strong>","<i>","<em>","<u>","<s>","<a ","<pre>","<code>","<blockquote"))
-        if has_rich:
-            formatted=_protect_bidi_latin(para.strip())
-        else:
-            formatted=_format_technical_tokens(_protect_bidi_latin(html.escape(pplain,quote=False)))
-        if i==1:
-            # Only bold an actually plain first body paragraph. Never nest formatting.
-            formatted=f"{icon} <b>{formatted}</b>" if not has_rich else f"{icon} {formatted}"
-        elif i==3 and len(pplain)<=140 and not has_rich:
-            formatted=f"{icon} <i>{formatted}</i>"
-        else:
-            formatted=f"{icon} {formatted}"
-        out.append(formatted)
+        if re.search(r"<blockquote\b", para or "", flags=re.I):
+            # Preserve explicit quotes, but do not add extra emoji inside quote cards.
+            out.append(_protect_bidi_latin(para.strip()))
+            first_body=False
+            continue
+
+        icon=icons[icon_offset % len(icons)]
+        icon_offset += 1
+        formatted=_apply_visual_richness(para,icon,is_first_body=first_body)
+        if formatted:
+            out.append(formatted)
+            first_body=False
+
     return dedupe_adjacent_emojis("\n\n".join(out))
 
 def ensure_rich_channel_format(title: str, value: str, category: str = "tech") -> str:
@@ -2281,18 +2381,19 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
 - اگر اصطلاح فنی لازم است، معادل فارسی را اول بیاور و اصطلاح انگلیسی را فقط داخل پرانتز یا <code>...</code> قرار بده. پاراگراف کامل انگلیسی ممنوع است؛ فقط نام مدل‌ها، شرکت‌ها، محصولات و اصطلاح‌های فنی شناخته‌شده می‌توانند انگلیسی بمانند.
 - در هر پاراگراف اصلی حداکثر یک ایموجی مرتبط داشته باش؛ دو یا چند ایموجی کنار هم نگذار و ایموجی تکراری پشت‌سرهم هم استفاده نکن.
 - نسخه کانال و نسخه کامل باید بین پاراگراف‌های اصلی فاصلهٔ خالی واقعی داشته باشند؛ متن را به یک دیوار متراکم از جمله‌ها تبدیل نکن.
-- Quoteها بر اساس طول تنظیم می‌شوند: حدود 400-500 کاراکتر = 1 Quote، حدود 1000 = 2، حدود 1500 = 3 و حدود 2000 یا بیشتر = حداکثر 4 Quote. Quoteها باید از متن واقعی یا نقل‌قول واقعی منبع ساخته شوند و ساختگی نباشند؛ renderer در صورت نیاز excerpt واقعی ایجاد می‌کند.
+- Quote فقط در جایی استفاده شود که از نظر معنایی طبیعی و مفید است؛ این تعداد «حداکثر» است نه اجبار: کمتر از سقف کاملاً مجاز است. سقف تقریبی: زیر 700 کاراکتر 1، زیر 1250 کاراکتر 2، زیر 1750 کاراکتر 3 و بالاتر از آن 4. از Quote مصنوعی، تکراری یا تبدیل کل مقاله به Quote خودداری کن.
 - متن را با تیترهای کوتاه Bold، Italic فقط برای کلمه/عبارت کوتاه، Underline در موارد محدود، Code و Quote در جاهای طبیعی خوش‌خوان کن؛ روی یک جمله طولانی Italic نزن و از فرمت‌ها افراطی استفاده نکن.
 - اگر کد، دستور، نام API یا عبارت فنی دقیق وجود دارد از <code>...</code> استفاده کن؛ اگر متن شامل قطعه‌کد واقعی است از <pre>...</pre> استفاده کن.
 - هیچ‌وقت کاراکترهای متنی "\\n" را برای فاصله‌گذاری خروجی نده؛ برای خط جدید از newline واقعی استفاده کن.
 - سؤال‌هایی مثل «هدف چیست؟» یا «چه معنایی دارد؟» را به عنوان سؤال رها نکن؛ پاسخ و اطلاعات موجود در منبع را مستقیم بیان کن.
 - هیچ نتیجه‌گیری شخصی یا قضاوتی به کاربر تحمیل نکن.
+- عنوان و لید را یک بار بیان کن؛ در پاراگراف بعدی همان خبر را دوباره با واژه‌های متفاوت تکرار نکن. هر پاراگراف باید نکته، عدد، علت، اثر، مرحله، نقل‌قول یا زمینهٔ تازه‌ای اضافه کند.
 - «طبق منبع»، «گزارش شده» و «این شرکت گفته» را فقط وقتی لازم است برای نسبت‌دادن ادعا استفاده کن.
 - چیزی را که در منبع نیست به عنوان واقعیت نساز.
 - تمام بخش‌های منبع را بررسی کن و به چند پاراگراف اول اکتفا نکن؛ نکات مهم میانی و پایانی را نیز در article_html پوشش بده.
 - channel_html و article_html را با HTML سازگار با Telegram بده؛ Markdown استفاده نکن.
 - لینک یا URL تولید نکن و هیچ لینک منبعی را در پاسخ خودت وارد نکن؛ URL فقط در اختیار برنامه است.
-- لینک Deep Link مقاله فقط وقتی توسط برنامه اضافه می‌شود که واقعاً جزئیات بیشتری برای خواندن وجود داشته باشد. در غیر این صورت هیچ CTA یا تبلیغ ربات اضافه نکن.
+- تیتر را در اولین پاراگراف دوباره با عبارت‌های تقریباً یکسان تکرار نکن. هر پاراگراف باید اطلاعات جدیدی نسبت به پاراگراف قبل اضافه کند؛ بازگویی همان واقعیت با واژه‌های متفاوت ممنوع است.
 
 فقط JSON معتبر:
 {json.dumps(editorial_schema, ensure_ascii=False)}"""
