@@ -1737,7 +1737,7 @@ def _remove_duplicate_title_from_body(title: str, value: str) -> str:
     return "\n\n".join(kept)
 
 def _quote_target_count(total_chars: int) -> int:
-    """Soft maximum for quote blocks; the renderer never forces quotes into the article."""
+    """Soft maximum for quote accents. Quotes are never a quota and never forced blindly."""
     if total_chars < 700:
         return 1
     if total_chars < 1250:
@@ -1777,22 +1777,15 @@ def _remove_semantic_repeats(value: str, title: str = "") -> str:
         plain=strip_html_text(block).strip()
         if not plain:
             continue
-
-        # Remove an explicit model title/header because renderer supplies the canonical title.
         if idx == 0 and title_plain:
             tr,to=_semantic_similarity(plain,title_plain)
             if tr >= 0.72 or to >= 0.82:
                 continue
-
-        # Strong protection against the common "title -> same fact rephrased" bug.
         if not kept and title_plain and len(plain) >= 45:
             tr,to=_semantic_similarity(plain,title_plain)
             if tr >= 0.52 and to >= 0.58:
                 continue
-
         duplicate=False
-        # Compare against the last few retained blocks only; this avoids deleting legitimate
-        # recurring topic words spread throughout a long report.
         for prev in kept[-4:]:
             pr,po=_semantic_similarity(prev,plain)
             if pr >= 0.82 or po >= 0.88 or (pr >= 0.70 and po >= 0.78):
@@ -1806,26 +1799,75 @@ def _remove_semantic_repeats(value: str, title: str = "") -> str:
 
 def _build_quote_excerpt(paragraph: str) -> str:
     plain=strip_html_text(paragraph or "").strip()
-    if len(plain) < 20:
+    if len(plain) < 45:
         return ""
     sentences=[x.strip() for x in re.split(r"(?<=[.!?؟؛])\s+", plain) if x.strip()]
-    # Synthetic quotes are intentionally conservative. Prefer a sentence that already looks
-    # self-contained; never convert an arbitrary technical paragraph into a giant quote box.
-    excerpt=next((x for x in sentences if 35 <= len(x) <= 180), "")
+    # Prefer a self-contained factual sentence. Never synthesize a claim.
+    excerpt=next((x for x in sentences if 45 <= len(x) <= 190), "")
+    if not excerpt and len(plain) <= 220:
+        excerpt=plain
     return excerpt
 
 
+def _inject_soft_quotes(paragraphs: List[str], max_quotes: int) -> List[str]:
+    """Add a small number of semantically useful quote cards when none exist.
+
+    Quotes are visual accents, not a quota: short material may receive one, while richer
+    articles receive a few distributed across the text. Existing explicit quotes are kept.
+    """
+    if not paragraphs or max_quotes <= 0:
+        return paragraphs
+    existing=[i for i,p in enumerate(paragraphs) if re.search(r"<blockquote\b", p or "", flags=re.I)]
+    if existing:
+        return paragraphs
+
+    candidates=[]
+    for i,p in enumerate(paragraphs):
+        plain=strip_html_text(p).strip()
+        excerpt=_build_quote_excerpt(p)
+        if excerpt:
+            # Avoid title-like / tiny heading blocks as quotes.
+            if _looks_like_heading(plain):
+                continue
+            candidates.append((i, excerpt))
+    if not candidates:
+        return paragraphs
+
+    # Visual density ceiling: never turn the whole article into cards.
+    density_cap=max(1, math.ceil(len(paragraphs)/5))
+    target=min(max_quotes, density_cap, len(candidates))
+    if len(candidates) >= 5 and target > 1:
+        # Pick evenly spaced candidates so quotes do not cluster together.
+        selected=[]
+        for n in range(target):
+            pos=round((n+0.5)*len(candidates)/target)-1
+            pos=max(0,min(len(candidates)-1,pos))
+            idx=candidates[pos][0]
+            if idx not in selected:
+                selected.append(idx)
+    else:
+        selected=[candidates[0][0]]
+
+    chosen=set(selected)
+    out=[]
+    for i,p in enumerate(paragraphs):
+        if i in chosen:
+            excerpt=dict(candidates).get(i,"" )
+            out.append(f"<blockquote>💡 {html.escape(excerpt,quote=False)}</blockquote>")
+        else:
+            out.append(p)
+    return out
+
+
 def _rebalance_quotes(paragraphs: List[str], max_quotes: int) -> List[str]:
-    """Keep quotes as accents, not as the entire article. Never force a quote into text."""
+    """Keep quotes as accents, preserving spacing and avoiding a quote wall."""
+    paragraphs=_inject_soft_quotes(paragraphs, max_quotes)
     quote_positions=[i for i,p in enumerate(paragraphs) if re.search(r"<blockquote\b", p or "", flags=re.I)]
     if not quote_positions:
         return paragraphs
-    # A rich article should not become a wall of quote cards. Roughly one quote per three
-    # body blocks is the visual ceiling, while the length-based max remains the hard ceiling.
-    visual_cap=max(1, min(max_quotes, math.ceil(max(1,len(paragraphs))/3)))
+    visual_cap=max(1, min(max_quotes, math.ceil(max(1,len(paragraphs))/4)))
     if len(quote_positions) <= visual_cap:
         return paragraphs
-    # Prefer quotes distributed across the article rather than the first N quote blocks.
     selected=[]
     for n in range(visual_cap):
         pos=round((n+0.5)*len(quote_positions)/visual_cap)-1
@@ -1858,7 +1900,18 @@ def _looks_like_heading(text: str) -> bool:
     return False
 
 
-def _apply_visual_richness(para: str, icon: str, is_first_body: bool=False) -> str:
+def _split_first_sentence(value: str) -> Tuple[str,str]:
+    text=value.strip()
+    m=re.match(r"^(.*?[.!?؟؛])(?:\s+)(.*)$", text, flags=re.S)
+    if not m:
+        return text,""
+    first,rest=m.group(1).strip(),m.group(2).strip()
+    if len(strip_html_text(first)) < 45:
+        return text,""
+    return first,rest
+
+
+def _apply_visual_richness(para: str, icon: str, body_index: int = 0) -> str:
     pplain=strip_html_text(para).strip()
     if not pplain:
         return ""
@@ -1866,18 +1919,49 @@ def _apply_visual_richness(para: str, icon: str, is_first_body: bool=False) -> s
     if has_rich:
         base=_protect_bidi_latin(para.strip())
     else:
-        base=_format_technical_tokens(_protect_bidi_latin(html.escape(pplain,quote=False)))
+        escaped=html.escape(pplain,quote=False)
+        base=_format_technical_tokens(_protect_bidi_latin(escaped))
 
     if _looks_like_heading(pplain):
-        return f"{icon} <b>{base}</b>" if not has_rich else f"{icon} {base}"
-    if is_first_body and not has_rich:
+        if has_rich:
+            return f"{icon} {base}"
         return f"{icon} <b>{base}</b>"
 
+    if has_rich:
+        return f"{icon} {base}"
+
+    # Visually emphasize a portion of alternating body paragraphs without turning the whole
+    # article bold. This keeps the current clean spacing while restoring hierarchy.
+    first,rest=_split_first_sentence(pplain)
+    if rest and body_index % 2 == 1:
+        first_html=_format_technical_tokens(_protect_bidi_latin(html.escape(first,quote=False)))
+        rest_html=_format_technical_tokens(_protect_bidi_latin(html.escape(rest,quote=False)))
+        return f"{icon} <b>{first_html}</b> {rest_html}"
+
+    # Short notes can use italic sparingly; only semantic note-like paragraphs are italicized.
     lower=pplain.lower()
     emphasis_words=("نکته", "هشدار", "توجه", "در عمل", "به‌طور خلاصه", "خلاصه")
-    if not has_rich and len(pplain) <= 190 and any(w in lower for w in emphasis_words):
+    starts_emphasis=any(lower.startswith(w + ":") or lower.startswith(w + " ") for w in emphasis_words)
+    if len(pplain) <= 190 and starts_emphasis:
         return f"{icon} <i>{base}</i>"
+
     return f"{icon} {base}"
+
+
+def _format_quote_block(para: str, icon: str) -> str:
+    """Preserve an existing quote and add one restrained contextual emoji if absent."""
+    clean=sanitize_telegram_html(para.strip())
+    plain=strip_html_text(clean)
+    if not plain:
+        return ""
+    m=re.match(r"<blockquote>(.*?)</blockquote>$",clean,flags=re.I|re.S)
+    if m:
+        inner=m.group(1).strip()
+        # Normalize any pre-existing emoji prefix to one contextual emoji. This prevents
+        # the quote cards from becoming emoji-heavy while guaranteeing a visual marker.
+        inner=re.sub(r"^(?:\s*[\U0001F300-\U0001FAFF\u2600-\u27BF]\s*)+", "", inner).strip()
+        return f"<blockquote>{icon} {inner}</blockquote>"
+    return f"<blockquote>{icon} {html.escape(plain,quote=False)}</blockquote>"
 
 
 def _visualize_plain_paragraphs(title: str, value: str, category: str, article: bool=False) -> str:
@@ -1888,11 +1972,11 @@ def _visualize_plain_paragraphs(title: str, value: str, category: str, article: 
         return ""
 
     emoji_map={
-        "ai":["🤖","🧠","🔬","⚡","🧩","🚀","💡"],
-        "cyber":["🛡️","🔐","🚨","⚠️","🔎","🧩","💻"],
-        "tech":["💻","⚙️","🚀","🔎","🧪","📱","💡"],
-        "edu":["📚","💡","🧭","📝","🎓","🔍","🛠️"],
-        "general":["🌐","✨","📌","🔭","🧭","💡","📰"]
+        "ai":["🤖","🧠","🔬","⚡","🧩","🚀","💡","🎯"],
+        "cyber":["🛡️","🔐","🚨","⚠️","🔎","🧩","💻","🎯"],
+        "tech":["💻","⚙️","🚀","🔎","🧪","📱","💡","🔧"],
+        "edu":["📚","💡","🧭","📝","🎓","🔍","🛠️","🎯"],
+        "general":["🌐","✨","📌","🔭","🧭","💡","📰","🎯"]
     }
     icons=emoji_map.get(category,emoji_map["tech"])
     paragraphs=_split_readable_paragraphs(clean, max_chars=430 if not article else 560) or [clean]
@@ -1900,7 +1984,7 @@ def _visualize_plain_paragraphs(title: str, value: str, category: str, article: 
 
     out=[f"<b>{icons[0]} {html.escape(strip_html_text(title)[:220])}</b>"]
     icon_offset=0
-    first_body=True
+    body_index=0
     for para in paragraphs[:18]:
         pplain=strip_html_text(para).strip()
         if not pplain:
@@ -1909,28 +1993,26 @@ def _visualize_plain_paragraphs(title: str, value: str, category: str, article: 
         if title_similarity>0.84 and len(pplain)<=max(60,len(strip_html_text(title))*1.7):
             continue
 
-        if re.search(r"<blockquote\b", para or "", flags=re.I):
-            # Preserve explicit quotes, but do not add extra emoji inside quote cards.
-            out.append(_protect_bidi_latin(para.strip()))
-            first_body=False
-            continue
-
         icon=icons[icon_offset % len(icons)]
         icon_offset += 1
-        formatted=_apply_visual_richness(para,icon,is_first_body=first_body)
+        if re.search(r"<blockquote\b", para or "", flags=re.I):
+            formatted=_format_quote_block(para,icon)
+        else:
+            formatted=_apply_visual_richness(para,icon,body_index=body_index)
+            body_index += 1
         if formatted:
             out.append(formatted)
-            first_body=False
 
     return dedupe_adjacent_emojis("\n\n".join(out))
+
 
 def ensure_rich_channel_format(title: str, value: str, category: str = "tech") -> str:
     return _visualize_plain_paragraphs(title, clean_channel_copy(value or ""), category, article=False)
 
+
 def ensure_rich_article_format(title: str, value: str, source_url: str, category: str = "tech") -> str:
     clean=_normalize_text_blocks(value or "")
     if not strip_html_text(sanitize_telegram_html(clean)):
-        # Do not return placeholder; return empty so the pipeline can reject.
         return ""
     return _visualize_plain_paragraphs(title, clean, category or "tech", article=True)
 
