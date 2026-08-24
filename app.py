@@ -3373,13 +3373,10 @@ def quality_menu_kb() -> InlineKeyboardMarkup:
 
 
 def schedule_menu_kb() -> InlineKeyboardMarkup:
-    # The canonical schedule screen stays focused on settings the manager actually uses.
-    # Worker/verification internals remain configurable elsewhere and are not mixed into this page.
+    # Publish/scheduling controls only; the main automation on/off toggle stays in the parent menu.
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔢 سقف تقریبی پست روزانه", callback_data="set_max_daily")],
-        [InlineKeyboardButton(text="⏱ حداقل فاصله پست‌ها", callback_data="set_min_gap")],
-        [InlineKeyboardButton(text="🌐 فاصله بررسی منابع", callback_data="set_default_interval")],
-        [InlineKeyboardButton(text="🚀 همین حالا منتشر کن", callback_data="publish_now")],
+        [InlineKeyboardButton(text="🔢 سقف تقریبی پست روزانه", callback_data="set_max_daily"), InlineKeyboardButton(text="⏱ حداقل فاصله پست‌ها", callback_data="set_min_gap")],
+        [InlineKeyboardButton(text="🌐 فاصله بررسی منابع", callback_data="set_default_interval"), InlineKeyboardButton(text="📢 تنظیم/تغییر کانال", callback_data="auto_channel_set")],
         [InlineKeyboardButton(text="🔙 اتوماسیون محتوا", callback_data="auto_back")]
     ])
 
@@ -4584,10 +4581,8 @@ async def render_channel_panel(call: CallbackQuery, db: D1Database):
           f"🕐 نوبت بعدی: <b>{nxt}</b>\n\n"
           "مدیر فقط فاصله‌ها را تعیین می‌کند؛ نوبت هر محتوا خودکار محاسبه می‌شود.")
     kb=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='📢 تنظیم/تغییر کانال',callback_data='auto_channel_set')],
-        [InlineKeyboardButton(text='🔢 سقف پست روزانه',callback_data='set_max_daily'),InlineKeyboardButton(text='⏱ فاصله انتشار',callback_data='set_min_gap')],
-        [InlineKeyboardButton(text='🌐 فاصله بررسی منابع',callback_data='set_default_interval')],
-        [InlineKeyboardButton(text='🚀 همین حالا منتشر کن',callback_data='publish_now'),InlineKeyboardButton(text='🧪 تست کانال',callback_data='channel_test')],
+        [InlineKeyboardButton(text='📢 تنظیم/تغییر کانال',callback_data='auto_channel_set'),InlineKeyboardButton(text='🔢 سقف پست روزانه',callback_data='set_max_daily')],
+        [InlineKeyboardButton(text='⏱ فاصله انتشار',callback_data='set_min_gap'),InlineKeyboardButton(text='🌐 فاصله بررسی منابع',callback_data='set_default_interval')],
         [InlineKeyboardButton(text='🔙 اتوماسیون محتوا',callback_data='auto_back')]
     ])
     await call.message.edit_text(text,parse_mode='HTML',reply_markup=kb)
@@ -4611,45 +4606,12 @@ async def auto_channel_set(call: CallbackQuery, state: FSMContext, db: D1Databas
         'ربات باید در کانال ادمین باشد و اجازه انتشار پیام داشته باشد.',
         parse_mode='HTML', reply_markup=get_exit_menu())
 
-@router.callback_query(F.data == "publish_now")
-async def publish_now(call: CallbackQuery, db:D1Database, bot:Bot):
-    if call.from_user.id!=ADMIN_ID: return
-    await call.answer("🚀 در حال انتشار…")
-    try:
-        ok=await publish_next_article(db,bot,force=True)
-        msg="✅ اولین محتوای آماده همین حالا منتشر شد." if ok else "⏸ محتوای آماده‌ای برای انتشار نیست یا سقف روزانه پر شده است."
-    except Exception as e:
-        msg="❌ انتشار دستی شکست خورد:\n"+html.escape(str(e)[:1200])
-    await call.message.edit_text(msg,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 انتشار و زمان‌بندی",callback_data="auto_channel")]]))
-
 @router.callback_query(F.data == "publish_schedule")
 async def publish_schedule(call:CallbackQuery,state:FSMContext):
     if call.from_user.id!=ADMIN_ID:return
     await state.set_state(BotStates.admin_automation_setting)
     await state.update_data(automation_setting_key="__publish_delay__",panel_message_id=call.message.message_id,parent_callback="auto_channel")
     await call.message.edit_text("⏱ <b>زمان‌بندی انتشار</b>\n\nچند دقیقه دیگر منتشر شود؟\n\n0 = همین حالا\n2 = دو دقیقه دیگر\n10 = ده دقیقه دیگر\nمثلاً 30",parse_mode="HTML",reply_markup=get_exit_menu()); await call.answer()
-
-@router.callback_query(F.data == "channel_test")
-async def channel_test(call: CallbackQuery, db: D1Database, bot: Bot):
-    if call.from_user.id != ADMIN_ID: return
-    channel_id = await get_channel_id(db)
-    if not channel_id:
-        await call.answer('کانال هنوز تنظیم نشده است.', show_alert=True); return
-    try:
-        chat = await bot.get_chat(channel_id)
-        me = await bot.get_me()
-        member = await bot.get_chat_member(chat.id, me.id)
-        status = str(getattr(member, 'status', ''))
-        if status not in {'administrator', 'creator'}:
-            raise RuntimeError('ربات در کانال ادمین نیست.')
-        perms = getattr(member, 'can_post_messages', None)
-        if perms is False:
-            raise RuntimeError('اجازه انتشار پیام برای ربات فعال نیست.')
-        label = '@' + chat.username if getattr(chat, 'username', None) else 'کانال خصوصی'
-        await call.message.edit_text(f'✅ <b>کانال سالم است</b>\n\n📢 {html.escape(label)}\n👤 وضعیت ربات: {html.escape(status)}\n📝 اجازه انتشار: ✅', parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔙 کانال و انتشار', callback_data='auto_channel')]]))
-    except Exception as e:
-        await call.message.edit_text(f'❌ <b>تست کانال ناموفق بود</b>\n\n{html.escape(str(e)[:1000])}', parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔙 کانال و انتشار', callback_data='auto_channel')]]))
-    await call.answer()
 
 @router.message(F.chat.id == ADMIN_ID, StateFilter(BotStates.admin_channel_input))
 async def admin_channel_input(message: Message, state: FSMContext, db: D1Database, bot: Bot):
@@ -4674,7 +4636,7 @@ async def admin_channel_input(message: Message, state: FSMContext, db: D1Databas
         text=f"✅ <b>کانال با موفقیت تنظیم شد.</b>\n\n📢 {html.escape(label)}\n🆔 <code>{chat.id}</code>"
         if panel_id:
             try:
-                await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text=text,parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🧪 تست کانال',callback_data='channel_test')],[InlineKeyboardButton(text='🔙 کانال و انتشار',callback_data='auto_channel')]]))
+                await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text=text,parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[],[InlineKeyboardButton(text='🔙 کانال و انتشار',callback_data='auto_channel')]]))
             except Exception:
                 await message.answer(text,parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔙 کانال و انتشار',callback_data='auto_channel')]]))
         else:
@@ -5803,16 +5765,6 @@ async def next_publication_estimate(db:D1Database)->Dict[str,Any]:
     queued=await db.execute("SELECT COUNT(*) c FROM publication_queue WHERE status='queued'")
     return {"target":target,"minutes":max(0,int((target-now).total_seconds()/60)) if target>now else 0,"latest":latest,"interval_minutes":int(interval_minutes),"queued":int(queued[0].get('c',0)) if queued else 0}
 
-@router.callback_query(F.data == "auto_publish_now")
-async def auto_publish_now(call:CallbackQuery,db:D1Database,bot:Bot):
-    if call.from_user.id!=ADMIN_ID: return
-    try:
-        ok=await publish_next_article(db,bot,force=True)
-        msg="✅ اولین محتوای صف همین حالا منتشر شد." if ok else "⚠️ محتوای آماده‌ای برای انتشار فوری پیدا نشد یا سقف روزانه تکمیل شده است."
-    except Exception as e:
-        msg="❌ انتشار فوری شکست خورد:\n"+html.escape(str(e)[:1200])
-    await call.message.edit_text(msg,parse_mode="HTML",reply_markup=get_admin_back_kb("auto_queue")); await call.answer()
-
 @router.callback_query(F.data == "auto_queue")
 async def auto_queue(call: CallbackQuery, db: D1Database):
     await call.answer()
@@ -5832,7 +5784,7 @@ async def auto_queue(call: CallbackQuery, db: D1Database):
     for r in rows:
         text+=f"#{r['article_id']} · ⭐ {float(r['score'] or 0):.0f} · {str(r['title'])[:70]}\n"
         kb_rows.append([InlineKeyboardButton(text=f"📄 #{r['article_id']} · {str(r['title'])[:22]}",callback_data=f'auto_art_{r["article_id"]}')])
-    kb_rows += [[InlineKeyboardButton(text='🚀 همین حالا منتشر کن',callback_data='auto_publish_now'),InlineKeyboardButton(text='🔄 بروزرسانی',callback_data='auto_queue')],
+    kb_rows += [[InlineKeyboardButton(text='🔄 بروزرسانی',callback_data='auto_queue')],
                 [InlineKeyboardButton(text='📰 محتوای تولیدشده',callback_data='auto_articles')],
                 [InlineKeyboardButton(text='🔙 محتوا و داده‌ها',callback_data='auto_content_db')]]
     await call.message.edit_text(text,parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows)); await call.answer()
