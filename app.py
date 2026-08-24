@@ -1,4 +1,4 @@
-# VERSION 10.24.0 — fix insufficient content detection + remove placeholder fallback from publication
+# VERSION 10.26.0 — full-article extraction + prompt persistence + language/repetition/image fixes
 import os
 import io
 import re
@@ -49,7 +49,7 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "10.25.0-full-article-direct-fetch-d1-optimized"
+BUILD_VERSION = "10.26.0-full-article-prompt-image-git-distinct"
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_AI_WORKERS = 3
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -338,11 +338,22 @@ async def initialize_automation_database(db: D1Database):
         "weight_freshness": "10",
         "weight_source": "5",
         "weight_novelty": "10",
-        "editorial_prompt_channel": "فقط محتوای فنی و واقعاً ارزشمند برای مخاطب فناوری و هوش مصنوعی را پوشش بده؛ خبرهای سطحی، عمومی، تبلیغاتی، تکراری و پیش‌پاافتاده را کنار بگذار. نکات فنی مهم، قابلیت جدید، تغییر مهم، عدد و جزئیات قابل اتکا را در نسخه کوتاه بیاور.",
-        "editorial_prompt_article": "نسخه کامل باید یک محتوای فنی و غنی باشد؛ جزئیات واقعی رویداد، نحوه کار یا فناوری، نکات فنی مهم، زمینه لازم و اثرات قابل فهم را پوشش بده. از حرف‌های کلی، کلیشه‌ای، نتیجه‌گیری شخصی و سؤال‌سازی به جای پاسخ خودداری کن. فقط بر پایه اطلاعات منبع بنویس.",
     }
     for k, v in defaults.items():
         await db.execute("INSERT OR IGNORE INTO automation_settings(key, value) VALUES(?, ?)", [k, v])
+    # Safe one-time migration: replace only the previous built-in editorial defaults.
+    # A manager-customized prompt is never overwritten.
+    legacy_prompts={
+        "editorial_prompt_channel": "فقط محتوای فنی، دقیق و واقعاً ارزشمند برای مخاطب فناوری و هوش مصنوعی را پوشش بده؛ مطالب سطحی، عمومی، کلیشه‌ای و پیش‌پاافتاده را کنار بگذار. خودِ خبر و جزئیات واقعی را بیان کن به‌طوری مفهومی که تمام چکیده مطلب در حدود 400 تا 600 کاراکتر بیان شود، بدون قضاوت شخصی و سوگیری. تمام محتوا فارسی باشد و در صورت نیاز از اطلاعات انگلیسی فقط در حداقل ممکن استفاده شود. از شروع جمله با کلمات انگلیسی خودداری کن. متن دوستانه، صمیمی، شیوا و طبیعی باشد.",
+        "editorial_prompt_article": "مقاله کامل باید فنی، غنی و مبتنی بر اطلاعات واقعی منبع باشد؛ جزئیات، زمینه، نحوه کار، اعداد و اثرات قابل اتکا را توضیح بده. سؤال نساز؛ پاسخ و اطلاعات موجود را مستقیم بیان کن. اگر موضوع مالی پیش آمد مبالغ، تعداد و ارقام دقیق را بیان کن. از کلی‌گویی، قضاوت و تحلیل شخصی خودداری کن. اگر از قول شخصی مطلب مهمی بیان می‌شود، ابتدا خیلی کوتاه آن شخص را معرفی کن و سپس ادامه مطلب را بیاور. تمام محتوا فارسی باشد و در صورت نیاز از اطلاعات انگلیسی فقط در حداقل ممکن استفاده شود. متن دوستانه، صمیمی، شیوا و طبیعی باشد.",
+    }
+    for pk, legacy in legacy_prompts.items():
+        try:
+            rows=await db.execute("SELECT value FROM automation_settings WHERE key=?",[pk])
+            if rows and str(rows[0].get("value") or "").strip()==legacy.strip():
+                await set_setting(db,pk,defaults[pk])
+        except Exception:
+            pass
     # مهاجرت تنظیم فاصله انتشار: اگر نصب قبلی مقدار ساعتی داشته، همان مقدار به دقیقه منتقل شود.
     try:
         gap_rows = await db.execute("SELECT value FROM automation_settings WHERE key='min_post_gap_minutes'")
@@ -764,12 +775,67 @@ def parse_feed(text: str, base_url: str) -> List[Dict[str, Any]]:
     return items
 
 
+def _extract_structured_image_url(html_text: str, base_url: str) -> str:
+    """Find the article's most likely hero image without relying on one metadata convention."""
+    # Highest-confidence metadata first.
+    meta_patterns = [
+        r'<meta\b[^>]+(?:property|name)=["\'](?:og:image:secure_url|og:image|twitter:image:src|twitter:image)["\'][^>]+content=["\']([^"\']+)',
+        r'<meta\b[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:image:secure_url|og:image|twitter:image:src|twitter:image)["\']',
+    ]
+    for pat in meta_patterns:
+        m=re.search(pat,html_text or '',flags=re.I)
+        if m:
+            u=urllib.parse.urljoin(base_url,html.unescape(m.group(1).strip()))
+            if u.startswith(('http://','https://')):
+                return normalize_url(u)
+
+    # JSON-LD is common on modern news sites. Search only image-like fields.
+    for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',html_text or '',flags=re.I|re.S):
+        raw=m.group(1).strip()
+        try:
+            data=json.loads(raw)
+        except Exception:
+            continue
+        stack=list(data) if isinstance(data,list) else [data]
+        while stack:
+            node=stack.pop()
+            if not isinstance(node,dict):
+                continue
+            typ=str(node.get('@type') or node.get('type') or '').lower()
+            if 'article' in typ or 'news' in typ or 'imageobject' in typ:
+                img=node.get('image')
+                candidates=[]
+                if isinstance(img,str): candidates=[img]
+                elif isinstance(img,dict): candidates=[img.get('url') or img.get('contentUrl') or '']
+                elif isinstance(img,list):
+                    for x in img:
+                        if isinstance(x,str): candidates.append(x)
+                        elif isinstance(x,dict): candidates.append(x.get('url') or x.get('contentUrl') or '')
+                for cand in candidates:
+                    if cand:
+                        u=urllib.parse.urljoin(base_url,html.unescape(str(cand).strip()))
+                        if u.startswith(('http://','https://')):
+                            return normalize_url(u)
+            for v in node.values():
+                if isinstance(v,dict): stack.append(v)
+                elif isinstance(v,list): stack.extend(x for x in v if isinstance(x,dict))
+
+    # <link rel=image_src> is an old but useful fallback.
+    m=re.search(r'<link\b[^>]+rel=["\'][^"\']*image_src[^"\']*["\'][^>]+href=["\']([^"\']+)',html_text or '',flags=re.I)
+    if m:
+        u=urllib.parse.urljoin(base_url,html.unescape(m.group(1).strip()))
+        if u.startswith(('http://','https://')):
+            return normalize_url(u)
+
+    return ""
+
+
 def extract_html_page(html_text: str, url: str) -> Dict[str, Any]:
     p = SimpleHTMLParser()
     p.feed(html_text)
     canonical = p.meta.get("og:url") or p.meta.get("twitter:url") or url
     title = p.meta.get("og:title") or p.meta.get("twitter:title") or p.title
-    image = p.meta.get("og:image") or p.meta.get("twitter:image") or ""
+    image = _extract_structured_image_url(html_text,url) or p.meta.get("og:image") or p.meta.get("twitter:image") or ""
     desc = p.meta.get("og:description") or p.meta.get("description") or p.meta.get("twitter:description") or ""
     body = p.body
     links = []
@@ -1845,6 +1911,9 @@ def append_resource_links(article_html: str, resource_links, source_url: str = "
 
 async def resolve_article_image(db: D1Database, article: dict) -> str:
     # Image URLs are transient transport data. Never persist them in D1.
+    existing=normalize_url(str(article.get("image_url") or ""))
+    if existing:
+        return existing
     source_url=normalize_url(article.get("source_url") or "")
     if not source_url:
         return ""
@@ -1852,7 +1921,20 @@ async def resolve_article_image(db: D1Database, article: dict) -> str:
         session=await get_http_session()
         raw,_=await http_get(source_url,session)
         parsed=extract_html_page(raw,source_url)
-        return normalize_url(parsed.get("image_url") or "")
+        image=normalize_url(parsed.get("image_url") or "")
+        if image:
+            return image
+        # Last safe fallback: an image explicitly marked as article/featured/hero in HTML.
+        for m in re.finditer(r'<img\b[^>]+>',raw or '',flags=re.I):
+            tag=m.group(0)
+            if not re.search(r'(featured|hero|article|post|cover|thumbnail)',tag,re.I):
+                continue
+            u=re.search(r'(?:src|data-src|data-lazy-src)=["\']([^"\']+)',tag,flags=re.I)
+            if u:
+                candidate=urllib.parse.urljoin(source_url,html.unescape(u.group(1).strip()))
+                if candidate.startswith(('http://','https://')) and not re.search(r'(logo|avatar|icon|sprite|favicon)',candidate,re.I):
+                    return normalize_url(candidate)
+        return ""
     except Exception as exc:
         try:
             await log_automation(db,"WARN","article_image_resolution_failed",f"article={article.get('id')} {str(exc)[:220]}")
@@ -2041,9 +2123,61 @@ def _has_long_english_blocks(text: str) -> bool:
             return True
     return False
 
+def _starts_with_english_sentence(text: str) -> bool:
+    clean=strip_html_text(text or "")
+    for sent in re.split(r"(?<=[.!؟!?])\s+", clean):
+        sent=sent.strip()
+        if len(sent)<25:
+            continue
+        if re.match(r"^[A-Za-z]{2,}\b",sent) and not re.match(r"^(GPT|AI|API|WPF|PDF|OpenAI|Microsoft|Google|Apple|Meta|Anthropic|Gemini|Claude|Ox|GLM)\b",sent,re.I):
+            return True
+    return False
+
 def _needs_persian_rewrite(title: str, channel: str, article: str) -> bool:
-    sample=" ".join([title or "", channel or "", article or ""])[:5000]
-    return _latin_ratio(sample) > 0.42 and _persian_ratio(sample) < 0.45
+    sample=" ".join([title or "", channel or "", article or ""])[:7000]
+    if _starts_with_english_sentence(channel) or _starts_with_english_sentence(article):
+        return True
+    for text in (channel,article):
+        clean=strip_html_text(text or "")
+        for block in re.split(r"\n\s*\n+",clean):
+            b=block.strip()
+            if len(b)<35:
+                continue
+            latin=len(re.findall(r"[A-Za-z]",b))
+            pers=len(re.findall(r"[\u0600-\u06FF]",b))
+            if latin>=25 and latin>max(18,pers*1.15):
+                return True
+    return _latin_ratio(sample) > 0.24 and _persian_ratio(sample) < 0.58
+
+def _dedupe_leading_semantics(value: str, title: str) -> str:
+    """Remove leading AI-generated restatements while preserving the existing renderer/formatting."""
+    text=_normalize_text_blocks(value or "")
+    blocks=[x.strip() for x in re.split(r"\n\s*\n+",text) if strip_html_text(x).strip()]
+    if len(blocks)<2:
+        return text
+    title_plain=strip_html_text(title or "").lower()
+    kept=[]
+    first_plain=strip_html_text(blocks[0]).lower()
+    # Do not keep a standalone title/header generated by the model; renderer already adds the official title.
+    if title_plain and SequenceMatcher(None,first_plain,title_plain).ratio()>=0.72:
+        blocks=blocks[1:]
+    if not blocks:
+        return text
+    kept.append(blocks[0])
+    for block in blocks[1:4]:
+        a=strip_html_text(kept[0]).lower()
+        b=strip_html_text(block).lower()
+        if len(a)>=45 and len(b)>=45:
+            ratio=SequenceMatcher(None,a,b).ratio()
+            aw=set(re.findall(r"[\u0600-\u06FFA-Za-z]{4,}",a))
+            bw=set(re.findall(r"[\u0600-\u06FFA-Za-z]{4,}",b))
+            overlap=len(aw & bw)/max(1,min(len(aw),len(bw)))
+            if ratio>=0.62 or overlap>=0.72:
+                continue
+        kept.append(block)
+    if len(blocks)>4:
+        kept.extend(blocks[4:])
+    return "\n\n".join(kept)
 
 async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:Dict[str,Any],recent_titles:List[str],weights:Dict[str,float],manager_prompts:Optional[Dict[str,str]]=None):
     body=(item.get("body") or item.get("description") or "")[:MAX_SOURCE_CONTENT_CHARS]
@@ -2078,7 +2212,13 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
 دستور محتوایی مدیر برای نسخه کامل داخل ربات (حدود 2000 کاراکتر):
 {article_scope}
 
-این دو دستور فقط مشخص می‌کنند چه اطلاعات و چه نوع محتوایی پوشش داده شود؛ به هیچ وجه قوانین Formatting را تغییر نده. قالب‌بندی وظیفه موتور تولید و ربات است.
+اولویت دستور مدیر: دستورهای بالا، سیاست محتوایی مدیر هستند و باید در تولید نهایی رعایت شوند. دستورهای کلی این prompt فقط در صورت نبودِ دستور مدیر یا برای جلوگیری از ساختن اطلاعات، آن را تکمیل می‌کنند و نباید با آن تعارض داشته باشند.
+
+قانون ضدتکرار: عنوان و پاراگراف آغازین نباید یک مفهوم را چند بار با عبارت‌های مختلف تکرار کنند. هر نکته فقط یک‌بار و در مناسب‌ترین جای متن بیان شود. در نسخه کانال، چند جمله اول باید یک چکیده مفهومی واحد بسازند و سپس فقط جزئیات جدید اضافه کنند. از قرار دادن چند تیتر متوالی یا تیترهای هم‌معنی خودداری کن؛ متن باید با یک عنوان اصلی شروع شود و بلافاصله وارد محتوای واقعی خبر شود.
+
+قانون زبان: متن نهایی باید فارسی باشد. نام مدل، شرکت، محصول و اصطلاح فنی را فقط در حد لازم نگه دار. هیچ جمله یا پاراگراف انگلیسی تولید نکن و هیچ جمله‌ای را با یک کلمه انگلیسی آغاز نکن، مگر اینکه خودِ نام رسمی یک مدل/محصول/شرکت باشد و جایگزین فارسی طبیعی نداشته باشد.
+
+این دو دستور فقط سیاست محتوایی را تعیین می‌کنند؛ قوانین Formatting، ایموجی، Bold، Italic، Quote و زیباسازی همان renderer فعلی ربات هستند و نباید تغییر کنند.
 
 اول برای امتیازدهی داخلی، امتیاز 0 تا 100 بده. فیلد accept فقط توضیح داخلی است و دروازه مستقل انتشار نیست؛ تصمیم نهایی را معیارهای عددی مدیر می‌گیرند. صرفاً به‌دلیل کوتاه بودن متن accept=false نده.
 تازگی توسط برنامه به‌صورت فنی و مستقل کنترل می‌شود؛ از ساختن تاریخ یا حدس‌زدن آن خودداری کن. مطالب خارج از پنجره ۶ ساعت برنامه اصلاً به این مرحله نمی‌رسند. مقدار accept فقط برای توصیف داخلی پاسخ است و تصمیم انتشار نهایی را برنامه بر اساس امتیاز و تنظیمات مدیر می‌گیرد.
@@ -2137,6 +2277,9 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
             obj["title"]=raw_title; obj["channel_html"]=raw_ch; obj["article_html"]=raw_ar
             result=repaired
     title=raw_title
+    # فقط محتوای تکراری ابتدای خروجی حذف می‌شود؛ renderer و formatting فعلی بدون تغییر باقی می‌مانند.
+    raw_ch=_dedupe_leading_semantics(raw_ch,title)
+    raw_ar=_dedupe_leading_semantics(raw_ar,title)
     category=str(obj.get("category") or source.get("category") or "tech")
     # واحدِ قالب‌بندی قطعی: هر خروجی، حتی اگر AI متن خام داده باشد، یک‌بار از همین renderer عبور می‌کند.
     ch=ensure_rich_channel_format(title, raw_ch, category)
@@ -2310,7 +2453,7 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                         if item_id: await db.execute("UPDATE source_items SET status='error',last_error=?,retry_after=? WHERE id=?",['generation produced no usable text',(now+timedelta(minutes=15)).isoformat(),item_id])
                         return {'processed':1,'errors':1,'reason':'generation empty'}
                     art=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at,source_published_at) VALUES(?,?,?,?,?,?,?,?,'ready',?,?) RETURNING id",
-                        [item_id,title_out,channel_text,article_text[:18000],url,'',out.get('category') or source.get('category','tech'),score,now.isoformat(),item.get('published_at','')[:100]])
+                        [item_id,title_out,channel_text,article_text[:18000],url,str(item.get('image_url') or '')[:1000],out.get('category') or source.get('category','tech'),score,now.isoformat(),item.get('published_at','')[:100]])
                     aid=art[0].get('id') if art else 0
                     token=make_deep_token(int(aid)); await db.execute('UPDATE articles SET deep_token=? WHERE id=?',[token,aid])
                     if item_id: await db.execute("UPDATE source_items SET status='ready',article_id=?,score=?,retry_after=NULL WHERE id=?",[aid,score,item_id])
