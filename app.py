@@ -936,6 +936,101 @@ def select_latest_fresh_items(items: List[Dict[str, Any]], now: Optional[datetim
     return fresh[:max_items], diagnostics[-10:], newest_dt, newest_url
 
 # ============================================================
+# HARD promotional / advertising filter
+# Explicit sponsored/advertorial pages are rejected immediately.
+# Generic words such as "offer" or "price" are NOT enough by themselves;
+# commercial context is required so legitimate technology news is preserved.
+# ============================================================
+
+def _normalize_ad_text(value: str) -> str:
+    text = strip_html_text(value or "").lower()
+    text = text.replace("ي", "ی").replace("ك", "ک")
+    text = text.replace("\\u200c", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+AD_DISCLOSURE_HARD = [
+    "رپورتاژ", "رپورتاژ آگهی", "محتوای تبلیغاتی", "محتوای اسپانسری",
+    "اسپانسر شده", "اسپانسری", "همکاری تبلیغاتی", "همکاری تجاری",
+    "حمایت مالی", "آگهی تبلیغاتی",
+    "advertorial", "sponsored content", "sponsored by", "paid partnership",
+    "paid content", "affiliate link", "affiliate disclosure", "promotional content",
+]
+
+AD_URL_MARKERS_HARD = [
+    "/sponsored", "/advertorial", "/advertisement", "/advertising/",
+    "/promo/", "/promotions/", "/affiliate/", "/paid-partnership",
+]
+
+PROMO_TERMS_STRONG = [
+    "تخفیف", "تخفیف ویژه", "آفر ویژه", "آفر", "پیشنهاد ویژه", "فروش ویژه",
+    "کد تخفیف", "کوپن تخفیف", "کوپن", "حراج", "قیمت ویژه",
+    "فروش فوق العاده", "فروش فوق‌العاده", "پیشنهاد محدود",
+    "discount code", "promo code", "coupon code", "limited time offer",
+    "special offer", "exclusive offer", "flash sale", "clearance sale",
+    "buy now", "shop now", "order now", "use code", "% off", "percent off",
+]
+
+COMMERCIAL_CONTEXT = [
+    "قیمت", "خرید", "بخرید", "سفارش", "ثبت سفارش", "سبد خرید", "فروشگاه",
+    "پرداخت", "تومان", "ریال", "دلار", "یورو", "هزینه", "قسط", "موجودی",
+    "ارسال", "رایگان", "price", "purchase", "buy", "order", "checkout", "cart",
+    "store", "shop", "payment", "shipping", "delivery", "usd", "eur",
+]
+
+
+def is_promotional_content(title: str, body: str, description: str, url: str = "") -> Tuple[bool, str]:
+    """Hard-filter obvious advertising while preserving legitimate product news."""
+    title_n = _normalize_ad_text(title)
+    desc_n = _normalize_ad_text(description)
+    body_n = _normalize_ad_text(body)
+    combined = " ".join(x for x in (title_n, desc_n, body_n) if x)
+    url_n = (url or "").lower()
+
+    for marker in AD_DISCLOSURE_HARD:
+        if marker in combined:
+            return True, f"صفحه تبلیغاتی/اسپانسری تشخیص داده شد: {marker}"
+
+    for marker in AD_URL_MARKERS_HARD:
+        if marker in url_n:
+            return True, f"مسیر URL تبلیغاتی است: {marker}"
+
+    promo_hits = [term for term in PROMO_TERMS_STRONG if term in combined]
+    if not promo_hits and re.search(r"\b\d{1,3}\s*%\s*(?:off|discount)\b", combined, re.I):
+        promo_hits.append("percent-off")
+
+    if not promo_hits:
+        return False, ""
+
+    commercial_hits = [term for term in COMMERCIAL_CONTEXT if term in combined]
+    title_has_promo = any(term in title_n for term in PROMO_TERMS_STRONG) or bool(
+        re.search(r"\b\d{1,3}\s*%\s*(?:off|discount)\b", title_n, re.I)
+    )
+
+    # A promotional title plus purchase/price language is an obvious ad/promo page.
+    if title_has_promo and commercial_hits:
+        return True, f"عبارت تبلیغاتی همراه با نشانه تجاری: {promo_hits[0]}"
+
+    # Multiple promo terms with commercial intent are also hard-rejected.
+    if len(set(promo_hits)) >= 2 and commercial_hits:
+        return True, f"چند نشانه تبلیغاتی/فروش همزمان: {', '.join(promo_hits[:3])}"
+
+    # Explicit purchase CTA / coupon / sale language is hard-rejected even if it
+    # appears only once; these are unlikely to be ordinary technology reporting.
+    explicit_cta = {
+        "discount code", "promo code", "coupon code", "buy now", "shop now",
+        "order now", "use code", "% off", "percent off", "flash sale", "clearance sale",
+    }
+    if any(term in explicit_cta for term in promo_hits):
+        return True, f"عبارت تبلیغاتی صریح: {promo_hits[0]}"
+
+    # Bare "offer" or a simple mention of a discount without commercial context
+    # is intentionally NOT rejected; this preserves legitimate product/news reporting.
+    return False, ""
+
+
+# ============================================================
 # NEW: Insufficient content / paywall detection (replaces length gate)
 # ============================================================
 PAYWALL_KEYWORDS = [
@@ -1557,7 +1652,7 @@ class AIProviderManager:
 async def ai_analyze_candidate(ai: AIProviderManager, item: Dict[str, Any], source: Dict[str, Any], recent_titles: List[str]) -> Dict[str, Any]:
     body = (item.get("body") or item.get("description") or "")[:MAX_SOURCE_CONTENT_CHARS]
     sim = recent_semantic_similarity(item.get("title", ""), recent_titles)
-    prompt = f"""تو سردبیر ارشد یک کانال فارسی درباره تکنولوژی، هوش مصنوعی، ابزارها، مدل‌های AI، امنیت سایبری و اخبار مهم فناوری هستی.\n\nمنبع: {source.get('name')}\nدسته منبع: {source.get('category')}\nعنوان: {item.get('title')}\nتاریخ انتشار احتمالی: {item.get('published_at')}\nخلاصه/متن: {body}\nشباهت متنی اولیه با عناوین اخیر: {sim:.2f}\n\nبررسی کن آیا این محتوا ارزش انتشار برای فارسی‌زبانان، مخصوصاً ایران، دارد. clickbait، تبلیغ کم‌ارزش، شایعه، محتوای تکراری و خبرهای فاقد ارزش را رد کن. اگر اطلاعات برای تصمیم‌گیری کافی نیست، رد کن.\n\nفقط JSON معتبر برگردان با این فیلدها:\n{{\n  "accept": true/false,\n  "score": 0-100,\n  "category": "ai|tech|cyber|edu|general",\n  "importance_reason": "...",\n  "iran_relevance": 0-10,\n  "freshness": 0-10,\n  "reliability": 0-10,\n  "duplicate_risk": 0-10,\n  "event_date": "...",\n  "why": "..."\n}}"""
+    prompt = f"""تو سردبیر ارشد یک کانال فارسی درباره تکنولوژی، هوش مصنوعی، ابزارها، مدل‌های AI، امنیت سایبری و اخبار مهم فناوری هستی.\n\nمنبع: {source.get('name')}\nدسته منبع: {source.get('category')}\nعنوان: {item.get('title')}\nتاریخ انتشار احتمالی: {item.get('published_at')}\nخلاصه/متن: {body}\nشباهت متنی اولیه با عناوین اخیر: {sim:.2f}\n\nبررسی کن آیا این محتوا ارزش انتشار برای فارسی‌زبانان، مخصوصاً ایران، دارد. clickbait، تبلیغ کم‌ارزش، رپورتاژ، sponsored/advertorial، تخفیف و آفرهای فروش، شایعه، محتوای تکراری و خبرهای فاقد ارزش را رد کن؛ اما خبر واقعی درباره عرضه، تغییر، امنیت یا عملکرد محصول را فقط به‌دلیل ذکر قیمت یا عبارت offer رد نکن. اگر اطلاعات برای تصمیم‌گیری کافی نیست، رد کن.\n\nفقط JSON معتبر برگردان با این فیلدها:\n{{\n  "accept": true/false,\n  "score": 0-100,\n  "category": "ai|tech|cyber|edu|general",\n  "importance_reason": "...",\n  "iran_relevance": 0-10,\n  "freshness": 0-10,\n  "reliability": 0-10,\n  "duplicate_risk": 0-10,\n  "event_date": "...",\n  "why": "..."\n}}"""
     result = await ai.call([{"role": "system", "content": "You are a strict editorial gate. Output JSON only."}, {"role": "user", "content": prompt}], temperature=0.1, max_tokens=900, purpose="candidate_scoring")
     obj = parse_json_object(result.get("content", ""))
     if not obj:
@@ -1853,7 +1948,7 @@ def _inject_soft_quotes(paragraphs: List[str], max_quotes: int) -> List[str]:
     for i,p in enumerate(paragraphs):
         if i in chosen:
             excerpt=dict(candidates).get(i,"" )
-            out.append(f"<blockquote>💡 {html.escape(excerpt,quote=False)}</blockquote>")
+            out.append(f"<blockquote>💬 {html.escape(excerpt,quote=False)}</blockquote>")
         else:
             out.append(p)
     return out
@@ -1941,8 +2036,7 @@ def _apply_visual_richness(para: str, icon: str, body_index: int = 0) -> str:
     # Short notes can use italic sparingly; only semantic note-like paragraphs are italicized.
     lower=pplain.lower()
     emphasis_words=("نکته", "هشدار", "توجه", "در عمل", "به‌طور خلاصه", "خلاصه")
-    starts_emphasis=any(lower.startswith(w + ":") or lower.startswith(w + " ") for w in emphasis_words)
-    if len(pplain) <= 190 and starts_emphasis:
+    if len(pplain) <= 190 and any(w in lower for w in emphasis_words):
         return f"{icon} <i>{base}</i>"
 
     return f"{icon} {base}"
@@ -1957,10 +2051,9 @@ def _format_quote_block(para: str, icon: str) -> str:
     m=re.match(r"<blockquote>(.*?)</blockquote>$",clean,flags=re.I|re.S)
     if m:
         inner=m.group(1).strip()
-        # Normalize any pre-existing emoji prefix to one contextual emoji. This prevents
-        # the quote cards from becoming emoji-heavy while guaranteeing a visual marker.
-        inner=re.sub(r"^(?:\s*[\U0001F300-\U0001FAFF\u2600-\u27BF]\s*)+", "", inner).strip()
-        return f"<blockquote>{icon} {inner}</blockquote>"
+        if not re.match(r"^\s*[\U0001F300-\U0001FAFF]", strip_html_text(inner)):
+            return f"<blockquote>{icon} {inner}</blockquote>"
+        return clean
     return f"<blockquote>{icon} {html.escape(plain,quote=False)}</blockquote>"
 
 
@@ -2606,6 +2699,32 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                 item=await enrich_candidate_content(dict(raw))
                 title=strip_html_text(item.get('title') or raw_title)[:500]; url=normalize_url(item.get('url') or raw_url)
                 if not url or not title: return {'processed':0,'rejected':1,'reason':'missing'}
+                # --- HARD: promotional/advertising filter before AI ---
+                # Discarded items are stored permanently so they do not re-enter the queue.
+                row0_pre = existing_item_map.get(url)
+                if row0_pre and str(row0_pre.get('status') or '') == 'discarded':
+                    return {'processed':0,'rejected':0,'seen':1,'reason':'discarded promotional item'}
+                promotional, promo_reason = is_promotional_content(
+                    title, item.get('body') or '', item.get('description') or '', url
+                )
+                if promotional:
+                    if progress:
+                        await progress('skip', f"🗑️ {title[:60]} → تبلیغاتی: {promo_reason[:120]}")
+                    item_id_pre = int(row0_pre.get('id') or 0) if row0_pre else 0
+                    content_pre = item.get('body') or ''
+                    hash_pre = text_hash(title + ' ' + strip_html_text(content_pre))
+                    if item_id_pre:
+                        await db.execute(
+                            "UPDATE source_items SET title=?,description=?,content=?,published_at=?,discovered_at=?,content_hash=?,status='discarded',last_error=?,retry_after=NULL WHERE id=?",
+                            [title, item.get('description','')[:2000], content_pre[:14000], item.get('published_at','')[:100], now.isoformat(), hash_pre, promo_reason[:1000], item_id_pre]
+                        )
+                    else:
+                        await db.execute(
+                            "INSERT OR IGNORE INTO source_items(source_id,canonical_url,title,description,content,image_url,published_at,discovered_at,content_hash,status,category,last_error) VALUES(?,?,?,?,?,?,?,?,?,'discarded',?,?)",
+                            [source_id, url, title, item.get('description','')[:2000], content_pre[:14000], '', item.get('published_at','')[:100], now.isoformat(), hash_pre, source.get('category','tech'), promo_reason[:1000]]
+                        )
+                    return {'processed':0,'rejected':1,'reason':f"advertising: {promo_reason}"}
+
                 # --- NEW: Check for insufficient content (paywall/snippet) before AI ---
                 insufficient, reason = is_insufficient_content(title, item.get('body') or '', item.get('description') or '')
                 if insufficient:
@@ -2620,7 +2739,7 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                     if exists and not allow_old_test:
                         if retry_at and retry_at > now:
                             return {'processed':0,'rejected':0,'seen':1,'reason':'retry cooldown'}
-                        if existing_status in {'ready','published','analyzing'}:
+                        if existing_status in {'ready','published','analyzing','discarded'}:
                             return {'processed':0,'rejected':0,'seen':1,'reason':'seen'}
                     body=item.get('body') or item.get('description') or ''
                     body_plain=strip_html_text(body)
@@ -2638,7 +2757,7 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                         hrow=hash_exists[0]; hstatus=str(hrow.get('status') or '')
                         hretry=parse_publication_datetime(str(hrow.get('retry_after') or ''))
                         if hretry and hretry > now: return {'processed':0,'rejected':0,'seen':1,'reason':'hash cooldown'}
-                        if hstatus in {'ready','published','analyzing'}: return {'processed':0,'rejected':0,'seen':1,'reason':'hash'}
+                        if hstatus in {'ready','published','analyzing','discarded'}: return {'processed':0,'rejected':0,'seen':1,'reason':'hash'}
                         item_id=int(hrow.get('id') or 0)
                     if item_id:
                         await db.execute("UPDATE source_items SET title=?,description=?,content=?,published_at=?,discovered_at=?,content_hash=?,status='analyzing',last_error=NULL,retry_after=NULL WHERE id=?",
