@@ -1,4 +1,4 @@
-# VERSION 10.26.0 — full-article extraction + prompt persistence + language/repetition/image fixes
+# VERSION 10.27.0 — smart editorial formats + content-aware bot continuation + safe channel footer
 import os
 import io
 import re
@@ -49,7 +49,7 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "10.26.0-full-article-prompt-image-git-distinct"
+BUILD_VERSION = "10.27.0-smart-editorial-continuation-footer-format-safe"
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_AI_WORKERS = 3
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -344,7 +344,7 @@ async def initialize_automation_database(db: D1Database):
     # Safe one-time migration: replace only the previous built-in editorial defaults.
     # A manager-customized prompt is never overwritten.
     legacy_prompts={
-        "editorial_prompt_channel": "فقط محتوای فنی، دقیق و واقعاً ارزشمند برای مخاطب فناوری و هوش مصنوعی را پوشش بده؛ مطالب سطحی، عمومی، کلیشه‌ای و پیش‌پاافتاده را کنار بگذار. خودِ خبر و جزئیات واقعی را بیان کن به‌طوری مفهومی که تمام چکیده مطلب در حدود 400 تا 600 کاراکتر بیان شود، بدون قضاوت شخصی و سوگیری. تمام محتوا فارسی باشد و در صورت نیاز از اطلاعات انگلیسی فقط در حداقل ممکن استفاده شود. از شروع جمله با کلمات انگلیسی خودداری کن. متن دوستانه، صمیمی، شیوا و طبیعی باشد.",
+        "editorial_prompt_channel": "فقط محتوای فنی، دقیق و واقعاً ارزشمند برای مخاطب فناوری و هوش مصنوعی را پوشش بده؛ مطالب سطحی، عمومی، کلیشه‌ای و پیش‌پاافتاده را کنار بگذار. خودِ خبر و جزئیات واقعی را طوری بیان کن که پست کانال به‌تنهایی ارزش خواندن داشته باشد. طول معمول می‌تواند حدود 600 تا 900 کاراکتر باشد، اما این بازه حداقل یا سهمیه نیست؛ اگر مطلب واقعاً کوتاه است همان کوتاهی حفظ شود و هیچ اضافه‌گویی برای رسیدن به عدد مشخص انجام نشود. نسخه ربات فقط وقتی لازم است که واقعاً جزئیات بیشتری وجود داشته باشد. تمام محتوا فارسی باشد و در صورت نیاز از اطلاعات انگلیسی فقط در حداقل ممکن استفاده شود. از شروع جمله با کلمات انگلیسی خودداری کن. متن دوستانه، صمیمی، شیوا و طبیعی باشد.",
         "editorial_prompt_article": "مقاله کامل باید فنی، غنی و مبتنی بر اطلاعات واقعی منبع باشد؛ جزئیات، زمینه، نحوه کار، اعداد و اثرات قابل اتکا را توضیح بده. سؤال نساز؛ پاسخ و اطلاعات موجود را مستقیم بیان کن. اگر موضوع مالی پیش آمد مبالغ، تعداد و ارقام دقیق را بیان کن. از کلی‌گویی، قضاوت و تحلیل شخصی خودداری کن. اگر از قول شخصی مطلب مهمی بیان می‌شود، ابتدا خیلی کوتاه آن شخص را معرفی کن و سپس ادامه مطلب را بیاور. تمام محتوا فارسی باشد و در صورت نیاز از اطلاعات انگلیسی فقط در حداقل ممکن استفاده شود. متن دوستانه، صمیمی، شیوا و طبیعی باشد.",
     }
     for pk, legacy in legacy_prompts.items():
@@ -1729,11 +1729,14 @@ def _remove_duplicate_title_from_body(title: str, value: str) -> str:
     return "\n\n".join(kept)
 
 def _mandatory_quote_block(paragraphs: List[str], start_index: int = 1) -> Tuple[str, int]:
-    """Return one short Telegram-safe quote and the paragraph it replaces."""
+    """Create a short safe quote only when the model did not already provide one."""
     if not paragraphs:
         return "", -1
     order=list(range(start_index,len(paragraphs)))+list(range(0,start_index))
     for idx in order:
+        # Never turn an existing rich quote/block into a second synthetic quote.
+        if re.search(r"<blockquote\b", paragraphs[idx] or "", flags=re.I):
+            continue
         plain=strip_html_text(paragraphs[idx]).strip()
         if len(plain) < 20:
             continue
@@ -1746,35 +1749,53 @@ def _mandatory_quote_block(paragraphs: List[str], start_index: int = 1) -> Tuple
 
 
 def _visualize_plain_paragraphs(title: str, value: str, category: str, article: bool=False) -> str:
+    # IMPORTANT: Preserve model-provided Telegram HTML blocks. The previous renderer
+    # stripped every <blockquote>, which made intentionally formatted educational
+    # content lose its visual structure. Only sanitize unsafe tags; do not flatten
+    # valid rich blocks.
     value=_remove_duplicate_title_from_body(title, value or "")
-    value=re.sub(r"</?blockquote[^>]*>", "", value, flags=re.I)
     clean=sanitize_telegram_html(_normalize_text_blocks(value))
     plain=strip_html_text(clean)
     if not plain: return ""
-    emoji_map={"ai":["🤖","🧠","🔬","⚡","🧩"],"cyber":["🛡️","🔐","🚨","⚠️","🔎"],"tech":["💻","⚙️","🚀","🔎","🧪"],"edu":["📚","💡","🧭","📝","🎓"],"general":["🌐","✨","📌","🔭","🧭"]}
+    emoji_map={
+        "ai":["🤖","🧠","🔬","⚡","🧩"],
+        "cyber":["🛡️","🔐","🚨","⚠️","🔎"],
+        "tech":["💻","⚙️","🚀","🔎","🧪"],
+        "edu":["📚","💡","🧭","📝","🎓"],
+        "general":["🌐","✨","📌","🔭","🧭"]
+    }
     icons=emoji_map.get(category,emoji_map["tech"])
-    paragraphs=_split_readable_paragraphs(clean, max_chars=430 if not article else 560) or [clean]
+    paragraphs=_split_readable_paragraphs(clean, max_chars=470 if not article else 620) or [clean]
     out=[f"<b>{icons[0]} {html.escape(strip_html_text(title)[:220])}</b>"]
-    quote, quote_index = _mandatory_quote_block(paragraphs, start_index=1)
+    has_existing_quote=any(re.search(r"<blockquote\b", p or "", flags=re.I) for p in paragraphs)
+    quote, quote_index = ("", -1) if has_existing_quote else _mandatory_quote_block(paragraphs, start_index=1)
     last_icon=None
-    for i,para in enumerate(paragraphs[:12]):
+    for i,para in enumerate(paragraphs[:16]):
         pplain=strip_html_text(para).strip()
         title_similarity=SequenceMatcher(None,pplain.lower(),strip_html_text(title).lower()).ratio()
         if not pplain or title_similarity>0.82: continue
+
+        # Preserve explicit quotes exactly (after Telegram sanitization). This is the
+        # semantic formatting the model requested; the renderer must not destroy it.
+        if re.search(r"<blockquote\b", para or "", flags=re.I):
+            out.append(_protect_bidi_latin(para.strip()))
+            continue
         if i==quote_index:
             out.append(quote)
             continue
+
         icon=icons[i%len(icons)]
         if icon==last_icon: icon=icons[(i+1)%len(icons)]
         last_icon=icon
-        has_rich=any(tag in para.lower() for tag in ("<b>","<strong>","<i>","<em>","<u>","<s>","<a ","<pre>","<code>"))
+        has_rich=any(tag in para.lower() for tag in ("<b>","<strong>","<i>","<em>","<u>","<s>","<a ","<pre>","<code>","<blockquote"))
         if has_rich:
             formatted=_protect_bidi_latin(para.strip())
         else:
             formatted=_format_technical_tokens(_protect_bidi_latin(html.escape(pplain,quote=False)))
         if i==1:
-            formatted=f"{icon} <b>{formatted}</b>"
-        elif i==3 and len(pplain)<=140:
+            # Only bold an actually plain first body paragraph. Never nest formatting.
+            formatted=f"{icon} <b>{formatted}</b>" if not has_rich else f"{icon} {formatted}"
+        elif i==3 and len(pplain)<=140 and not has_rich:
             formatted=f"{icon} <i>{formatted}</i>"
         else:
             formatted=f"{icon} {formatted}"
@@ -1784,12 +1805,12 @@ def _visualize_plain_paragraphs(title: str, value: str, category: str, article: 
 def ensure_rich_channel_format(title: str, value: str, category: str = "tech") -> str:
     return _visualize_plain_paragraphs(title, clean_channel_copy(value or ""), category, article=False)
 
-def ensure_rich_article_format(title: str, value: str, source_url: str) -> str:
+def ensure_rich_article_format(title: str, value: str, source_url: str, category: str = "tech") -> str:
     clean=_normalize_text_blocks(value or "")
     if not strip_html_text(sanitize_telegram_html(clean)):
         # Do not return placeholder; return empty so the pipeline can reject.
         return ""
-    return _visualize_plain_paragraphs(title, clean, "tech", article=True)
+    return _visualize_plain_paragraphs(title, clean, category or "tech", article=True)
 
 def remove_article_metadata_blocks(value: str) -> str:
     text=_normalize_text_blocks(value or "")
@@ -2189,7 +2210,9 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
         "ai_relevance": 0, "cyber_relevance": 0, "education_relevance": 0, "iran_relevance": 0,
         "freshness": 0, "reliability": 0, "duplicate_risk": 0, "category": "ai|tech|cyber|edu|general",
         "why": "...", "title": "...", "channel_html": "...", "article_html": "...",
-        "facts": ["..."], "resource_links": []
+        "facts": ["..."], "resource_links": [],
+        "content_type": "news|tutorial|tool|security|comparison|list|analysis|general",
+        "has_more_details": false
     }
     prompt=f"""تو موتور تحریریه و تولید محتوای یک کانال فارسی حرفه‌ای هستی؛ نه قاضی، نه مفسر سیاسی و نه منتقد.
 وظیفه تو این است که از منبع داده‌شده محتوای فنی، غنی، دقیق، بی‌طرف و قابل‌فهم بسازی. انتخاب نهایی فقط بر اساس معیارهای عددی مدیر انجام می‌شود؛ در متن نهایی قضاوت، توصیه یا ارزش‌گذاری ننویس.
@@ -2206,10 +2229,10 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
 وزن‌های تعیین‌شده توسط مدیر:
 {json.dumps(weights,ensure_ascii=False)}
 
-دستور محتوایی مدیر برای نسخه کوتاه کانال (حدود 500 کاراکتر):
+دستور محتوایی مدیر برای نسخه کوتاه کانال (معمولاً حدود 600 تا 900 کاراکتر، فقط وقتی محتوای منبع اجازه می‌دهد):
 {channel_scope}
 
-دستور محتوایی مدیر برای نسخه کامل داخل ربات (حدود 2000 کاراکتر):
+دستور محتوایی مدیر برای نسخه کامل داخل ربات (بدون طول ثابت؛ فقط به اندازه جزئیات واقعی منبع):
 {article_scope}
 
 اولویت دستور مدیر: دستورهای بالا، سیاست محتوایی مدیر هستند و باید در تولید نهایی رعایت شوند. دستورهای کلی این prompt فقط در صورت نبودِ دستور مدیر یا برای جلوگیری از ساختن اطلاعات، آن را تکمیل می‌کنند و نباید با آن تعارض داشته باشند.
@@ -2225,17 +2248,18 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
 کوتاهی متن منبع، کم بودن پاراگراف‌ها یا یک‌جمله‌ای بودن خلاصه به‌تنهایی دلیل رد محتوا نیست. اگر منبع کوتاه است، بهترین محتوای کوتاه و دقیق ممکن را فقط بر اساس همان اطلاعات تولید کن؛ طول محتوا معیار پذیرش نیست و هرگز جزئیات، عدد یا ادعای ساختگی اضافه نکن.
 
 اگر accept=true، همزمان محتوای نهایی را تولید کن:
-1) channel_html: حدود 450 تا 650 کاراکتر «خودِ خبر»؛ نه teaser و نه صرفاً معرفی لینک. ساختار بصری داشته باشد: تیتر/شروع با <b>، حداکثر 1 بخش کوتاه با <i> یا <blockquote> فقط وقتی طبیعی است، پاراگراف‌های کوتاه و 1 تا 3 ایموجی دقیق و مرتبط.
-2) article_html: طول ثابت ندارد؛ بسته به غنای منبع کوتاه یا بلند باشد (تقریباً 400 تا 3000 کاراکتر کافی است). اگر منبع کوتاه است، کوتاه و دقیق بمان؛ برای رسیدن به طول مشخص جزئیات نساز. مستقل و غنی‌تر از متن کانال باشد. از تیترهای کوتاه با <b>، پاراگراف‌های کوتاه و در صورت مناسب یک <blockquote> استفاده کن. متن باید برای خواندن در موبایل خوش‌خوان باشد و صرفاً کپی/تکرار channel_html نباشد.
-3) title: کوتاه، جذاب و غیرکلیک‌بیتی.
-4) category و facts.
+1) channel_html: متن مستقل و ارزشمند برای خود کانال، معمولاً حدود 600 تا 900 کاراکتر وقتی منبع اطلاعات کافی دارد. این بازه «هدف طبیعی» است، نه حداقل و نه سهمیه. اگر مطلب واقعاً در 100 یا 300 یا 700 کاراکتر کامل می‌شود، همان‌جا تمامش کن و هیچ اضافه‌گویی برای رسیدن به عدد مشخص نداشته باش. پست کانال باید حتی بدون کلیک روی ربات ارزش کامل خواندن داشته باشد؛ teaser، تبلیغ ربات یا خلاصه‌ی توخالی نباشد. ساختار بصری داشته باشد و از <b>، <i>، <blockquote>، فهرست و لینک متنی فقط وقتی از نظر معنایی لازم است استفاده کند.
+2) article_html: طول ثابت ندارد و فقط وقتی جزئیات واقعی بیشتری در منبع وجود دارد از channel_html کامل‌تر باشد. اگر منبع کوتاه است، همین کوتاهی را حفظ کن؛ برای رسیدن به 1000 یا 2000 یا 3000 کاراکتر چیزی نساز. اگر واقعاً ادامه، مراحل، زمینه، جزئیات، نکات، منابع یا توضیحات اضافه وجود دارد، آنها را در نسخه کامل قرار بده.
+3) content_type: دقیقاً نوع غالب محتوا را تشخیص بده (news/tutorial/tool/security/comparison/list/analysis/general).
+4) has_more_details: فقط وقتی true باشد که نسخه ربات واقعاً اطلاعات معنادار و بیشتری از نسخه کانال دارد؛ صرف تفاوت عنوان/فرمت یا چند جمله تکراری کافی نیست.
+5) title, category و facts.
 
 قواعد نگارش:
 - فارسی روان، دوستانه، عامیانه و خوش‌خوان؛ رسمی و خشک نباش.
 - اگر اصطلاح فنی لازم است، معادل فارسی را اول بیاور و اصطلاح انگلیسی را فقط داخل پرانتز یا <code>...</code> قرار بده. پاراگراف کامل انگلیسی ممنوع است؛ فقط نام مدل‌ها، شرکت‌ها، محصولات و اصطلاح‌های فنی شناخته‌شده می‌توانند انگلیسی بمانند.
 - در هر پاراگراف اصلی حداکثر یک ایموجی مرتبط داشته باش؛ دو یا چند ایموجی کنار هم نگذار و ایموجی تکراری پشت‌سرهم هم استفاده نکن.
 - نسخه کانال باید فاصله‌گذاری طبیعی موبایلی داشته باشد، چند پاراگراف کوتاه داشته باشد و در صورت مناسب یک بخش Quote کوتاه داشته باشد.
-- نسخه کانال و نسخه کامل باید حتماً حداقل یک Quote کوتاه و واقعی داشته باشند؛ اگر منبع جمله مستقیمی برای نقل‌قول ندارد، یک جمله عیناً از متن منبع را به‌صورت Quote بیاور، نه اینکه نقل‌قول ساختگی بسازی. نسخه کامل در صورت داشتن متن کافی می‌تواند 2 Quote کوتاه داشته باشد. Quote هرگز نباید کل مقاله یا یک پاراگراف بسیار بزرگ باشد.
+- Quote اجباری نیست. اگر خود محتوا نقل‌قول، نکته کلیدی، هشدار یا جمله‌ای دارد که با Quote بهتر خوانده می‌شود، از <blockquote> استفاده کن. اگر Quote معنایی ندارد، آن را مصنوعی نساز. renderer فقط در صورت نبودن Quote و مناسب بودن متن می‌تواند یک excerpt کوتاه بسازد.
 - متن را با تیترهای کوتاه Bold، Italic فقط برای کلمه/عبارت کوتاه، Underline در موارد محدود، Code و Quote در جاهای طبیعی خوش‌خوان کن؛ روی یک جمله طولانی Italic نزن و از فرمت‌ها افراطی استفاده نکن.
 - اگر کد، دستور، نام API یا عبارت فنی دقیق وجود دارد از <code>...</code> استفاده کن؛ اگر متن شامل قطعه‌کد واقعی است از <pre>...</pre> استفاده کن.
 - هیچ‌وقت کاراکترهای متنی "\\n" را برای فاصله‌گذاری خروجی نده؛ برای خط جدید از newline واقعی استفاده کن.
@@ -2246,7 +2270,7 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
 - تمام بخش‌های منبع را بررسی کن و به چند پاراگراف اول اکتفا نکن؛ نکات مهم میانی و پایانی را نیز در article_html پوشش بده.
 - channel_html و article_html را با HTML سازگار با Telegram بده؛ Markdown استفاده نکن.
 - لینک یا URL تولید نکن و هیچ لینک منبعی را در پاسخ خودت وارد نکن؛ URL فقط در اختیار برنامه است.
-- لینک Deep Link مقاله توسط برنامه اضافه می‌شود؛ در متن کانال هیچ عبارت «ادامه مطلب را از لینک زیر بخوانید» یا مشابه آن ننویس.
+- لینک Deep Link مقاله فقط وقتی توسط برنامه اضافه می‌شود که واقعاً جزئیات بیشتری برای خواندن وجود داشته باشد. در غیر این صورت هیچ CTA یا تبلیغ ربات اضافه نکن.
 
 فقط JSON معتبر:
 {json.dumps(editorial_schema, ensure_ascii=False)}"""
@@ -2281,15 +2305,18 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
     raw_ch=_dedupe_leading_semantics(raw_ch,title)
     raw_ar=_dedupe_leading_semantics(raw_ar,title)
     category=str(obj.get("category") or source.get("category") or "tech")
+    content_type=classify_content_type(title, raw_ch, category, str(obj.get("content_type") or ""))
+    obj["content_type"]=content_type
+    obj["has_more_details"]=bool(obj.get("has_more_details"))
     # واحدِ قالب‌بندی قطعی: هر خروجی، حتی اگر AI متن خام داده باشد، یک‌بار از همین renderer عبور می‌کند.
     ch=ensure_rich_channel_format(title, raw_ch, category)
-    ar=ensure_rich_article_format(title, raw_ar, item.get("url") or "")
+    ar=ensure_rich_article_format(title, raw_ar, item.get("url") or "", category)
     # If ensure_rich_article_format returns empty (due to no content), we treat as error.
     if not ar:
         return {"error": "تولید محتوای کامل ناموفق بود - خروجی خالی", "ai": result}
     resource_links=sanitize_resource_links(obj.get("resource_links"))
     ar=append_resource_links(ar, resource_links, item.get("url") or "")
-    obj["title"]=title; obj["channel_html"]=ch; obj["article_html"]=ar; obj["resource_links"]=resource_links
+    obj["title"]=title; obj["channel_html"]=ch; obj["article_html"]=ar; obj["resource_links"]=resource_links; obj["content_type"]=content_type; obj["has_more_details"]=should_attach_bot_link(ch, ar, content_type)
     # امتیاز نهایی را خود ربات از وزن‌های مدیر محاسبه می‌کند؛ بنابراین تغییر وزن واقعاً اثر دارد.
     dims={
         "global":float(obj.get("global_relevance",5) or 0),
@@ -2439,7 +2466,7 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                     title_out=strip_html_text(out.get('title') or title)[:500]
                     # از خروجی نهایی AI همان یک renderer اصلی را اجرا می‌کنیم؛ دیگر مسیر خام/متفاوت نداریم.
                     channel_text=ensure_rich_channel_format(title_out, out.get('channel_html') or out.get('channel_text') or body_plain, str(out.get('category') or source.get('category') or 'tech'))
-                    article_text=ensure_rich_article_format(title_out, out.get('article_html') or out.get('article_text') or body_plain, url)
+                    article_text=ensure_rich_article_format(title_out, out.get('article_html') or out.get('article_text') or body_plain, url, str(out.get('category') or source.get('category') or 'tech'))
                     # IMPORTANT: Ensure article_text is not the placeholder fallback. If it contains the placeholder string, reject.
                     if not article_text or "اطلاعات کافی برای تهیه متن کامل" in article_text:
                         if item_id: await db.execute("UPDATE source_items SET status='error',last_error=?,retry_after=? WHERE id=?",['generation produced fallback placeholder',(now+timedelta(minutes=15)).isoformat(),item_id])
@@ -2521,6 +2548,69 @@ async def get_runtime_bot_username(bot: Bot) -> str:
         BOT_USERNAME_RUNTIME=BOT_USERNAME.lstrip("@")
     return BOT_USERNAME_RUNTIME
 
+CONTENT_TYPE_RULES = {
+    "tutorial": ("آموزش", ["آموزش", "چطور", "چگونه", "مراحل", "قدم به قدم", "گام به گام", "تنظیم", "نصب"]),
+    "tool": ("معرفی ابزار", ["ابزار", "سرویس", "اپلیکیشن", "برنامه", "سایت", "پلتفرم"]),
+    "security": ("امنیت", ["امنیت", "هک", "بدافزار", "فیشینگ", "رمزنگاری", "آسیب‌پذیری", "ردیابی"]),
+    "comparison": ("مقایسه", ["مقایسه", "در برابر", "بهتر است", "فرق", "تفاوت"]),
+    "list": ("فهرست", ["۵", "۵ ابزار", "چند ابزار", "بهترین", "لیست", "فهرست", "موارد"]),
+    "analysis": ("تحلیل", ["تحلیل", "بررسی", "چرا", "پیامد", "تأثیر", "معنای"]),
+    "news": ("خبر", ["معرفی کرد", "اعلام کرد", "منتشر شد", "رونمایی", "خبر", "گزارش"])
+}
+
+def classify_content_type(title: str, text: str, category: str = "tech", ai_type: str = "") -> str:
+    candidate=(ai_type or "").strip().lower()
+    allowed={"tutorial","tool","security","comparison","list","analysis","news","general"}
+    if candidate in allowed:
+        return candidate
+    sample=f"{title or ''}\n{text or ''}".lower()
+    if category=="cyber" or any(k in sample for k in CONTENT_TYPE_RULES["security"][1]):
+        return "security"
+    for key in ("tutorial","comparison","list","tool","analysis","news"):
+        if any(k.lower() in sample for k in CONTENT_TYPE_RULES[key][1]):
+            return key
+    if category=="edu": return "tutorial"
+    return "general"
+
+CONTENT_FOOTER_EMOJI = {
+    "tutorial":"📚", "tool":"🛠️", "security":"🛡️", "comparison":"⚖️",
+    "list":"📋", "analysis":"🔎", "news":"📰", "general":"📌"
+}
+
+def append_channel_footer(channel_html: str, category: str, content_type: str) -> str:
+    """Append the mandatory branded footer once, without altering preceding Telegram HTML."""
+    clean=sanitize_telegram_html(channel_html or "").strip()
+    clean=re.sub(r"(?:\n\s*)?(?:<b>|<strong>|<i>|<em>|<u>|<s>)*\s*[📰📚🛠️🛡️⚖️📋🔎📌📰💻🤖🌐📢🔗]*\s*@TechNowAI\s*(?:</b>|</strong>|</i>|</em>|</u>|</s>)*\s*$", "", clean, flags=re.I)
+    icon=CONTENT_FOOTER_EMOJI.get(content_type, CONTENT_FOOTER_EMOJI.get("general"))
+    return (clean.rstrip()+f"\n\n{icon} @TechNowAI").strip()
+
+def split_channel_footer(value: str) -> Tuple[str,str]:
+    text=sanitize_telegram_html(value or "").strip()
+    m=re.search(r"\n\n([^\n]{1,24}\s*@TechNowAI)\s*$", text)
+    if not m:
+        return text, ""
+    return text[:m.start()].rstrip(), m.group(1).strip()
+
+def should_attach_bot_link(channel_html: str, article_html: str, content_type: str = "general") -> bool:
+    """Link to the bot only when there is genuinely more to read.
+
+    Length is a signal, not a quota: a short complete item stays channel-only.
+    The bot link appears when the stored article has a meaningful extra body.
+    """
+    ch=max(0,plain_len(channel_html or ""))
+    ar=max(0,plain_len(article_html or ""))
+    if not ch or not ar or ar<=ch:
+        return False
+    extra=ar-ch
+    # A clearly longer article needs navigation; tiny formatting/title differences do not.
+    if extra>=260:
+        return True
+    if ar>1000 and extra>=180:
+        return True
+    if content_type in {"tutorial","analysis","comparison","list","security"} and ar>=900 and extra>=180:
+        return True
+    return False
+
 def _trim_rich_blocks_to_limit(value: str, max_plain_chars: int = 760) -> str:
     clean=sanitize_telegram_html(clean_channel_copy(value or ''))
     if plain_len(clean) <= max_plain_chars:
@@ -2534,26 +2624,41 @@ def _trim_rich_blocks_to_limit(value: str, max_plain_chars: int = 760) -> str:
         return html.escape(plain,quote=False)
     return trimmed
 
-def publication_caption(title: str, channel_html: str, deep_link: str) -> str:
-    """Build a single rich caption under Telegram's 1024-char caption limit."""
-    link=f'<a href="{html.escape(deep_link,quote=True)}">📖 بیشتر بخوانید</a>'
-    clean=_trim_rich_blocks_to_limit(channel_html, 760)
-    caption=(clean.strip()+"\n\n"+link).strip()
-    if len(caption) <= 1024:
+def publication_caption(title: str, channel_html: str, deep_link: Optional[str] = None) -> str:
+    """Build a rich caption while preserving the mandatory footer.
+
+    A bot CTA is optional and is added only when substantial extra content exists.
+    """
+    body, footer = split_channel_footer(channel_html)
+    link=(f'<a href="{html.escape(deep_link,quote=True)}">📖 جزئیات کامل در ربات</a>' if deep_link else "")
+    # Photo captions have a 1024-character limit. Give channel-only posts more room,
+    # while leaving enough space for the optional navigation link when necessary.
+    body_limit=820 if deep_link else 930
+    clean=_trim_rich_blocks_to_limit(body, body_limit)
+    tail=[]
+    if footer: tail.append(footer)
+    if link: tail.append(link)
+    caption=(clean.strip()+"\n\n"+"\n\n".join(tail)).strip() if tail else clean.strip()
+    if len(caption)<=1024:
         return caption
-    # Drop whole rich blocks before ever stripping formatting.
+
+    # Drop whole body blocks only; never sacrifice the footer or the bot CTA.
     blocks=[b.strip() for b in re.split(r"\n\s*\n+", sanitize_telegram_html(clean)) if strip_html_text(b).strip()]
-    while len(blocks)>1 and len("\n\n".join(blocks)+"\n\n"+link)>1024:
+    tail_text=("\n\n"+"\n\n".join(tail)) if tail else ""
+    while len(blocks)>1 and len("\n\n".join(blocks)+tail_text)<=1024:
+        break
+    while len(blocks)>1 and len("\n\n".join(blocks[:-1])+tail_text)>1024:
         blocks.pop()
-    candidate=("\n\n".join(blocks)+"\n\n"+link).strip()
-    if len(candidate) <= 1024:
+    body_candidate="\n\n".join(blocks).strip()
+    candidate=(body_candidate+tail_text).strip()
+    if len(candidate)<=1024:
         return candidate
-    # Last-resort: keep Telegram-safe HTML by truncating the current final block as plain text,
-    # then escaping only that truncated block. This path is rare because channel content is short.
-    plain=strip_html_text("\n\n".join(blocks))
-    budget=max(120, 1024-len(strip_html_text(link))-8)
-    plain=plain[:budget].rsplit(' ',1)[0]+"…"
-    return html.escape(plain,quote=False)+"\n\n"+link
+
+    # Last resort: truncate only the body as plain text and retain branded footer/CTA.
+    budget=max(80,1024-len(tail_text)-8)
+    plain=strip_html_text(body_candidate)[:budget]
+    plain=(plain.rsplit(" ",1)[0] if " " in plain else plain)+"…"
+    return (html.escape(plain,quote=False)+tail_text).strip()
 
 
 async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> bool:
@@ -2581,20 +2686,27 @@ async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> b
         deep_link=f"https://t.me/{bot_username}?start=article_{token}"
         channel_id=await get_channel_id(db)
         title_out=str(row.get("title") or "مطلب")
-        channel_text=sanitize_telegram_html(row.get("channel_text") or "")
+        category_out=str(row.get("category") or "tech")
+        article_body=sanitize_telegram_html(row.get("body") or "")
+        content_type=classify_content_type(title_out, row.get("channel_text") or "", category_out)
+        channel_text=append_channel_footer(row.get("channel_text") or "", category_out, content_type)
         source_url=normalize_url(row.get("source_url") or "")
-        # publication_caption adds exactly one navigation link. Keep channel_text itself clean.
+        # The bot CTA is conditional: only add it when the article contains substantial
+        # extra material. Every channel post still gets the mandatory branded footer.
+        attach_bot=should_attach_bot_link(channel_text, article_body, content_type)
+        navigation_link=deep_link if attach_bot else None
         image_url=await resolve_article_image(db,row)
         sent=None
         if image_url:
             try:
-                sent=await bot.send_photo(chat_id=channel_id,photo=image_url,caption=publication_caption(title_out,channel_text,deep_link),parse_mode="HTML")
+                sent=await bot.send_photo(chat_id=channel_id,photo=image_url,caption=publication_caption(title_out,channel_text,navigation_link),parse_mode="HTML")
             except Exception as img_error:
                 await log_automation(db,"WARN","source_image_failed",f"article={article_id} {img_error}")
         if sent is None:
             # Never publish an unrelated placeholder image. If the source has no usable image,
             # publish the real formatted text instead.
-            sent=await bot.send_message(chat_id=channel_id,text=channel_text[:4096],parse_mode="HTML",disable_web_page_preview=True)
+            final_text=publication_caption(title_out,channel_text,navigation_link)
+            sent=await bot.send_message(chat_id=channel_id,text=final_text[:4096],parse_mode="HTML",disable_web_page_preview=True)
         published_at=datetime.now(timezone.utc).isoformat()
         await db.execute("UPDATE articles SET status='published',published_message_id=?,published_at=? WHERE id=?",[getattr(sent,"message_id",0),published_at,article_id])
         await db.execute("UPDATE publication_queue SET status='published',published_at=? WHERE id=?",[published_at,queue_id])
@@ -4967,7 +5079,7 @@ async def health_dry_run(call:CallbackQuery,db:D1Database,bot:Bot):
             await edit_health_progress(call.message,f"⚠️ <b>این گزینه زیر حداقل امتیاز مدیر بود.</b>\n\nامتیاز: <b>{out.get('score','-')}</b> · حد مدیر: <b>{min_score:g}</b>\nدلیل: {html.escape(str(out.get('why','-'))[:800])}", get_admin_back_kb("auto_health")); return
         await edit_health_progress(call.message,health_progress_block(4,6,"محتوا تولید شد","در حال بررسی Formatting و طول متن…"))
         ch=ensure_rich_channel_format(str(out.get('title') or item.get('title') or 'مطلب'), out.get('channel_html') or out.get('channel_text') or item.get('body') or item.get('description') or '', str(out.get('category') or src.get('category') or 'tech'))
-        ar=ensure_rich_article_format(str(out.get('title') or item.get('title') or 'مطلب'), out.get('article_html') or out.get('article_text') or item.get('body') or item.get('description') or '', item.get('url') or '')
+        ar=ensure_rich_article_format(str(out.get('title') or item.get('title') or 'مطلب'), out.get('article_html') or out.get('article_text') or item.get('body') or item.get('description') or '', item.get('url') or '', str(out.get('category') or src.get('category') or 'tech'))
         await edit_health_progress(call.message,health_progress_block(5,6,"قالب و محتوا آماده شد","عکس منبع و Deep Link آزمایشی نیز بررسی می‌شوند."))
         ai_info=out.get('ai') or {}
         msg=("✅ <b>تست تولید واقعی موفق شد.</b>\n\n"
@@ -5079,15 +5191,20 @@ async def health_test_publish(call:CallbackQuery,db:D1Database,bot:Bot):
         username=await get_runtime_bot_username(bot)
         if not username: raise RuntimeError('Username ربات پیدا نشد.')
         deep=f'https://t.me/{username}?start=article_{token}'
-        await edit_health_progress(call.message,health_progress_block(4,6,'Deep Link آماده شد','ارسال همان محتوای تولیدشده به کانال…'))
-        channel_html=sanitize_telegram_html(ch)
+        await edit_health_progress(call.message,health_progress_block(4,6,'بررسی ادامه‌دار بودن محتوا','فقط اگر جزئیات واقعی بیشتری وجود داشته باشد لینک ربات اضافه می‌شود…'))
+        category_out=str(out.get('category') or src.get('category') or 'tech')
+        content_type=classify_content_type(str(out.get('title') or item.get('title') or 'مطلب'), ch, category_out, str(out.get('content_type') or ''))
+        channel_html=append_channel_footer(sanitize_telegram_html(ch),category_out,content_type)
+        attach_bot=should_attach_bot_link(channel_html,ar,content_type)
+        navigation_link=deep if attach_bot else None
+        await edit_health_progress(call.message,health_progress_block(4,6,'نسخه نهایی کانال آماده شد','Footer الزامی اضافه شد؛ CTA ربات فقط در صورت وجود محتوای بیشتر نمایش داده می‌شود.'))
         photo=item.get('image_url') or ''
         sent=None
         if photo:
-            try: sent=await bot.send_photo(channel,photo=photo,caption=publication_caption(str(out.get('title') or item.get('title') or 'مطلب'),channel_html,deep),parse_mode='HTML')
+            try: sent=await bot.send_photo(channel,photo=photo,caption=publication_caption(str(out.get('title') or item.get('title') or 'مطلب'),channel_html,navigation_link),parse_mode='HTML')
             except Exception: sent=None
         if sent is None:
-            final_text=sanitize_telegram_html(channel_html + f"\n\n<a href=\"{html.escape(deep,quote=True)}\">📖 بیشتر بخوانید</a>")
+            final_text=publication_caption(str(out.get('title') or item.get('title') or 'مطلب'),channel_html,navigation_link)
             sent=await bot.send_message(channel,text=final_text[:4096],parse_mode='HTML',disable_web_page_preview=True)
         await db.execute("UPDATE articles SET published_message_id=?,published_at=? WHERE id=?",[getattr(sent,'message_id',0),now,aid])
         await edit_health_progress(call.message,health_progress_block(5,6,'✅ انتشار انجام شد','در حال نهایی‌کردن نتیجه و لینک تست…'))
@@ -5333,14 +5450,19 @@ async def auto_art_edit_input(message:Message,state:FSMContext,db:D1Database,bot
     if rows and rows[0].get('status')=='published' and rows[0].get('published_message_id'):
         try:
             channel_id=await get_channel_id(db); token=rows[0].get('deep_token'); username=await get_runtime_bot_username(bot)
-            deep=f"https://t.me/{username}?start=auto_{token}" if token and username else ''
-            if field in {'title','channel'} and deep:
-                latest=await db.execute("SELECT title,channel_text FROM articles WHERE id=?",[aid])
-                cap=publication_caption(latest[0].get('title') or '',latest[0].get('channel_text') or '',deep)
-                try: await bot.edit_message_caption(chat_id=channel_id,message_id=int(rows[0]['published_message_id']),caption=cap,parse_mode='HTML')
-                except Exception:
-                    try: await bot.edit_message_text(chat_id=channel_id,message_id=int(rows[0]['published_message_id']),text=cap,parse_mode='HTML')
-                    except Exception: pass
+            deep=f"https://t.me/{username}?start=article_{token}" if token and username else ''
+            if field in {'title','channel'}:
+                latest=await db.execute("SELECT title,channel_text,body,category FROM articles WHERE id=?",[aid])
+                if latest:
+                    latest_row=latest[0]
+                    ctype=classify_content_type(latest_row.get('title') or '',latest_row.get('channel_text') or '',latest_row.get('category') or 'tech')
+                    channel_html=append_channel_footer(latest_row.get('channel_text') or '',latest_row.get('category') or 'tech',ctype)
+                    attach=bool(deep) and should_attach_bot_link(channel_html,latest_row.get('body') or '',ctype)
+                    cap=publication_caption(latest_row.get('title') or '',channel_html,deep if attach else None)
+                    try: await bot.edit_message_caption(chat_id=channel_id,message_id=int(rows[0]['published_message_id']),caption=cap,parse_mode='HTML')
+                    except Exception:
+                        try: await bot.edit_message_text(chat_id=channel_id,message_id=int(rows[0]['published_message_id']),text=cap,parse_mode='HTML')
+                        except Exception: pass
         except Exception: pass
     await state.set_state(BotStates.idle)
     # Return to article panel via a fresh bot message to avoid losing the parent navigation.
