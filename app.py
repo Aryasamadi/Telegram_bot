@@ -49,7 +49,7 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "10.27.6-quality-adfilter-about-schedule-image-safe"
+BUILD_VERSION = "10.27.7-help-menu-about-format"
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_AI_WORKERS = 3
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -3318,8 +3318,7 @@ def automation_menu_kb(enabled: bool) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=state_text, callback_data=state_cb)],
         [InlineKeyboardButton(text="🌐 منابع خبری", callback_data="auto_sources"), InlineKeyboardButton(text="🤖 مدل‌های AI", callback_data="auto_providers")],
         [InlineKeyboardButton(text="📢 انتشار و زمان‌بندی", callback_data="auto_channel"), InlineKeyboardButton(text="🧠 کیفیت محتوا", callback_data="auto_quality")],
-        [InlineKeyboardButton(text="🗃 محتوا و داده‌ها", callback_data="auto_content_db")],
-        [InlineKeyboardButton(text="ℹ️ درباره ربات", callback_data="bot_about_admin")],
+        [InlineKeyboardButton(text="🗃 محتوا و داده‌ها", callback_data="auto_content_db"), InlineKeyboardButton(text="ℹ️ درباره ربات", callback_data="bot_about_admin")],
         [InlineKeyboardButton(text="🧪 تست و سلامت", callback_data="auto_health"), InlineKeyboardButton(text="📊 گزارش", callback_data="auto_report")],
         [InlineKeyboardButton(text="🔙 پنل اصلی", callback_data="admin_home")]
     ])
@@ -3805,7 +3804,7 @@ async def cmd_about(message: Message, db: D1Database):
 async def cmd_help(message: Message, db: D1Database):
     about=await get_setting(db,"bot_about_text","")
     about=sanitize_telegram_html(about or "🤖 <b>این ربات چیست؟</b>\n\nربات هوشمند تولید و انتشار محتوای فناوری، هوش مصنوعی و امنیت سایبری است.")
-    help_text=about+"\n\n❓ <b>راهنمای دستورات</b>\n\n🌐 /help • راهنما\nℹ️ /about • درباره ربات\n📞 /man • تماس با مدیر\n🚀 /start • شروع"
+    help_text=about+"\n\n❓ <b>راهنمای دستورات</b>\n\nℹ️ /about • این ربات چه میکند\n📞 /man • تماس با مدیر\n🚀 /start • شروع مجدد"
     await message.answer(help_text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی",callback_data="user_home")]]))
 
 @router.message(Command("man"))
@@ -4315,7 +4314,14 @@ async def admin_add_source_input(message: Message, state: FSMContext, db: D1Data
 
 @router.message(F.chat.id == ADMIN_ID, StateFilter(BotStates.admin_automation_setting))
 async def admin_automation_setting_input(message:Message,state:FSMContext,db:D1Database,bot:Bot):
-    data=await state.get_data(); key=data.get("automation_setting_key"); value=(message.text or "").strip()
+    data=await state.get_data(); key=data.get("automation_setting_key")
+    # For the About field, preserve Telegram's native formatting/links when the admin
+    # sends rich text from the Telegram composer. Other settings remain plain text.
+    if key == "bot_about_text":
+        rich = getattr(message, "html_text", None)
+        value=(rich if rich is not None else (message.text or "")).strip()
+    else:
+        value=(message.text or "").strip()
     parent=data.get("parent_callback","admin_home")
     try:
         if key=="__source_interval__":
@@ -4766,7 +4772,7 @@ async def user_profile(call: CallbackQuery, db: D1Database):
 async def user_help(call: CallbackQuery, db: D1Database):
     about=await get_setting(db,"bot_about_text","")
     about=sanitize_telegram_html(about or "🤖 <b>این ربات چیست؟</b>\n\nربات هوشمند تولید و انتشار محتوای فناوری، هوش مصنوعی و امنیت سایبری است.")
-    text=about+"\n\n❓ <b>راهنمای دستورات</b>\n\n/start • شروع\n/help • راهنما\n/about • درباره ربات\n/man • تماس با مدیر"
+    text=about+"\n\n❓ <b>راهنمای دستورات</b>\n\nℹ️ /about • این ربات چه میکند\n📞 /man • تماس با مدیر\n🚀 /start • شروع مجدد"
     await call.message.edit_text(text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی",callback_data="user_home")]]))
     await call.answer()
 
