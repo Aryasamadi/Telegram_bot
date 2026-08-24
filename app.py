@@ -3376,8 +3376,8 @@ def schedule_menu_kb() -> InlineKeyboardMarkup:
     # Publish/scheduling controls only; the main automation on/off toggle stays in the parent menu.
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔢 سقف تقریبی پست روزانه", callback_data="set_max_daily"), InlineKeyboardButton(text="⏱ حداقل فاصله پست‌ها", callback_data="set_min_gap")],
-        [InlineKeyboardButton(text="🌐 فاصله بررسی منابع", callback_data="set_default_interval"), InlineKeyboardButton(text="📢 تنظیم/تغییر کانال", callback_data="auto_channel_set")],
-        [InlineKeyboardButton(text="🔙 اتوماسیون محتوا", callback_data="auto_back")]
+        [InlineKeyboardButton(text="🕐 ساعات انتشار خودکار", callback_data="set_publish_hours"), InlineKeyboardButton(text="🌐 فاصله بررسی منابع", callback_data="set_default_interval")],
+        [InlineKeyboardButton(text="📢 تنظیم/تغییر کانال", callback_data="auto_channel_set"), InlineKeyboardButton(text="🔙 اتوماسیون محتوا", callback_data="auto_back")]
     ])
 
 async def reset_database(db: D1Database):
@@ -4238,7 +4238,7 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
 👎 دیس‌لایک‌ها: <b>{dislikes_count}</b>
 
 🔰 <b>{role_display}</b>"""
-        await message.answer(profile_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="user_home")]]))
+        await message.answer(profile_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="?? منوی اصلی", callback_data="user_home")]]))
         
     elif text == "💾 ذخیره‌های من":
         await message.answer("📂 کدوم پوشه رو میخوای باز کنی؟ 👇", reply_markup=get_folder_selection_kb())
@@ -4350,6 +4350,15 @@ async def admin_automation_setting_input(message:Message,state:FSMContext,db:D1D
             await db.execute("UPDATE ai_providers SET priority=?,updated_at=? WHERE id=?",[int(value),datetime.now(timezone.utc).isoformat(),pid]); parent=f"provider_view_{pid}"
         elif key.startswith("weight_"):
             value=str(max(0,min(100,float(value)))); await set_setting(db,key,value); parent="quality_weights"
+        elif key=="__publish_hours__":
+            m=re.fullmatch(r"\s*(?:[01]?\d|2[0-3])\s*[-–—:]\s*(?:[01]?\d|2[0-3])\s*", value)
+            if not m: raise ValueError("فرمت درست: 08-23")
+            parts=re.findall(r"(?:[01]?\d|2[0-3])", value)
+            start_h=int(parts[0]); end_h=int(parts[1])
+            if start_h==end_h: raise ValueError("ساعت شروع و پایان نمی‌تواند یکسان باشد")
+            await set_setting(db,"publish_start_hour",str(start_h))
+            await set_setting(db,"publish_end_hour",str(end_h))
+            parent="auto_channel"
         elif key in {"max_daily_posts","default_source_interval"}:
             value=str(max(1,int(value)))
             await set_setting(db,key,value)
@@ -4572,9 +4581,12 @@ async def render_channel_panel(call: CallbackQuery, db: D1Database):
     if est['minutes']<=0: nxt='آماده انتشار طبق برنامه'
     elif est['minutes']<60: nxt=f"حدود {est['minutes']} دقیقه دیگر"
     else: nxt=f"حدود {est['minutes']//60} ساعت و {est['minutes']%60} دقیقه دیگر"
+    start_h=int(await get_setting(db,"publish_start_hour",str(DEFAULT_PUBLISH_START_HOUR)))
+    end_h=int(await get_setting(db,"publish_end_hour",str(DEFAULT_PUBLISH_END_HOUR)))
     text=("📢 <b>انتشار و زمان‌بندی</b>\n\n"
           f"📢 کانال: <b>{shown}</b>\n"
-          f"🤖 اتوماسیون: <b>{'🟢 فعال' if enabled else '🔴 خاموش'}</b>\n\n"
+          f"🤖 اتوماسیون اصلی: <b>{'🟢 فعال' if enabled else '🔴 خاموش'}</b>\n"
+          f"🕐 ساعات انتشار خودکار: <b>{start_h:02d}:00 تا {end_h:02d}:00</b>\n\n"
           f"🔢 سقف روزانه: <b>{max_daily}</b>\n"
           f"⏱ فاصله انتشار: <b>{format_duration_minutes(gap)}</b>\n"
           f"🌐 فاصله بررسی منابع: <b>{src_interval} دقیقه</b>\n"
@@ -5733,6 +5745,16 @@ async def set_min_score(call: CallbackQuery, state: FSMContext):
 async def set_min_gap(call: CallbackQuery, state: FSMContext, db: D1Database):
     current=await get_setting(db,"min_post_gap_minutes",str(DEFAULT_MIN_POST_GAP_MINUTES))
     await prompt_for_setting(call, state, "min_post_gap_minutes", f"⏱ <b>حداقل فاصله بین دو پست</b> را بر حسب دقیقه بفرست.\nفعلاً روی <b>{format_duration_minutes(current)}</b> است.\nمثال: <code>30</code> یعنی هر ۳۰ دقیقه و <code>120</code> یعنی هر ۲ ساعت.", "auto_channel")
+@router.callback_query(F.data == "set_publish_hours")
+async def set_publish_hours(call: CallbackQuery, state: FSMContext, db: D1Database):
+    start=await get_setting(db,"publish_start_hour",str(DEFAULT_PUBLISH_START_HOUR))
+    end=await get_setting(db,"publish_end_hour",str(DEFAULT_PUBLISH_END_HOUR))
+    await prompt_for_setting(
+        call, state, "__publish_hours__",
+        f"🕐 <b>ساعات انتشار خودکار</b> به وقت ایران را بفرست.\n\nفعلاً: <b>{int(start):02d}:00 تا {int(end):02d}:00</b>\n\nمثال: <code>08-23</code> یعنی فقط بین ۸ صبح تا ۱۱ شب اجازه انتشار خودکار وجود دارد.\nمثال: <code>09-18</code>",
+        "auto_channel"
+    )
+
 @router.callback_query(F.data == "set_default_interval")
 async def set_default_interval(call: CallbackQuery, state: FSMContext, db: D1Database):
     current=await get_setting(db,"default_source_interval",str(DEFAULT_SOURCE_INTERVAL_MINUTES))
