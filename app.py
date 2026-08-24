@@ -2212,7 +2212,7 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
         "why": "...", "title": "...", "channel_html": "...", "article_html": "...",
         "facts": ["..."], "resource_links": [],
         "content_type": "news|tutorial|tool|security|comparison|list|analysis|general",
-        "has_more_details": false
+        "has_more_details": False
     }
     prompt=f"""تو موتور تحریریه و تولید محتوای یک کانال فارسی حرفه‌ای هستی؛ نه قاضی، نه مفسر سیاسی و نه منتقد.
 وظیفه تو این است که از منبع داده‌شده محتوای فنی، غنی، دقیق، بی‌طرف و قابل‌فهم بسازی. انتخاب نهایی فقط بر اساس معیارهای عددی مدیر انجام می‌شود؛ در متن نهایی قضاوت، توصیه یا ارزش‌گذاری ننویس.
