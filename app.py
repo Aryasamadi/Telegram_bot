@@ -49,7 +49,7 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "10.27.8-help-exact-token-optimized"
+BUILD_VERSION = "10.27.8-publish-hours-actual-menu-fix"
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_AI_WORKERS = 3
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -4595,7 +4595,7 @@ async def render_channel_panel(call: CallbackQuery, db: D1Database):
     kb=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='📢 تنظیم/تغییر کانال',callback_data='auto_channel_set'),InlineKeyboardButton(text='🔢 سقف پست روزانه',callback_data='set_max_daily')],
         [InlineKeyboardButton(text='⏱ فاصله انتشار',callback_data='set_min_gap'),InlineKeyboardButton(text='🌐 فاصله بررسی منابع',callback_data='set_default_interval')],
-        [InlineKeyboardButton(text='🔙 اتوماسیون محتوا',callback_data='auto_back')]
+        [InlineKeyboardButton(text='🕐 ساعات انتشار خودکار',callback_data='set_publish_hours'),InlineKeyboardButton(text='🔙 اتوماسیون محتوا',callback_data='auto_back')]
     ])
     await call.message.edit_text(text,parse_mode='HTML',reply_markup=kb)
 
