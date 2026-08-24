@@ -49,9 +49,9 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "10.27.8-publish-hours-actual-menu-fix"
-DEFAULT_MAX_WORKERS = 3
-DEFAULT_MAX_AI_WORKERS = 3
+BUILD_VERSION = "10.27.8-help-image-speed-fix"
+DEFAULT_MAX_WORKERS = 6
+DEFAULT_MAX_AI_WORKERS = 4
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
 AI_PROVIDER_RECHECK_MINUTES = int(os.getenv("AI_PROVIDER_RECHECK_MINUTES", "10"))
 BOT_USERNAME_RUNTIME = ""
@@ -346,6 +346,15 @@ async def initialize_automation_database(db: D1Database):
     }
     for k, v in defaults.items():
         await db.execute("INSERT OR IGNORE INTO automation_settings(key, value) VALUES(?, ?)", [k, v])
+    # Safe one-time performance migration: increase only untouched legacy defaults.
+    try:
+        for perf_key, old_value, new_value in (("max_workers", "3", "6"), ("max_ai_workers", "3", "4")):
+            rows=await db.execute("SELECT value FROM automation_settings WHERE key=?", [perf_key])
+            current=str(rows[0].get("value") or "") if rows else ""
+            if current.strip()==old_value:
+                await set_setting(db, perf_key, new_value)
+    except Exception:
+        pass
 
     # Safe one-time migration of the previous built-in quality profile.
     # Customized manager values are never overwritten.
@@ -2296,10 +2305,23 @@ def append_resource_links(article_html: str, resource_links, source_url: str = "
 
 
 async def resolve_article_image(db: D1Database, article: dict) -> str:
-    # Image URLs are transient transport data. Never persist them in D1.
+    """Resolve a reliable article image, reusing persisted source/article URLs and caching success."""
     existing=normalize_url(str(article.get("image_url") or ""))
     if existing:
         return existing
+    source_item_id=article.get("source_item_id")
+    if source_item_id:
+        try:
+            rows=await db.execute("SELECT image_url FROM source_items WHERE id=? LIMIT 1", [int(source_item_id)])
+            recovered=normalize_url(str(rows[0].get("image_url") or "")) if rows else ""
+            if recovered:
+                try:
+                    await db.execute("UPDATE articles SET image_url=? WHERE id=?", [recovered, article.get("id")])
+                except Exception:
+                    pass
+                return recovered
+        except Exception:
+            pass
     source_url=normalize_url(article.get("source_url") or "")
     if not source_url:
         return ""
@@ -2308,18 +2330,30 @@ async def resolve_article_image(db: D1Database, article: dict) -> str:
         raw,_=await http_get(source_url,session)
         parsed=extract_html_page(raw,source_url)
         image=normalize_url(parsed.get("image_url") or "")
+        if not image:
+            for m in re.finditer(r'<img\b[^>]+>',raw or '',flags=re.I):
+                tag=m.group(0)
+                if not re.search(r'(featured|hero|article|post|cover|thumbnail)',tag,re.I):
+                    continue
+                u=re.search(r'(?:src|data-src|data-lazy-src|data-original|data-url)=["\']([^"\']+)',tag,flags=re.I)
+                if u:
+                    candidate=urllib.parse.urljoin(source_url,html.unescape(u.group(1).strip()))
+                    if candidate.startswith(('http://','https://')) and not re.search(r'(logo|avatar|icon|sprite|favicon)',candidate,re.I):
+                        image=normalize_url(candidate); break
+                su=re.search(r'(?:srcset|data-srcset)=["\']([^"\']+)',tag,flags=re.I)
+                if not image and su:
+                    first=su.group(1).split(',')[0].strip().split(' ')[0]
+                    candidate=urllib.parse.urljoin(source_url,html.unescape(first))
+                    if candidate.startswith(('http://','https://')) and not re.search(r'(logo|avatar|icon|sprite|favicon)',candidate,re.I):
+                        image=normalize_url(candidate); break
         if image:
+            try:
+                await db.execute("UPDATE articles SET image_url=? WHERE id=?", [image, article.get("id")])
+                if source_item_id:
+                    await db.execute("UPDATE source_items SET image_url=? WHERE id=?", [image, int(source_item_id)])
+            except Exception:
+                pass
             return image
-        # Last safe fallback: an image explicitly marked as article/featured/hero in HTML.
-        for m in re.finditer(r'<img\b[^>]+>',raw or '',flags=re.I):
-            tag=m.group(0)
-            if not re.search(r'(featured|hero|article|post|cover|thumbnail)',tag,re.I):
-                continue
-            u=re.search(r'(?:src|data-src|data-lazy-src)=["\']([^"\']+)',tag,flags=re.I)
-            if u:
-                candidate=urllib.parse.urljoin(source_url,html.unescape(u.group(1).strip()))
-                if candidate.startswith(('http://','https://')) and not re.search(r'(logo|avatar|icon|sprite|favicon)',candidate,re.I):
-                    return normalize_url(candidate)
         return ""
     except Exception as exc:
         try:
@@ -2327,7 +2361,6 @@ async def resolve_article_image(db: D1Database, article: dict) -> str:
         except Exception:
             pass
         return ""
-
 def make_article_png(width=1280,height=720):
     # Kept only for backward compatibility; placeholder images are not generated or stored.
     return b""
@@ -2765,7 +2798,7 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
 
         weight_keys=['global','technology','ai','cyber','education','iran','freshness','novelty']
         weights={k:float(await get_setting(db,f'weight_{k}','10')) for k in weight_keys}
-        sem=asyncio.Semaphore(max(1,min(4,int(await get_setting(db,'max_ai_workers','3')))))
+        sem=asyncio.Semaphore(max(1,min(4,int(await get_setting(db,'max_ai_workers',str(DEFAULT_MAX_AI_WORKERS))))))
         async def process_one(raw):
             try:
                 raw_title=strip_html_text(raw.get('title',''))[:500]; raw_desc=strip_html_text(raw.get('description',''))[:2000]; raw_url=normalize_url(raw.get('url'))
@@ -2842,11 +2875,11 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                         if hstatus in {'ready','published','analyzing','discarded'}: return {'processed':0,'rejected':0,'seen':1,'reason':'hash'}
                         item_id=int(hrow.get('id') or 0)
                     if item_id:
-                        await db.execute("UPDATE source_items SET title=?,description=?,content=?,published_at=?,discovered_at=?,content_hash=?,status='analyzing',last_error=NULL,retry_after=NULL WHERE id=?",
-                                          [title,item.get('description','')[:2000],body[:14000],item.get('published_at','')[:100],now.isoformat(),content_hash,item_id])
+                        await db.execute("UPDATE source_items SET title=?,description=?,content=?,image_url=?,published_at=?,discovered_at=?,content_hash=?,status='analyzing',last_error=NULL,retry_after=NULL WHERE id=?",
+                                          [title,item.get('description','')[:2000],body[:14000],str(item.get('image_url') or '')[:1000],item.get('published_at','')[:100],now.isoformat(),content_hash,item_id])
                     else:
                         ins=await db.execute("INSERT INTO source_items(source_id,canonical_url,title,description,content,image_url,published_at,discovered_at,content_hash,status,category) VALUES(?,?,?,?,?,?,?,?,?,'analyzing',?) RETURNING id",
-                            [source_id,url,title,item.get('description','')[:2000],body[:14000],'',item.get('published_at','')[:100],now.isoformat(),content_hash,source.get('category','tech')])
+                            [source_id,url,title,item.get('description','')[:2000],body[:14000],str(item.get('image_url') or '')[:1000],item.get('published_at','')[:100],now.isoformat(),content_hash,source.get('category','tech')])
                         item_id=ins[0].get('id') if ins else 0
                     out=await ai_editorial_process(ai,item,source,recent_titles,weights,await get_manager_editorial_prompts(db))
                     if out.get('error'):
@@ -3094,10 +3127,12 @@ async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> b
     now_iso=datetime.now(timezone.utc).isoformat()
     schedule_filter="" if force else " AND (q.scheduled_at IS NULL OR q.scheduled_at <= ?)"
     params=[now_iso] if not force else []
-    rows=await db.execute("SELECT q.id as queue_id,q.article_id,a.* FROM publication_queue q JOIN articles a ON a.id=q.article_id WHERE q.status='queued' AND a.status='ready'"+schedule_filter+" ORDER BY q.scheduled_at ASC, a.score DESC, q.created_at ASC LIMIT 1",params)
+    rows=await db.execute("SELECT q.id as queue_id,q.article_id,a.*,COALESCE(NULLIF(a.image_url,''),si.image_url,'') AS recovered_image_url FROM publication_queue q JOIN articles a ON a.id=q.article_id LEFT JOIN source_items si ON si.id=a.source_item_id WHERE q.status='queued' AND a.status='ready'"+schedule_filter+" ORDER BY q.scheduled_at ASC, a.score DESC, q.created_at ASC LIMIT 1",params)
     if not rows:
         return False
     row=rows[0]; queue_id=row["queue_id"]; article_id=row["article_id"]
+    if not row.get("image_url") and row.get("recovered_image_url"):
+        row["image_url"]=row.get("recovered_image_url")
     await db.execute("UPDATE publication_queue SET status='publishing',attempts=attempts+1 WHERE id=?",[queue_id])
     try:
         token=row.get("deep_token")
@@ -3173,7 +3208,7 @@ async def automation_loop(db: D1Database, bot: Bot):
                 if enabled=='1':
                     cycle_started=datetime.now(timezone.utc)
                     await set_setting(db,'last_cycle_started_at',cycle_started.isoformat())
-                    max_workers=max(1,min(4,int(await get_setting(db,'max_workers','2'))))
+                    max_workers=max(1,min(6,int(await get_setting(db,'max_workers',str(DEFAULT_MAX_WORKERS)))))
                     due_sources=await db.execute("SELECT * FROM sources WHERE enabled=1 AND (next_check_at IS NULL OR next_check_at <= ?) ORDER BY priority ASC,next_check_at ASC LIMIT ?",[cycle_started.isoformat(),MAX_AUTOMATION_SOURCES])
                     # Publish due work first and protect a publication window that is close to its scheduled time.
                     await publish_next_article(db,bot)
@@ -3817,8 +3852,8 @@ async def cmd_about(message: Message, db: D1Database):
 @router.message(Command("help"))
 async def cmd_help(message: Message, db: D1Database):
     help_text=("❓ <b>راهنمای دستورات</b>\n\n"
-               "ℹ️ /about • این ربات چه میکند ؟\n"
-               "📞 /man • ارتباط")
+               "📞 /man • ➜ <b>ارتباط</b>\n"
+               "🔑 /about • ➜ <b>این ربات چیست ؟</b>")
     await message.answer(help_text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی",callback_data="user_home")]]))
 
 @router.message(Command("man"))
@@ -4761,12 +4796,11 @@ async def user_profile(call: CallbackQuery, db: D1Database):
 
 @router.callback_query(F.data == "user_help")
 async def user_help(call: CallbackQuery, db: D1Database):
-    about=await get_setting(db,"bot_about_text","")
-    about=sanitize_telegram_html(about or "🤖 <b>این ربات چیست؟</b>\n\nربات هوشمند تولید و انتشار محتوای فناوری، هوش مصنوعی و امنیت سایبری است.")
-    text=about+"\n\n❓ <b>راهنمای دستورات</b>\n\nℹ️ /about • این ربات چه میکند\n📞 /man • تماس با مدیر\n🚀 /start • شروع مجدد"
-    await call.message.edit_text(text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی",callback_data="user_home")]]))
+    help_text=("❓ <b>راهنمای دستورات</b>\n\n"
+               "📞 /man • ➜ <b>ارتباط</b>\n"
+               "🔑 /about • ➜ <b>این ربات چیست ؟</b>")
+    await call.message.edit_text(help_text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی",callback_data="user_home")]]))
     await call.answer()
-
 
 @router.callback_query(F.data == "auto_on")
 async def auto_on(call: CallbackQuery, db: D1Database):
@@ -5762,7 +5796,7 @@ async def set_default_interval(call: CallbackQuery, state: FSMContext, db: D1Dat
 @router.callback_query(F.data == "set_workers")
 async def set_workers(call: CallbackQuery, state: FSMContext, db: D1Database):
     current=await get_setting(db,"max_workers",str(DEFAULT_MAX_WORKERS))
-    await prompt_for_setting(call, state, "max_workers", f"⚡ تعداد Workerهای همزمان را بین 1 تا 4 بفرست.\nفعلاً روی <b>{html.escape(current)}</b> است.", "auto_channel")
+    await prompt_for_setting(call, state, "max_workers", f"⚡ تعداد Workerهای همزمان را بین 1 تا 6 بفرست.\nفعلاً روی <b>{html.escape(current)}</b> است.", "auto_channel")
 @router.callback_query(F.data == "set_ai_workers")
 async def set_ai_workers(call: CallbackQuery, state: FSMContext, db: D1Database):
     current=await get_setting(db,"max_ai_workers",str(DEFAULT_MAX_AI_WORKERS))
