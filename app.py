@@ -49,7 +49,7 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "10.27.0-smart-editorial-continuation-footer-format-safe"
+BUILD_VERSION = "10.27.6-quality-adfilter-about-schedule-image-safe"
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_MAX_AI_WORKERS = 3
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -71,8 +71,8 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "")
 AUTOMATION_ENABLED_DEFAULT = os.getenv("AUTOMATION_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 DEFAULT_SOURCE_INTERVAL_MINUTES = int(os.getenv("DEFAULT_SOURCE_INTERVAL_MINUTES", "15"))
 DEFAULT_MAX_DAILY_POSTS = int(os.getenv("MAX_DAILY_POSTS", "6"))
-DEFAULT_MIN_CONTENT_SCORE = float(os.getenv("MIN_CONTENT_SCORE", "65"))
-MANAGER_SCORE_TOLERANCE = float(os.getenv("MANAGER_SCORE_TOLERANCE", "8"))
+DEFAULT_MIN_CONTENT_SCORE = float(os.getenv("MIN_CONTENT_SCORE", "78"))
+MANAGER_SCORE_TOLERANCE = float(os.getenv("MANAGER_SCORE_TOLERANCE", "0"))
 DEFAULT_MIN_HOURS_BETWEEN_POSTS = float(os.getenv("MIN_HOURS_BETWEEN_POSTS", "2"))
 DEFAULT_MIN_POST_GAP_MINUTES = max(1, int(round(DEFAULT_MIN_HOURS_BETWEEN_POSTS * 60)))
 DEFAULT_PUBLISH_START_HOUR = int(os.getenv("PUBLISH_START_HOUR", "8"))
@@ -328,19 +328,44 @@ async def initialize_automation_database(db: D1Database):
         "last_cycle_started_at": "",
         "last_cycle_finished_at": "",
         "last_cycle_result": "",
+        "bot_about_text": "🤖 <b>این ربات چیست؟</b>\n\nاین ربات برای کشف، بررسی، تولید و انتشار هوشمند محتوای باکیفیت در حوزه فناوری، هوش مصنوعی و امنیت سایبری طراحی شده است.\n\nمحتوا بر اساس منابع واقعی بررسی می‌شود، موارد تکراری و تبلیغاتی کنار گذاشته می‌شوند و نسخه کامل‌تر مطالب از طریق ربات قابل مطالعه است.",
         "ai_verify_mode": AI_VERIFY_ENABLED_DEFAULT,
-        "weight_global": "15",
-        "weight_technology": "15",
+        "weight_global": "30",
+        "weight_technology": "20",
         "weight_ai": "15",
         "weight_cyber": "15",
-        "weight_education": "10",
-        "weight_iran": "15",
-        "weight_freshness": "10",
-        "weight_source": "5",
-        "weight_novelty": "10",
+        "weight_education": "5",
+        "weight_iran": "2",
+        "weight_freshness": "8",
+        "weight_source": "0",
+        "weight_novelty": "5",
     }
     for k, v in defaults.items():
         await db.execute("INSERT OR IGNORE INTO automation_settings(key, value) VALUES(?, ?)", [k, v])
+
+    # Safe one-time migration of the previous built-in quality profile.
+    # Customized manager values are never overwritten.
+    legacy_quality={
+        "min_content_score":"65",
+        "weight_global":"15","weight_technology":"15","weight_ai":"15",
+        "weight_cyber":"15","weight_education":"10","weight_iran":"15",
+        "weight_freshness":"10","weight_source":"5","weight_novelty":"10",
+    }
+    new_quality={
+        "min_content_score":"78",
+        "weight_global":"30","weight_technology":"20","weight_ai":"15",
+        "weight_cyber":"15","weight_education":"5","weight_iran":"2",
+        "weight_freshness":"8","weight_source":"0","weight_novelty":"5",
+    }
+    for qk, legacy_value in legacy_quality.items():
+        try:
+            qrows=await db.execute("SELECT value FROM automation_settings WHERE key=?",[qk])
+            current=str(qrows[0].get("value") or "") if qrows else ""
+            if current.strip()==legacy_value:
+                await set_setting(db,qk,new_quality[qk])
+        except Exception:
+            pass
+
     # Safe one-time migration: replace only the previous built-in editorial defaults.
     # A manager-customized prompt is never overwritten.
     legacy_prompts={
@@ -370,10 +395,8 @@ async def initialize_automation_database(db: D1Database):
         await db.execute("UPDATE ai_providers SET enabled=0, status='invalid', last_error='Environment Default disabled by managed-provider mode' WHERE name='Environment Default'")
     except Exception:
         pass
-    # Privacy/storage policy: image URLs are transient and never retained in D1.
+    # Image URLs are retained because they are required for reliable publication.
     try:
-        await db.execute("UPDATE source_items SET image_url='' WHERE image_url IS NOT NULL AND image_url!=''")
-        await db.execute("UPDATE articles SET image_url='' WHERE image_url IS NOT NULL AND image_url!=''")
         cutoff=(datetime.now(timezone.utc)-timedelta(days=CONTENT_RETENTION_DAYS)).isoformat()
         await db.execute("DELETE FROM source_items WHERE discovered_at < ?", [cutoff])
     except Exception:
@@ -440,11 +463,8 @@ async def cleanup_automation_data(db: D1Database):
     cutoff_logs = (now - timedelta(days=LOG_RETENTION_DAYS)).isoformat()
     await db.execute("DELETE FROM automation_logs WHERE created_at < ?", [cutoff_logs])
     # source_items is the short-lived duplicate-detection cache. Keep it for one day only.
-    # Generated articles remain in `articles` for admin history/editing.
+    # Generated articles and their image URLs remain available for publication/history.
     await db.execute("DELETE FROM source_items WHERE discovered_at < ?", [cutoff_content])
-    # Images are transient transport data, never persistent content data.
-    await db.execute("UPDATE source_items SET image_url='' WHERE image_url IS NOT NULL AND image_url!=''")
-    await db.execute("UPDATE articles SET image_url='' WHERE image_url IS NOT NULL AND image_url!=''")
     await db.execute("DELETE FROM publication_queue WHERE status IN ('published','failed') AND created_at < ?", [cutoff_content])
     await set_setting(db, "last_cleanup_at", now.isoformat())
 
@@ -961,6 +981,22 @@ AD_DISCLOSURE_HARD = [
 AD_URL_MARKERS_HARD = [
     "/sponsored", "/advertorial", "/advertisement", "/advertising/",
     "/promo/", "/promotions/", "/affiliate/", "/paid-partnership",
+    "apply-now", "/register-now", "/sponsorship", "/sponsor/",
+]
+
+PROMO_ACTION_TERMS = [
+    "apply now", "apply today", "register now", "sign up now", "reserve your spot",
+    "book now", "join now", "applications open", "deadline to apply", "همین حالا ثبت نام", "همین حالا ثبت‌نام", "ثبت نام کنید",
+    "ثبت‌نام کنید", "درخواست میزبانی", "ثبت درخواست", "رزرو کنید", "میزبانی کنید", "مهلت ثبت نام", "مهلت ثبت‌نام", "مهلت درخواست", "ثبت نام تا", "ثبت‌نام تا", "درخواست تا",
+    "حامی شوید", "اسپانسر شوید",
+]
+
+EVENT_PROMO_TERMS = [
+    "side event", "side events", "رویداد جانبی", "رویدادهای جانبی", "host an event",
+    "host your event", "میزبانی رویداد", "میزبانی رویداد جانبی", "sponsorship", "sponsor",
+    "اسپانسر", "showcase", "showcase your", "معرفی محصولات و خدمات", "محصولات و خدمات خود",
+    "معرفی محصولات", "networking opportunity", "فرصت شبکه سازی", "فرصت شبکه‌سازی",
+    "سرمایه گذاران", "سرمایه‌گذاران", "رسانه ها", "رسانه‌ها",
 ]
 
 PROMO_TERMS_STRONG = [
@@ -996,6 +1032,22 @@ def is_promotional_content(title: str, body: str, description: str, url: str = "
         if marker in url_n:
             return True, f"مسیر URL تبلیغاتی است: {marker}"
 
+    # Recruitment/event-promotion detection is independent of discount vocabulary.
+    # This catches pages such as invitations to host side events, sponsor, showcase
+    # products/services, or register by a deadline.
+    action_hits=[x for x in PROMO_ACTION_TERMS if x in combined or x in title_n]
+    event_hits=[x for x in EVENT_PROMO_TERMS if x in combined]
+    if action_hits and len(set(event_hits)) >= 2:
+        return True, f"فراخوان تبلیغاتی/تجاری برای ثبت‌نام یا میزبانی: {action_hits[0]}"
+    if any(x in combined for x in ("مهلت ثبت نام","مهلت ثبت‌نام","deadline to apply","applications open","ثبت نام تا","ثبت‌نام تا")) and len(set(event_hits)) >= 2:
+        return True, "فراخوان ثبت‌نام/میزبانی رویداد با هدف بازاریابی و شبکه‌سازی"
+    if any(x in title_n for x in ("فرصت میزبانی رویداد","فرصت میزبانی رویداد جانبی","میزبانی رویداد جانبی")) and len(set(event_hits)) >= 2:
+        return True, "دعوت تبلیغاتی برای میزبانی رویداد جانبی"
+    if re.search(r"apply[- ]?now[^.]{0,120}(host|sponsor|side event)", combined, re.I):
+        return True, "صفحه فراخوان تجاری برای میزبانی/اسپانسرینگ رویداد"
+    if re.search(r"(host|sponsor)[^.]{0,120}(side event|sponsorship)", combined, re.I):
+        return True, "صفحه فراخوان تجاری برای میزبانی/اسپانسرینگ رویداد"
+
     promo_hits = [term for term in PROMO_TERMS_STRONG if term in combined]
     if not promo_hits and re.search(r"\b\d{1,3}\s*%\s*(?:off|discount)\b", combined, re.I):
         promo_hits.append("percent-off")
@@ -1024,6 +1076,18 @@ def is_promotional_content(title: str, body: str, description: str, url: str = "
     }
     if any(term in explicit_cta for term in promo_hits):
         return True, f"عبارت تبلیغاتی صریح: {promo_hits[0]}"
+
+    # Event/sponsorship recruitment can be advertising even without discount words.
+    action_hits=[term for term in PROMO_ACTION_TERMS if term in combined or term in title_n]
+    event_hits=[term for term in EVENT_PROMO_TERMS if term in combined]
+    if action_hits and len(set(event_hits)) >= 2:
+        return True, f"دعوت تجاری/تبلیغاتی برای ثبت‌نام یا میزبانی: {action_hits[0]}"
+    if re.search(r"apply[- ]?now[^.]{0,120}(host|sponsor|side event)", combined, re.I):
+        return True, "صفحه فراخوان تجاری برای میزبانی/اسپانسرینگ رویداد"
+    if re.search(r"(host|sponsor)[^.]{0,120}(side event|sponsorship)", combined, re.I):
+        return True, "صفحه فراخوان تجاری برای میزبانی/اسپانسرینگ رویداد"
+    if any(x in title_n for x in ("apply now", "register now", "sign up now")) and any(x in title_n or x in combined for x in EVENT_PROMO_TERMS):
+        return True, "عنوان دارای فراخوان ثبت‌نام تجاری/رویدادی است"
 
     # Bare "offer" or a simple mention of a discount without commercial context
     # is intentionally NOT rejected; this preserves legitimate product/news reporting.
@@ -2400,18 +2464,14 @@ def format_source_publication_date(raw: str) -> str:
         return ""
 
 def manager_accepts_score(score: float, min_score: float) -> bool:
-    """Manager-first gate with a small tolerance, never a hidden quality veto.
-    0/1 remains the intentional "accept all fresh, non-duplicate" mode.
-    For normal thresholds we allow a small 8-point margin so one borderline
-    score does not unnecessarily starve the queue.
-    """
+    """Strict manager gate: the configured threshold is the actual threshold."""
     try:
         score=float(score or 0); minimum=float(min_score or 0)
     except Exception:
         return False
     if minimum <= 1:
         return True
-    return score >= max(0.0, minimum - MANAGER_SCORE_TOLERANCE)
+    return score >= max(0.0, minimum)
 
 
 def _persian_ratio(text: str) -> float:
@@ -2536,6 +2596,10 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
 
 قانون ضدتکرار: عنوان و پاراگراف آغازین نباید یک مفهوم را چند بار با عبارت‌های مختلف تکرار کنند. هر نکته فقط یک‌بار و در مناسب‌ترین جای متن بیان شود. در نسخه کانال، چند جمله اول باید یک چکیده مفهومی واحد بسازند و سپس فقط جزئیات جدید اضافه کنند. از قرار دادن چند تیتر متوالی یا تیترهای هم‌معنی خودداری کن؛ متن باید با یک عنوان اصلی شروع شود و بلافاصله وارد محتوای واقعی خبر شود.
 
+قانون معرفی موجودیت کلیدی: هرگاه برای اولین بار نام یک شرکت، برند، محصول، مدل، سرویس، فرد کلیدی، سازمان یا فناوری مهم وارد متن می‌شود، قبل از ادامه بحث یک معرفی بسیار کوتاه و طبیعی از آن بده؛ مثال: «Zimbra (یک پلتفرم ایمیل و همکاری سازمانی) ...». این معرفی فقط در اولین اشاره انجام شود و تکرار نشود. برای افراد یا سخنگویانی که نقل‌قول می‌شوند نیز در اولین اشاره معرفی کوتاه لازم است.
+
+قانون لحن: متن باید صمیمی، دوستانه، روان و طبیعی باشد؛ رسمی و خشک نباشد. صمیمی بودن به معنی شوخی یا عامیانه‌نویسی افراطی نیست؛ لحن باید مثل یک سردبیر فناوری خوش‌بیان باشد.
+
 قانون زبان: متن نهایی باید فارسی باشد. نام مدل، شرکت، محصول و اصطلاح فنی را فقط در حد لازم نگه دار. هیچ جمله یا پاراگراف انگلیسی تولید نکن و هیچ جمله‌ای را با یک کلمه انگلیسی آغاز نکن، مگر اینکه خودِ نام رسمی یک مدل/محصول/شرکت باشد و جایگزین فارسی طبیعی نداشته باشد.
 
 این دو دستور فقط سیاست محتوایی را تعیین می‌کنند؛ قوانین Formatting، ایموجی، Bold، Italic، Quote و زیباسازی همان renderer فعلی ربات هستند و نباید تغییر کنند.
@@ -2624,9 +2688,13 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
         "education":float(obj.get("education_relevance",5) or 0),
         "iran":float(obj.get("iran_relevance",0) or 0),
         "freshness":float(obj.get("freshness",5) or 0),
-        "source":max(0,min(10,float(source.get("trust_score") or 80)/10)),
         "novelty":10-max(0,min(10,float(obj.get("duplicate_risk",0) or 0)))
     }
+    global_score=dims["global"]; major_score=max(dims["technology"],dims["ai"],dims["cyber"],dims["education"]); iran_score=dims["iran"]
+    if global_score < 4 and major_score < 6 and iran_score < 4:
+        obj["score"]=0
+        obj["why"]=(str(obj.get("why") or "").strip()+" | رد: اهمیت جهانی/فناوری کافی برای کانال ندارد").strip(" |")
+        return {**obj,"ai":result,"hard_reject":True,"hard_reject_reason":"low_global_or_technical_relevance"}
     total_weight=sum(max(0,float(weights.get(k,0))) for k in dims)
     weighted=sum(max(0,min(10,v))*max(0,float(weights.get(k,0))) for k,v in dims.items())
     obj["score"]=round((weighted/(total_weight*10))*100,1) if total_weight else round(float(obj.get("score",0) or 0),1)
@@ -2684,7 +2752,7 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
             erows=await db.execute(f"SELECT id,canonical_url,status,retry_after FROM source_items WHERE source_id=? AND canonical_url IN ({ph})", [source_id,*candidate_urls])
             existing_item_map={normalize_url(r.get('canonical_url') or ''):r for r in erows}
 
-        weight_keys=['global','technology','ai','cyber','education','iran','freshness','source','novelty']
+        weight_keys=['global','technology','ai','cyber','education','iran','freshness','novelty']
         weights={k:float(await get_setting(db,f'weight_{k}','10')) for k in weight_keys}
         sem=asyncio.Semaphore(max(1,min(4,int(await get_setting(db,'max_ai_workers','3')))))
         async def process_one(raw):
@@ -2986,6 +3054,16 @@ def publication_caption(title: str, channel_html: str, deep_link: Optional[str] 
     return (html.escape(plain,quote=False)+tail_text).strip()
 
 
+async def seconds_until_next_due_publication(db: D1Database) -> Optional[float]:
+    rows=await db.execute("SELECT q.scheduled_at FROM publication_queue q JOIN articles a ON a.id=q.article_id WHERE q.status='queued' AND a.status='ready' AND q.scheduled_at IS NOT NULL ORDER BY q.scheduled_at ASC LIMIT 1")
+    if not rows or not rows[0].get('scheduled_at'):
+        return None
+    dt=parse_publication_datetime(str(rows[0].get('scheduled_at') or ''))
+    if not dt:
+        return None
+    return (dt-datetime.now(timezone.utc)).total_seconds()
+
+
 async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> bool:
     if force:
         channel_id=await get_channel_id(db)
@@ -2999,7 +3077,7 @@ async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> b
     now_iso=datetime.now(timezone.utc).isoformat()
     schedule_filter="" if force else " AND (q.scheduled_at IS NULL OR q.scheduled_at <= ?)"
     params=[now_iso] if not force else []
-    rows=await db.execute("SELECT q.id as queue_id,q.article_id,a.* FROM publication_queue q JOIN articles a ON a.id=q.article_id WHERE q.status='queued' AND a.status='ready'"+schedule_filter+" ORDER BY COALESCE(a.source_published_at,a.created_at) DESC, a.score DESC, q.created_at ASC LIMIT 1",params)
+    rows=await db.execute("SELECT q.id as queue_id,q.article_id,a.* FROM publication_queue q JOIN articles a ON a.id=q.article_id WHERE q.status='queued' AND a.status='ready'"+schedule_filter+" ORDER BY q.scheduled_at ASC, a.score DESC, q.created_at ASC LIMIT 1",params)
     if not rows:
         return False
     row=rows[0]; queue_id=row["queue_id"]; article_id=row["article_id"]
@@ -3021,16 +3099,23 @@ async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> b
         attach_bot=should_attach_bot_link(channel_text, article_body, content_type)
         navigation_link=deep_link if attach_bot else None
         image_url=await resolve_article_image(db,row)
+        final_text=publication_caption(title_out,channel_text,navigation_link)
         sent=None
         if image_url:
             try:
-                sent=await bot.send_photo(chat_id=channel_id,photo=image_url,caption=publication_caption(title_out,channel_text,navigation_link),parse_mode="HTML")
+                sent=await bot.send_photo(chat_id=channel_id,photo=image_url,caption=final_text,parse_mode="HTML")
             except Exception as img_error:
-                await log_automation(db,"WARN","source_image_failed",f"article={article_id} {img_error}")
+                await log_automation(db,"WARN","source_image_caption_failed",f"article={article_id} {img_error}")
+                # Preserve the image even if a caption-specific send fails, then deliver
+                # the exact formatted content as a companion message.
+                try:
+                    sent=await bot.send_photo(chat_id=channel_id,photo=image_url)
+                    await bot.send_message(chat_id=channel_id,text=final_text[:4096],parse_mode="HTML",disable_web_page_preview=True)
+                except Exception as photo_error:
+                    await log_automation(db,"WARN","source_image_failed",f"article={article_id} {photo_error}")
+                    sent=None
         if sent is None:
-            # Never publish an unrelated placeholder image. If the source has no usable image,
-            # publish the real formatted text instead.
-            final_text=publication_caption(title_out,channel_text,navigation_link)
+            # No usable image: publish the real formatted text instead.
             sent=await bot.send_message(chat_id=channel_id,text=final_text[:4096],parse_mode="HTML",disable_web_page_preview=True)
         published_at=datetime.now(timezone.utc).isoformat()
         await db.execute("UPDATE articles SET status='published',published_message_id=?,published_at=? WHERE id=?",[getattr(sent,"message_id",0),published_at,article_id])
@@ -3073,15 +3158,21 @@ async def automation_loop(db: D1Database, bot: Bot):
                     await set_setting(db,'last_cycle_started_at',cycle_started.isoformat())
                     max_workers=max(1,min(4,int(await get_setting(db,'max_workers','2'))))
                     due_sources=await db.execute("SELECT * FROM sources WHERE enabled=1 AND (next_check_at IS NULL OR next_check_at <= ?) ORDER BY priority ASC,next_check_at ASC LIMIT ?",[cycle_started.isoformat(),MAX_AUTOMATION_SOURCES])
-                    # Try publication first, then refill queue, then publish again.
+                    # Publish due work first and protect a publication window that is close to its scheduled time.
                     await publish_next_article(db,bot)
+                    urgent_due=await seconds_until_next_due_publication(db)
+                    if urgent_due is not None and urgent_due <= 30.0:
+                        if urgent_due > 0.25:
+                            await asyncio.sleep(min(urgent_due,30.0))
+                        await publish_next_article(db,bot)
                     sem=asyncio.Semaphore(max_workers)
                     async def run_source(src):
                         async with sem:
                             await set_setting(db,'worker_heartbeat_at',datetime.now(timezone.utc).isoformat())
                             return await fetch_source_cycle(db,src,ai)
                     results=[]
-                    if due_sources:
+                    urgent_after_wait=await seconds_until_next_due_publication(db)
+                    if due_sources and not (urgent_after_wait is not None and urgent_after_wait <= 8.0):
                         results=await asyncio.gather(*(run_source(src) for src in due_sources),return_exceptions=True)
                     published=await publish_next_article(db,bot)
                     summary={
@@ -3107,7 +3198,7 @@ async def automation_loop(db: D1Database, bot: Bot):
                 await log_automation(db,'ERROR','automation_loop_failed',str(e)[:1500])
                 await set_setting(db,'last_cycle_result',json.dumps({'error':str(e)[:1000]},ensure_ascii=False))
                 await set_setting(db,'worker_heartbeat_at',datetime.now(timezone.utc).isoformat())
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.5)
     finally:
         await ai.close()
 
@@ -3228,6 +3319,7 @@ def automation_menu_kb(enabled: bool) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🌐 منابع خبری", callback_data="auto_sources"), InlineKeyboardButton(text="🤖 مدل‌های AI", callback_data="auto_providers")],
         [InlineKeyboardButton(text="📢 انتشار و زمان‌بندی", callback_data="auto_channel"), InlineKeyboardButton(text="🧠 کیفیت محتوا", callback_data="auto_quality")],
         [InlineKeyboardButton(text="🗃 محتوا و داده‌ها", callback_data="auto_content_db")],
+        [InlineKeyboardButton(text="ℹ️ درباره ربات", callback_data="bot_about_admin")],
         [InlineKeyboardButton(text="🧪 تست و سلامت", callback_data="auto_health"), InlineKeyboardButton(text="📊 گزارش", callback_data="auto_report")],
         [InlineKeyboardButton(text="🔙 پنل اصلی", callback_data="admin_home")]
     ])
@@ -3703,9 +3795,18 @@ async def deliver_article_by_token(message: Message, bot: Bot, db: D1Database, t
             first=False
     return True
 
+@router.message(Command("about"))
+async def cmd_about(message: Message, db: D1Database):
+    about=await get_setting(db,"bot_about_text","")
+    about=sanitize_telegram_html(about or "🤖 <b>این ربات چیست؟</b>\n\nربات هوشمند تولید و انتشار محتوای فناوری، هوش مصنوعی و امنیت سایبری است.")
+    await message.answer(about,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی",callback_data="user_home")]]))
+
 @router.message(Command("help"))
-async def cmd_help(message: Message):
-    await message.answer("🌐 /help • help ➜ راهنما\n📞 /man • man ➜ تماس با مدیر\n🚀 /start • start ➜ شروع\n✨ انتخاب کن و شروع کن 🚀", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="user_home")]]))
+async def cmd_help(message: Message, db: D1Database):
+    about=await get_setting(db,"bot_about_text","")
+    about=sanitize_telegram_html(about or "🤖 <b>این ربات چیست؟</b>\n\nربات هوشمند تولید و انتشار محتوای فناوری، هوش مصنوعی و امنیت سایبری است.")
+    help_text=about+"\n\n❓ <b>راهنمای دستورات</b>\n\n🌐 /help • راهنما\nℹ️ /about • درباره ربات\n📞 /man • تماس با مدیر\n🚀 /start • شروع"
+    await message.answer(help_text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی",callback_data="user_home")]]))
 
 @router.message(Command("man"))
 async def cmd_man(message: Message, state: FSMContext):
@@ -4082,7 +4183,7 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
             await message.answer("⛔ شما دسترسی مدیریت ندارید.")
             
     elif text == "❓ راهنما":
-        await message.answer("🌐 /help • راهنما\n📞 /man • تماس با مدیر\n🚀 /start • شروع", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="user_home")]]))
+        await message.answer("🌐 /help • راهنما\nℹ️ /about • درباره ربات\n📞 /man • تماس با مدیر\n🚀 /start • شروع", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="user_home")]]))
         
     elif text == "👤 پروفایل":
         rows = await db.execute("SELECT joined_at, role FROM users WHERE id = ?", [user_id])
@@ -4243,6 +4344,12 @@ async def admin_automation_setting_input(message:Message,state:FSMContext,db:D1D
             if not value: raise ValueError("پرامپت نمی‌تواند خالی باشد.")
             if len(value)>5000: value=value[:5000]
             await set_setting(db,key,value)
+        elif key=="bot_about_text":
+            if not value: raise ValueError("متن About نمی‌تواند خالی باشد.")
+            if len(value)>3500: value=value[:3500]
+            clean=sanitize_telegram_html(value)
+            if not strip_html_text(clean): raise ValueError("متن قابل نمایش نیست.")
+            await set_setting(db,key,clean); parent="bot_about_admin"
         elif key in {"min_hours_between_posts","min_post_gap_minutes"}:
             minutes=max(1,int(float(value)))
             await set_setting(db,"min_post_gap_minutes",str(minutes))
@@ -4283,7 +4390,7 @@ async def admin_automation_setting_input(message:Message,state:FSMContext,db:D1D
                 kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✍️ ویرایش کوتاه',callback_data='set_editorial_prompt_channel')],[InlineKeyboardButton(text='📝 ویرایش کامل',callback_data='set_editorial_prompt_article')],[InlineKeyboardButton(text='♻️ پیش‌فرض',callback_data='editorial_prompts_reset')],[InlineKeyboardButton(text='🔙 کیفیت محتوا',callback_data='auto_quality')]])
                 await bot.edit_message_text(chat_id=message.chat.id,message_id=panel_id,text=text,parse_mode='HTML',reply_markup=kb)
             elif parent=="quality_weights":
-                labels=[("global","🌍 جهانی"),("technology","💻 فناوری"),("ai","🤖 AI"),("cyber","🔐 سایبری"),("education","📚 آموزش"),("iran","🇮🇷 ایران/فارسی"),("freshness","🆕 تازگی"),("source","✅ منبع"),("novelty","♻️ عدم تکرار")]
+                labels=[("global","🌍 جهانی"),("technology","💻 فناوری"),("ai","🤖 AI"),("cyber","🔐 سایبری"),("education","📚 آموزش"),("iran","🇮🇷 ایران/فارسی"),("freshness","🆕 تازگی"),("novelty","♻️ عدم تکرار")]
                 text="🎯 <b>وزن معیارها</b>\n\n"+ "\n".join([f"{lab}: <b>{await get_setting(db,'weight_'+k,'10')}</b>" for k,lab in labels])
                 rows=[[InlineKeyboardButton(text=lab,callback_data="weight_"+k)] for k,lab in labels]
                 rows.append([InlineKeyboardButton(text="🔙 کیفیت محتوا",callback_data="auto_quality")])
@@ -4326,6 +4433,33 @@ async def admin_automation(call: CallbackQuery, db: D1Database):
     enabled = (await get_setting(db, 'automation_enabled', '0')) == '1'
     await call.message.edit_text(await automation_overview(db), parse_mode='HTML', reply_markup=automation_menu_kb(enabled))
 
+
+@router.callback_query(F.data == "bot_about_admin")
+async def bot_about_admin(call: CallbackQuery, db: D1Database):
+    if call.from_user.id != ADMIN_ID: return
+    text=await get_setting(db,"bot_about_text","")
+    preview=sanitize_telegram_html(text or "")
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ ویرایش درباره ربات",callback_data="set_bot_about")],
+        [InlineKeyboardButton(text="♻️ بازگردانی پیش‌فرض",callback_data="reset_bot_about")],
+        [InlineKeyboardButton(text="🔙 اتوماسیون محتوا",callback_data="admin_automation")]
+    ])
+    await call.message.edit_text("ℹ️ <b>درباره ربات</b>\n\n"+(preview[:3800] if preview else "متنی تنظیم نشده است."),parse_mode='HTML',reply_markup=kb)
+    await call.answer()
+
+@router.callback_query(F.data == "reset_bot_about")
+async def reset_bot_about(call: CallbackQuery, db: D1Database):
+    if call.from_user.id != ADMIN_ID: return
+    default="🤖 <b>این ربات چیست؟</b>\n\nاین ربات برای کشف، بررسی، تولید و انتشار هوشمند محتوای باکیفیت در حوزه فناوری، هوش مصنوعی و امنیت سایبری طراحی شده است.\n\nمحتوا بر اساس منابع واقعی بررسی می‌شود، موارد تکراری و تبلیغاتی کنار گذاشته می‌شوند و نسخه کامل‌تر مطالب از طریق ربات قابل مطالعه است."
+    await set_setting(db,"bot_about_text",default)
+    await bot_about_admin(call,db)
+
+@router.callback_query(F.data == "set_bot_about")
+async def set_bot_about(call: CallbackQuery, state: FSMContext, db: D1Database):
+    if call.from_user.id != ADMIN_ID: return
+    current=await get_setting(db,"bot_about_text","")
+    prompt_text="ℹ️ <b>متن About</b>\n\nمتن دلخواه را بفرست. Telegram HTML مجاز است: &lt;b&gt; &lt;i&gt; &lt;u&gt; &lt;s&gt; &lt;code&gt; &lt;pre&gt; &lt;a&gt; و Emoji.\n\nفعلی:\n<code>"+html.escape(current[:2200])+"</code>"
+    await prompt_for_setting(call,state,"bot_about_text",prompt_text,"bot_about_admin")
 
 @router.callback_query(F.data == "admin_ai")
 async def admin_ai(call: CallbackQuery, db: D1Database):
@@ -4540,6 +4674,7 @@ async def cancel_state(call: CallbackQuery, state: FSMContext, db: D1Database):
         if parent.startswith("provider_view_"): await provider_view(call,db); return
         if parent.startswith("source_view_"): await source_view(call,db); return
         if parent=="auto_sources": await auto_sources(call,db); return
+        if parent=="bot_about_admin": await bot_about_admin(call,db); return
     except Exception:
         pass
     if call.from_user.id==ADMIN_ID:
@@ -4628,8 +4763,11 @@ async def user_profile(call: CallbackQuery, db: D1Database):
 
 
 @router.callback_query(F.data == "user_help")
-async def user_help(call: CallbackQuery):
-    await call.message.edit_text("❓ <b>راهنما</b>\n\n/start • شروع\n/help • راهنما\n/man • تماس با مدیر", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="user_home")]]))
+async def user_help(call: CallbackQuery, db: D1Database):
+    about=await get_setting(db,"bot_about_text","")
+    about=sanitize_telegram_html(about or "🤖 <b>این ربات چیست؟</b>\n\nربات هوشمند تولید و انتشار محتوای فناوری، هوش مصنوعی و امنیت سایبری است.")
+    text=about+"\n\n❓ <b>راهنمای دستورات</b>\n\n/start • شروع\n/help • راهنما\n/about • درباره ربات\n/man • تماس با مدیر"
+    await call.message.edit_text(text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی",callback_data="user_home")]]))
     await call.answer()
 
 
@@ -5133,8 +5271,8 @@ async def quality_about(call: CallbackQuery):
             '🇮🇷 ارتباط با ایران و فارسی‌زبانان\n'
             '🆕 تازگی و ارزش خبری\n'
             '♻️ تکراری نبودن\n'
-            '✅ اعتبار و کیفیت منبع\n\n'
-            'محتوای ضعیف یا مبهم منتشر نمی‌شود؛ کیفیت بر تعداد اولویت دارد.')
+            '♻️ عدم تکرار\n\n'
+            'محتوای ضعیف، تبلیغاتی، بسیار محلی یا مبهم منتشر نمی‌شود؛ کیفیت و اهمیت واقعی بر تعداد اولویت دارد.')
     await call.message.edit_text(text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔙 کیفیت محتوا', callback_data='auto_quality')]]))
     await call.answer()
 
@@ -5222,7 +5360,7 @@ async def set_weight_novelty(call:CallbackQuery,state:FSMContext):
 @router.callback_query(F.data == "quality_weights")
 async def quality_weights(call:CallbackQuery,db:D1Database):
     await call.answer()
-    items=[("global","🌍 اهمیت جهانی"),("technology","💻 فناوری"),("ai","🤖 هوش مصنوعی"),("cyber","🔐 امنیت سایبری"),("education","📚 آموزش"),("iran","🇮🇷 ایران/فارسی"),("freshness","🆕 تازگی"),("source","✅ اعتبار منبع"),("novelty","♻️ عدم تکرار")]
+    items=[("global","🌍 اهمیت جهانی"),("technology","💻 فناوری"),("ai","🤖 هوش مصنوعی"),("cyber","🔐 امنیت سایبری"),("education","📚 آموزش"),("iran","🇮🇷 ایران/فارسی"),("freshness","🆕 تازگی"),("novelty","♻️ عدم تکرار")]
     text="🎯 <b>وزن معیارها</b>\nعدد بالاتر = اهمیت بیشتر.\n\n"; rows=[]
     pairs=[]
     for k,label in items:
@@ -5395,7 +5533,7 @@ async def health_dry_run(call:CallbackQuery,db:D1Database,bot:Bot):
         await edit_health_progress(call.message,health_progress_block(2,6,"محتوا پیدا شد",f"منبع: {src.get('name')}\nعنوان: {item.get('title')[:180]}"))
         test_hash=item.get('_test_hash') or text_hash((item.get('title') or '')+' '+(item.get('body') or item.get('description') or ''))
         await db.execute("INSERT INTO test_history(source_url,content_hash,title,tested_at) VALUES(?,?,?,?)",[item.get('url') or '',test_hash,item.get('title') or '',datetime.now(timezone.utc).isoformat()])
-        weights={k:float(await get_setting(db,'weight_'+k,'10')) for k in ['global','technology','ai','cyber','education','iran','freshness','source','novelty']}
+        weights={k:float(await get_setting(db,'weight_'+k,'10')) for k in ['global','technology','ai','cyber','education','iran','freshness','novelty']}
         out=await ai_editorial_process(ai,item,src,[],weights,await get_manager_editorial_prompts(db))
         if out.get('error'):
             await edit_health_progress(call.message,"❌ <b>تست تولید شکست خورد</b>\n\n<code>"+html.escape(str(out['error'])[:1800])+"</code>", get_admin_back_kb("auto_health")); return
@@ -5496,7 +5634,7 @@ async def health_test_publish(call:CallbackQuery,db:D1Database,bot:Bot):
         await edit_health_progress(call.message,health_progress_block(2,6,'Candidate واقعی پیدا شد',f"منبع: {src.get('name')}\n{item.get('title')[:180]}"))
         test_hash=item.get('_test_hash') or text_hash((item.get('title') or '')+' '+(item.get('body') or item.get('description') or ''))
         await db.execute("INSERT INTO test_history(source_url,content_hash,title,tested_at) VALUES(?,?,?,?)",[item.get('url') or '',test_hash,item.get('title') or '',datetime.now(timezone.utc).isoformat()])
-        weights={k:float(await get_setting(db,'weight_'+k,'10')) for k in ['global','technology','ai','cyber','education','iran','freshness','source','novelty']}
+        weights={k:float(await get_setting(db,'weight_'+k,'10')) for k in ['global','technology','ai','cyber','education','iran','freshness','novelty']}
         out=await ai_editorial_process(ai,item,src,[],weights,await get_manager_editorial_prompts(db))
         if out.get('error'): raise RuntimeError(out['error'])
         # Test publication obeys only the manager's numeric threshold.
@@ -5525,12 +5663,16 @@ async def health_test_publish(call:CallbackQuery,db:D1Database,bot:Bot):
         await edit_health_progress(call.message,health_progress_block(4,6,'نسخه نهایی کانال آماده شد','Footer الزامی اضافه شد؛ CTA ربات فقط در صورت وجود محتوای بیشتر نمایش داده می‌شود.'))
         photo=item.get('image_url') or ''
         sent=None
+        test_caption=publication_caption(str(out.get('title') or item.get('title') or 'مطلب'),channel_html,navigation_link)
         if photo:
-            try: sent=await bot.send_photo(channel,photo=photo,caption=publication_caption(str(out.get('title') or item.get('title') or 'مطلب'),channel_html,navigation_link),parse_mode='HTML')
-            except Exception: sent=None
+            try: sent=await bot.send_photo(channel,photo=photo,caption=test_caption,parse_mode='HTML')
+            except Exception:
+                try:
+                    sent=await bot.send_photo(channel,photo=photo)
+                    await bot.send_message(channel,text=test_caption[:4096],parse_mode='HTML',disable_web_page_preview=True)
+                except Exception: sent=None
         if sent is None:
-            final_text=publication_caption(str(out.get('title') or item.get('title') or 'مطلب'),channel_html,navigation_link)
-            sent=await bot.send_message(channel,text=final_text[:4096],parse_mode='HTML',disable_web_page_preview=True)
+            sent=await bot.send_message(channel,text=test_caption[:4096],parse_mode='HTML',disable_web_page_preview=True)
         await db.execute("UPDATE articles SET published_message_id=?,published_at=? WHERE id=?",[getattr(sent,'message_id',0),now,aid])
         await edit_health_progress(call.message,health_progress_block(5,6,'✅ انتشار انجام شد','در حال نهایی‌کردن نتیجه و لینک تست…'))
         result=("✅ <b>تست انتشار واقعی موفق شد.</b>\n\n"
