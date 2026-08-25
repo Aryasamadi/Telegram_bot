@@ -49,7 +49,7 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "10.27.8-help-image-speed-fix"
+BUILD_VERSION = "10.27.9-queue-edit-d1-optimized"
 DEFAULT_MAX_WORKERS = 6
 DEFAULT_MAX_AI_WORKERS = 4
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -178,44 +178,52 @@ class D1Database:
                 await session.close()
 
     async def execute_batch(self, queries: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        """Execute multiple D1 REST queries in one HTTP request."""
+        if not queries:
+            return []
         session = self.session
         temporary_session = False
         if session is None or session.closed:
             session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS))
             temporary_session = True
-        output = []
         try:
-            for query in queries:
-                    payload = {"sql": query["sql"]}
-                    if query.get("params"):
-                        payload["params"] = query["params"]
+            payload = {
+                "batch": [
+                    {"sql": q["sql"], **({"params": q["params"]} if q.get("params") else {})}
+                    for q in queries
+                ]
+            }
+            async with session.post(self.url, headers=self.headers, json=payload) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.error(f"D1 Batch API Error (status {resp.status}): {body}")
+                    raise Exception(f"Cloudflare D1 Batch API returned status {resp.status}: {body}")
 
-                    async with session.post(self.url, headers=self.headers, json=payload) as resp:
-                        if resp.status != 200:
-                            text = await resp.text()
-                            logger.error(f"D1 Batch API Error (status {resp.status}): {text}")
-                            raise Exception(f"Cloudflare D1 Batch API returned status {resp.status}: {text}")
-                        
-                        data = await resp.json()
-                        if not data.get("success"):
-                            errors = data.get("errors", [])
-                            logger.error(f"D1 Batch Query failed: {errors}")
-                            raise Exception(f"D1 Batch Query failed: {errors}")
-                        
-                        result = data.get("result", [])
-                        if isinstance(result, list) and len(result) > 0:
-                            output.append(result[0].get("results", []))
-                        elif isinstance(result, dict):
-                            output.append(result.get("results", []))
-                        else:
-                            output.append([])
-            return output
+                data = await resp.json()
+                if not data.get("success"):
+                    errors = data.get("errors", [])
+                    logger.error(f"D1 Batch Query failed: {errors}")
+                    raise Exception(f"D1 Batch Query failed: {errors}")
+
+                result = data.get("result", [])
+                if isinstance(result, dict):
+                    result = [result]
+
+                output: List[List[Dict[str, Any]]] = []
+                for item in result if isinstance(result, list) else []:
+                    output.append(item.get("results", []) if isinstance(item, dict) else [])
+
+                # Keep positional compatibility if the API returns fewer result objects.
+                if len(output) < len(queries):
+                    output.extend([[] for _ in range(len(queries) - len(output))])
+                return output
         except Exception as e:
             logger.error(f"Error executing batch queries. Error: {e}")
-            raise e
+            raise
         finally:
             if temporary_session:
                 await session.close()
+
 
 
 async def initialize_database(db: D1Database):
@@ -279,6 +287,8 @@ async def initialize_automation_database(db: D1Database):
         {"sql": "CREATE TABLE IF NOT EXISTS articles(id INTEGER PRIMARY KEY AUTOINCREMENT, source_item_id INTEGER UNIQUE, title TEXT, channel_text TEXT, body TEXT, source_url TEXT, image_url TEXT, category TEXT, score REAL, status TEXT DEFAULT 'ready', deep_token TEXT UNIQUE, created_at TEXT, verified_at TEXT, published_message_id INTEGER, source_published_at TEXT, deep_views INTEGER DEFAULT 0)"},
         {"sql": "CREATE TABLE IF NOT EXISTS publication_queue(id INTEGER PRIMARY KEY AUTOINCREMENT, article_id INTEGER UNIQUE, scheduled_at TEXT, status TEXT DEFAULT 'queued', attempts INTEGER DEFAULT 0, last_error TEXT, created_at TEXT, published_at TEXT)"},
         {"sql": "CREATE INDEX IF NOT EXISTS idx_publication_queue_due ON publication_queue(status, scheduled_at)"},
+        {"sql": "CREATE INDEX IF NOT EXISTS idx_publication_queue_published ON publication_queue(status, published_at, id)"},
+        {"sql": "CREATE INDEX IF NOT EXISTS idx_articles_published ON articles(status, published_at, id)"},
         {"sql": "CREATE TABLE IF NOT EXISTS ai_providers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, base_url TEXT, encrypted_api_key TEXT, model_name TEXT, priority INTEGER DEFAULT 10, enabled INTEGER DEFAULT 1, web_enabled INTEGER DEFAULT 0, created_at TEXT, updated_at TEXT, status TEXT DEFAULT 'unknown', last_error TEXT, cooldown_until TEXT, last_checked_at TEXT, last_latency_ms INTEGER DEFAULT 0, consecutive_failures INTEGER DEFAULT 0)"},
         {"sql": "CREATE TABLE IF NOT EXISTS automation_settings(key TEXT PRIMARY KEY, value TEXT)"},
         {"sql": "CREATE TABLE IF NOT EXISTS automation_logs(id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT, event TEXT, details TEXT, created_at TEXT)"},
@@ -3250,7 +3260,9 @@ async def automation_loop(db: D1Database, bot: Bot):
                 await log_automation(db,'ERROR','automation_loop_failed',str(e)[:1500])
                 await set_setting(db,'last_cycle_result',json.dumps({'error':str(e)[:1000]},ensure_ascii=False))
                 await set_setting(db,'worker_heartbeat_at',datetime.now(timezone.utc).isoformat())
-            await asyncio.sleep(0.5)
+            # Source intervals are minute-based; urgent publication windows sleep explicitly.
+            # Keep the heartbeat responsive without polling D1 twice per second.
+            await asyncio.sleep(1.0)
     finally:
         await ai.close()
 
@@ -5924,25 +5936,96 @@ async def auto_art_stats(call:CallbackQuery,db:D1Database):
 
 @router.callback_query(F.data.regexp(r'^auto_art_edit_(title|channel|body)_(\d+)$'))
 async def auto_art_edit_start(call:CallbackQuery,state:FSMContext,db:D1Database):
-    if call.from_user.id!=ADMIN_ID:return
-    parts=call.data.split('_'); field=parts[2]; aid=int(parts[3])
-    rows=await db.execute("SELECT title,channel_text,body FROM articles WHERE id=?",[aid])
-    if not rows: await call.answer('محتوا پیدا نشد',show_alert=True); return
-    labels={'title':'عنوان','channel':'متن کانال','body':'متن کامل'}
-    await state.set_state(BotStates.automation_article_edit)
-    await state.update_data(article_edit_id=aid,article_edit_field=field,parent_message_id=call.message.message_id)
-    await call.message.edit_text(f"✏️ <b>ویرایش {labels[field]} #{aid}</b>\n\nمقدار جدید را بفرست.\n\nپیام قبلی پاک نمی‌شود.",parse_mode='HTML',reply_markup=get_exit_menu()); await call.answer()
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("⛔ دسترسی ندارید", show_alert=True)
+        return
+
+    # Acknowledge immediately so a D1/network delay never makes the button
+    # appear dead in Telegram.
+    await call.answer()
+
+    match = re.fullmatch(r"auto_art_edit_(title|channel|body)_(\d+)", call.data or "")
+    if not match:
+        await call.message.answer("❌ دکمه ویرایش نامعتبر است", reply_markup=get_admin_back_kb("auto_queue"))
+        return
+
+    field = match.group(1)
+    aid = int(match.group(2))
+    try:
+        rows = await db.execute("SELECT title,channel_text,body FROM articles WHERE id=?", [aid])
+        if not rows:
+            await call.message.answer("❌ محتوا پیدا نشد.", reply_markup=get_admin_back_kb("auto_queue"))
+            return
+
+        labels={'title':'عنوان','channel':'متن کانال','body':'متن کامل'}
+        await state.update_data(
+            article_edit_id=aid,
+            article_edit_field=field,
+            parent_message_id=call.message.message_id
+        )
+        await state.set_state(BotStates.automation_article_edit)
+
+        await call.message.edit_text(
+            f"✏️ <b>ویرایش {labels[field]} #{aid}</b>\n\n"
+            "مقدار جدید را بفرست.\n\n"
+            "پیام قبلی پاک نمی‌شود.",
+            parse_mode='HTML',
+            reply_markup=get_exit_menu()
+        )
+    except Exception as exc:
+        logger.exception("automation article edit start failed: article=%s field=%s", aid, field)
+        await state.set_state(BotStates.idle)
+        await call.message.answer(
+            f"❌ باز کردن ویرایش انجام نشد.\n<code>{html.escape(str(exc)[:800])}</code>",
+            parse_mode='HTML',
+            reply_markup=get_admin_back_kb(f'auto_art_{aid}')
+        )
+
 
 @router.message(F.chat.id==ADMIN_ID,StateFilter(BotStates.automation_article_edit))
 async def auto_art_edit_input(message:Message,state:FSMContext,db:D1Database,bot:Bot):
-    data=await state.get_data(); aid=int(data['article_edit_id']); field=data['article_edit_field']; value=(message.text or message.caption or '').strip()
+    data=await state.get_data()
+    try:
+        aid=int(data['article_edit_id'])
+        field=str(data['article_edit_field'])
+    except (KeyError,TypeError,ValueError):
+        await state.set_state(BotStates.idle)
+        await message.answer("❌ نشست ویرایش منقضی شده است.", reply_markup=get_admin_back_kb("auto_content_db"))
+        return
+
+    value=(message.text or message.caption or '').strip()
     if not value:
-        await message.answer('❌ مقدار خالی است؛ دوباره بفرست.',reply_markup=get_exit_menu()); return
-    col={'title':'title','channel':'channel_text','body':'body'}[field]
-    if field=='title': value=strip_html_text(value)[:500]
-    elif field=='channel': value=sanitize_telegram_html(value)[:5000]
-    else: value=sanitize_telegram_html(value)[:18000]
-    await db.execute(f"UPDATE articles SET {col}=? WHERE id=?",[value,aid])
+        await message.answer('❌ مقدار خالی است؛ دوباره بفرست.',reply_markup=get_exit_menu())
+        return
+
+    col={'title':'title','channel':'channel_text','body':'body'}.get(field)
+    if not col:
+        await state.set_state(BotStates.idle)
+        await message.answer("❌ نوع ویرایش نامعتبر است.", reply_markup=get_admin_back_kb(f'auto_art_{aid}'))
+        return
+
+    if field=='title':
+        value=strip_html_text(value)[:500]
+    elif field=='channel':
+        value=sanitize_telegram_html(value)[:5000]
+    else:
+        value=sanitize_telegram_html(value)[:18000]
+
+    if not value.strip():
+        await message.answer("❌ محتوای نهایی خالی شد؛ دوباره بفرست.", reply_markup=get_exit_menu())
+        return
+
+    try:
+        await db.execute(f"UPDATE articles SET {col}=? WHERE id=?", [value,aid])
+    except Exception as exc:
+        logger.exception("automation article edit save failed: article=%s field=%s", aid, field)
+        await message.answer(
+            f"❌ ذخیره ویرایش انجام نشد.\n<code>{html.escape(str(exc)[:800])}</code>",
+            parse_mode='HTML',
+            reply_markup=get_admin_back_kb(f'auto_art_{aid}')
+        )
+        return
+
     # اگر پست قبلاً در کانال منتشر شده، تلاش می‌کنیم همان پیام هم اصلاح شود.
     rows=await db.execute("SELECT published_message_id,status,deep_token,title,channel_text FROM articles WHERE id=?",[aid])
     if rows and rows[0].get('status')=='published' and rows[0].get('published_message_id'):
@@ -5957,15 +6040,28 @@ async def auto_art_edit_input(message:Message,state:FSMContext,db:D1Database,bot
                     channel_html=append_channel_footer(latest_row.get('channel_text') or '',latest_row.get('category') or 'tech',ctype)
                     attach=bool(deep) and should_attach_bot_link(channel_html,latest_row.get('body') or '',ctype)
                     cap=publication_caption(latest_row.get('title') or '',channel_html,deep if attach else None)
-                    try: await bot.edit_message_caption(chat_id=channel_id,message_id=int(rows[0]['published_message_id']),caption=cap,parse_mode='HTML')
+                    try:
+                        await bot.edit_message_caption(chat_id=channel_id,message_id=int(rows[0]['published_message_id']),caption=cap,parse_mode='HTML')
                     except Exception:
-                        try: await bot.edit_message_text(chat_id=channel_id,message_id=int(rows[0]['published_message_id']),text=cap,parse_mode='HTML')
-                        except Exception: pass
-        except Exception: pass
+                        try:
+                            await bot.edit_message_text(chat_id=channel_id,message_id=int(rows[0]['published_message_id']),text=cap,parse_mode='HTML')
+                        except Exception:
+                            pass
+        except Exception:
+            logger.exception("published article message refresh failed: article=%s", aid)
+
     await state.set_state(BotStates.idle)
-    # Return to article panel via a fresh bot message to avoid losing the parent navigation.
-    cb=type('C',(),{})(); cb.message=type('M',(),{})(); cb.message.chat=message.chat; cb.message.message_id=data.get('parent_message_id',0)
-    await message.answer(f"✅ {field} محتوای #{aid} ویرایش شد.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📄 مدیریت همین محتوا',callback_data=f'auto_art_{aid}')],[InlineKeyboardButton(text='🔙 محتوا و داده‌ها',callback_data='auto_content_db')]]))
+    # Keep the existing queue record/schedule intact.
+    qrows = await db.execute("SELECT status FROM publication_queue WHERE article_id=? LIMIT 1", [aid])
+    back_cb = "auto_queue" if qrows and qrows[0].get("status") == "queued" else "auto_articles"
+    await message.answer(
+        f"✅ {field} محتوای #{aid} ویرایش شد.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='📄 مدیریت همین محتوا',callback_data=f'auto_art_{aid}')],
+            [InlineKeyboardButton(text='🔙 بازگشت',callback_data=back_cb)]
+        ])
+    )
+
 
 @router.callback_query(F.data.regexp(r'^auto_art_delete_(\d+)$'))
 async def auto_art_delete(call:CallbackQuery):
