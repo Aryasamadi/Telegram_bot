@@ -49,7 +49,7 @@ load_dotenv()
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TechNowAibot")
-BUILD_VERSION = "10.27.9-queue-edit-d1-optimized"
+BUILD_VERSION = "11.0.0-multi-tenant-manager-platform"
 DEFAULT_MAX_WORKERS = 6
 DEFAULT_MAX_AI_WORKERS = 4
 AI_VERIFY_ENABLED_DEFAULT = os.getenv("AI_VERIFY_ENABLED", "auto").lower()
@@ -279,7 +279,7 @@ async def migrate_unified_user_interactions(db: D1Database):
 
 async def initialize_automation_database(db: D1Database):
     queries = [
-        {"sql": "CREATE TABLE IF NOT EXISTS sources(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, url TEXT UNIQUE, feed_url TEXT, category TEXT DEFAULT 'tech', enabled INTEGER DEFAULT 1, interval_minutes INTEGER DEFAULT 15, priority INTEGER DEFAULT 5, last_checked_at TEXT, next_check_at TEXT, last_error TEXT, trust_score REAL DEFAULT 80, created_at TEXT, last_seen_published_at TEXT, last_seen_url TEXT)"},
+        {"sql": "CREATE TABLE IF NOT EXISTS sources(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, url TEXT, feed_url TEXT, category TEXT DEFAULT 'general', enabled INTEGER DEFAULT 1, interval_minutes INTEGER DEFAULT 15, priority INTEGER DEFAULT 5, last_checked_at TEXT, next_check_at TEXT, last_error TEXT, trust_score REAL DEFAULT 80, created_at TEXT, last_seen_published_at TEXT, last_seen_url TEXT, manager_id INTEGER DEFAULT 0, channel_id TEXT DEFAULT '')"},
         {"sql": "CREATE INDEX IF NOT EXISTS idx_sources_due ON sources(enabled, next_check_at)"},
         {"sql": "CREATE TABLE IF NOT EXISTS source_items(id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER NOT NULL, canonical_url TEXT NOT NULL, title TEXT, description TEXT, content TEXT, image_url TEXT, published_at TEXT, discovered_at TEXT, content_hash TEXT, status TEXT DEFAULT 'new', score REAL DEFAULT 0, category TEXT, article_id INTEGER, last_error TEXT, retry_after TEXT, UNIQUE(source_id, canonical_url))"},
         {"sql": "CREATE INDEX IF NOT EXISTS idx_source_items_status ON source_items(status)"},
@@ -291,6 +291,17 @@ async def initialize_automation_database(db: D1Database):
         {"sql": "CREATE INDEX IF NOT EXISTS idx_articles_published ON articles(status, published_at, id)"},
         {"sql": "CREATE TABLE IF NOT EXISTS ai_providers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, base_url TEXT, encrypted_api_key TEXT, model_name TEXT, priority INTEGER DEFAULT 10, enabled INTEGER DEFAULT 1, web_enabled INTEGER DEFAULT 0, created_at TEXT, updated_at TEXT, status TEXT DEFAULT 'unknown', last_error TEXT, cooldown_until TEXT, last_checked_at TEXT, last_latency_ms INTEGER DEFAULT 0, consecutive_failures INTEGER DEFAULT 0)"},
         {"sql": "CREATE TABLE IF NOT EXISTS automation_settings(key TEXT PRIMARY KEY, value TEXT)"},
+        {"sql": "CREATE TABLE IF NOT EXISTS manager_workspaces(id INTEGER PRIMARY KEY AUTOINCREMENT, manager_id INTEGER NOT NULL UNIQUE, name TEXT DEFAULT '', status TEXT DEFAULT 'trial', created_at TEXT NOT NULL, trial_started_at TEXT, trial_expires_at TEXT, contact_token TEXT UNIQUE, help_token TEXT UNIQUE, current_plan_id INTEGER DEFAULT 1)"},
+        {"sql": "CREATE INDEX IF NOT EXISTS idx_manager_workspaces_status ON manager_workspaces(status)"},
+        {"sql": "CREATE TABLE IF NOT EXISTS subscription_plans(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, duration_days INTEGER DEFAULT 30, max_sources INTEGER DEFAULT 2, max_channels INTEGER DEFAULT 1, max_daily_posts INTEGER DEFAULT 1, price REAL DEFAULT 0, active INTEGER DEFAULT 1, created_at TEXT NOT NULL)"},
+        {"sql": "CREATE TABLE IF NOT EXISTS manager_subscriptions(id INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id INTEGER NOT NULL, plan_id INTEGER NOT NULL, status TEXT DEFAULT 'active', started_at TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL)"},
+        {"sql": "CREATE INDEX IF NOT EXISTS idx_manager_subscriptions_workspace ON manager_subscriptions(workspace_id,status,expires_at)"},
+        {"sql": "CREATE TABLE IF NOT EXISTS manager_channels(id INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id INTEGER NOT NULL, chat_id TEXT NOT NULL, title TEXT, username TEXT, enabled INTEGER DEFAULT 1, created_at TEXT NOT NULL, UNIQUE(workspace_id,chat_id))"},
+        {"sql": "CREATE INDEX IF NOT EXISTS idx_manager_channels_workspace ON manager_channels(workspace_id,enabled)"},
+        {"sql": "CREATE TABLE IF NOT EXISTS manager_settings(workspace_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(workspace_id,key))"},
+        {"sql": "CREATE TABLE IF NOT EXISTS manager_prompts(workspace_id INTEGER PRIMARY KEY, channel_prompt TEXT, article_prompt TEXT, updated_at TEXT NOT NULL)"},
+        {"sql": "CREATE TABLE IF NOT EXISTS manager_metrics(id INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id INTEGER NOT NULL, metric_key TEXT NOT NULL, label TEXT NOT NULL, weight REAL DEFAULT 10, enabled INTEGER DEFAULT 1, UNIQUE(workspace_id,metric_key))"},
+        {"sql": "CREATE INDEX IF NOT EXISTS idx_manager_metrics_workspace ON manager_metrics(workspace_id,enabled)"},
         {"sql": "CREATE TABLE IF NOT EXISTS automation_logs(id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT, event TEXT, details TEXT, created_at TEXT)"},
         {"sql": "CREATE INDEX IF NOT EXISTS idx_automation_logs_created ON automation_logs(created_at)"},
         {"sql": "CREATE TABLE IF NOT EXISTS manual_channel_events(id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER, created_at TEXT)"},
@@ -314,11 +325,37 @@ async def initialize_automation_database(db: D1Database):
         "ALTER TABLE sources ADD COLUMN last_seen_published_at TEXT",
         "ALTER TABLE sources ADD COLUMN last_seen_url TEXT",
         "ALTER TABLE source_items ADD COLUMN retry_after TEXT",
+        "ALTER TABLE sources ADD COLUMN manager_id INTEGER DEFAULT 0",
+        "ALTER TABLE sources ADD COLUMN channel_id TEXT DEFAULT ''",
+        "ALTER TABLE articles ADD COLUMN manager_id INTEGER DEFAULT 0",
+        "ALTER TABLE articles ADD COLUMN channel_id TEXT DEFAULT ''",
+        "ALTER TABLE publication_queue ADD COLUMN manager_id INTEGER DEFAULT 0",
+        "ALTER TABLE publication_queue ADD COLUMN channel_id TEXT DEFAULT ''",
     ]:
         try:
             await db.execute(sql)
         except Exception:
             pass
+    # Remove the legacy global UNIQUE(url) constraint. The same source may belong to multiple managers.
+    try:
+        marker = await db.execute("SELECT value FROM automation_settings WHERE key='schema_sources_multi_tenant_v1'")
+        if not marker:
+            schema_rows = await db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='sources'")
+            schema_sql = str(schema_rows[0].get('sql') or '') if schema_rows else ''
+            if 'UNIQUE' in schema_sql.upper() and 'URL' in schema_sql.upper():
+                await db.execute_batch([
+                    {"sql": "DROP INDEX IF EXISTS idx_sources_due"},
+                    {"sql": "ALTER TABLE sources RENAME TO sources_legacy_v1"},
+                    {"sql": "CREATE TABLE sources(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, url TEXT, feed_url TEXT, category TEXT DEFAULT 'general', enabled INTEGER DEFAULT 1, interval_minutes INTEGER DEFAULT 15, priority INTEGER DEFAULT 5, last_checked_at TEXT, next_check_at TEXT, last_error TEXT, trust_score REAL DEFAULT 80, created_at TEXT, last_seen_published_at TEXT, last_seen_url TEXT, manager_id INTEGER DEFAULT 0, channel_id TEXT DEFAULT '')"},
+                    {"sql": "INSERT INTO sources(id,name,url,feed_url,category,enabled,interval_minutes,priority,last_checked_at,next_check_at,last_error,trust_score,created_at,last_seen_published_at,last_seen_url,manager_id,channel_id) SELECT id,name,url,feed_url,category,enabled,interval_minutes,priority,last_checked_at,next_check_at,last_error,trust_score,created_at,last_seen_published_at,last_seen_url,COALESCE(manager_id,0),COALESCE(channel_id,'') FROM sources_legacy_v1"},
+                    {"sql": "DROP TABLE sources_legacy_v1"},
+                    {"sql": "CREATE INDEX IF NOT EXISTS idx_sources_due ON sources(enabled, next_check_at)"},
+                    {"sql": "CREATE INDEX IF NOT EXISTS idx_sources_manager ON sources(manager_id, enabled, next_check_at)"},
+                ])
+            await db.execute("INSERT OR REPLACE INTO automation_settings(key,value) VALUES('schema_sources_multi_tenant_v1','1')")
+    except Exception as exc:
+        logger.exception('sources multi-tenant migration failed: %s', exc)
+
     defaults = {
         "automation_enabled": "1" if AUTOMATION_ENABLED_DEFAULT else "0",
         "max_daily_posts": str(DEFAULT_MAX_DAILY_POSTS),
@@ -412,6 +449,17 @@ async def initialize_automation_database(db: D1Database):
             await db.execute("UPDATE automation_settings SET value=? WHERE key='min_post_gap_minutes'", [str(int(round(legacy_gap*60)))])
     except Exception:
         pass
+    # Public /help is platform-global and is controlled only by the Super Admin.
+    default_help = ("❓ <b>راهنمای دستورات</b>\n\n"
+                    "📞 /man • ➜ <b>ارتباط با مدیریت کلان</b>\n"
+                    "🔑 /about • ➜ <b>این ربات چیست ؟</b>")
+    await db.execute("INSERT OR IGNORE INTO automation_settings(key,value) VALUES('bot_help_text',?)", [default_help])
+    # Built-in trial + paid capacity templates. Pricing remains under Super Admin control.
+    now_seed=datetime.now(timezone.utc).isoformat()
+    await db.execute("INSERT OR IGNORE INTO subscription_plans(id,name,duration_days,max_sources,max_channels,max_daily_posts,price,active,created_at) VALUES(1,'Free Trial',30,2,1,1,0,1,?)", [now_seed])
+    await db.execute("INSERT OR IGNORE INTO subscription_plans(name,duration_days,max_sources,max_channels,max_daily_posts,price,active,created_at) VALUES('Basic',30,6,2,4,0,1,?)", [now_seed])
+    await db.execute("INSERT OR IGNORE INTO subscription_plans(name,duration_days,max_sources,max_channels,max_daily_posts,price,active,created_at) VALUES('Pro',30,20,5,15,0,1,?)", [now_seed])
+
     # Provider قدیمی محیطی را از چرخه failover خارج می‌کنیم؛ مدیر فقط مدل‌هایی را که
     # خودش در پنل تست کرده است وارد اتوماسیون می‌کند.
     try:
@@ -2612,21 +2660,22 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
     else:
         body=raw_body
     manager_prompts=manager_prompts or {}
-    channel_scope=manager_prompts.get("channel") or "تمرکز روی خبرهای فنی و ارزشمند؛ محتوای سطحی و کلیشه‌ای را کنار بگذار."
-    article_scope=manager_prompts.get("article") or "نسخه کامل را فنی، غنی و مبتنی بر واقعیت‌های منبع بنویس."
+    channel_scope=manager_prompts.get("channel") or "محتوا را متناسب با حوزه و مخاطب تعریف‌شده توسط مدیر تولید کن؛ دقیق، منسجم و بدون ساختن اطلاعات."
+    article_scope=manager_prompts.get("article") or "نسخه کامل را فقط بر اساس اطلاعات واقعی منبع و متناسب با حوزه مدیر تولید کن."
     editorial_schema={
         "accept": True, "score": 0, "global_relevance": 0, "technology_relevance": 0,
         "ai_relevance": 0, "cyber_relevance": 0, "education_relevance": 0, "iran_relevance": 0,
         "freshness": 0, "reliability": 0, "duplicate_risk": 0, "category": "ai|tech|cyber|edu|general",
         "why": "...", "title": "...", "channel_html": "...", "article_html": "...",
         "facts": ["..."], "resource_links": [],
+        "metric_scores": {"metric_key": 0},
         "content_type": "news|tutorial|tool|security|comparison|list|analysis|general",
         "has_more_details": False
     }
     prompt=f"""تو موتور تحریریه و تولید محتوای یک کانال فارسی حرفه‌ای هستی؛ نه قاضی، نه مفسر سیاسی و نه منتقد.
-وظیفه تو این است که از منبع داده‌شده محتوای فنی، غنی، دقیق، بی‌طرف و قابل‌فهم بسازی. انتخاب نهایی فقط بر اساس معیارهای عددی مدیر انجام می‌شود؛ در متن نهایی قضاوت، توصیه یا ارزش‌گذاری ننویس.
+وظیفه تو این است که از منبع داده‌شده محتوای دقیق، غنی و قابل‌فهم متناسب با حوزه تعریف‌شده توسط مدیر بسازی. حوزه می‌تواند هر موضوع مشروعی باشد و نباید به فناوری یا AI محدود شود. انتخاب نهایی فقط بر اساس معیارهای عددی مدیر انجام می‌شود؛ در متن نهایی قضاوت، توصیه یا ارزش‌گذاری نساز.
 
-موضوعات کانال: فناوری، هوش مصنوعی، ابزارها و مدل‌ها، امنیت سایبری، آموزش و اخبار مهم جهان.
+حوزه کانال، مخاطب و سبک از تنظیمات مدیر می‌آید.
 مخاطب: فارسی‌زبان‌ها. زبان یا جغرافیای منبع هیچ اولویتی ندارد؛ فقط کیفیت، ارتباط و تازگی محتوا مهم است.
 
 منبع: {source.get('name')}
@@ -2635,8 +2684,10 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
 متن منبع:
 {body}
 
-وزن‌های تعیین‌شده توسط مدیر:
-{json.dumps(weights,ensure_ascii=False)}
+معیارها و وزن‌های تعیین‌شده توسط مدیر:
+{json.dumps(source.get('_manager_metrics') or {"metrics": []},ensure_ascii=False)}
+
+اگر معیارهای اختصاصی مدیر وجود دارد، برای هر metric_key یک امتیاز 0 تا 10 در metric_scores بده. اگر این منبع واقعاً با معیار مرتبط نیست، امتیاز پایین بده؛ معیار را حذف یا تغییر نام نده.
 
 دستور محتوایی مدیر برای نسخه کوتاه کانال (معمولاً حدود 600 تا 900 کاراکتر، فقط وقتی محتوای منبع اجازه می‌دهد):
 {channel_scope}
@@ -2648,7 +2699,7 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
 
 قانون ضدتکرار: عنوان و پاراگراف آغازین نباید یک مفهوم را چند بار با عبارت‌های مختلف تکرار کنند. هر نکته فقط یک‌بار و در مناسب‌ترین جای متن بیان شود. در نسخه کانال، چند جمله اول باید یک چکیده مفهومی واحد بسازند و سپس فقط جزئیات جدید اضافه کنند. از قرار دادن چند تیتر متوالی یا تیترهای هم‌معنی خودداری کن؛ متن باید با یک عنوان اصلی شروع شود و بلافاصله وارد محتوای واقعی خبر شود.
 
-قانون معرفی موجودیت کلیدی: هرگاه برای اولین بار نام یک شرکت، برند، محصول، مدل، سرویس، فرد کلیدی، سازمان یا فناوری مهم وارد متن می‌شود، قبل از ادامه بحث یک معرفی بسیار کوتاه و طبیعی از آن بده؛ مثال: «Zimbra (یک پلتفرم ایمیل و همکاری سازمانی) ...». این معرفی فقط در اولین اشاره انجام شود و تکرار نشود. برای افراد یا سخنگویانی که نقل‌قول می‌شوند نیز در اولین اشاره معرفی کوتاه لازم است.
+قانون معرفی موجودیت کلیدی: هرگاه برای اولین بار نام یک شخص، سازمان، برند، اثر، محصول، مکان، فناوری یا مفهوم مهم وارد متن می‌شود، در صورت نیاز یک معرفی بسیار کوتاه و طبیعی از آن بده و تکرار نکن. این معرفی فقط در اولین اشاره انجام شود و تکرار نشود. برای افراد یا سخنگویانی که نقل‌قول می‌شوند نیز در اولین اشاره معرفی کوتاه لازم است.
 
 قانون لحن: متن باید صمیمی، دوستانه، روان و طبیعی باشد؛ رسمی و خشک نباشد. صمیمی بودن به معنی شوخی یا عامیانه‌نویسی افراطی نیست؛ لحن باید مثل یک سردبیر فناوری خوش‌بیان باشد.
 
@@ -2688,7 +2739,7 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
 
 فقط JSON معتبر:
 {json.dumps(editorial_schema, ensure_ascii=False)}"""
-    result=await ai.call([{"role":"system","content":"You are a Persian technology content producer. Be neutral and factual. Return JSON only."},{"role":"user","content":prompt}],0.35,5000,"editorial")
+    result=await ai.call([{"role":"system","content":"You are a Persian content producer for arbitrary legitimate domains. Follow manager editorial scope, never fabricate facts, and return JSON only."},{"role":"user","content":prompt}],0.35,5000,"editorial")
     obj=parse_json_object(result.get("content",""))
     if not obj:
         repair_prompt=("پاسخ زیر را فقط به JSON معتبر تبدیل کن؛ محتوای آن را تغییر نده. فیلدها: accept,score,category,iran_relevance,freshness,reliability,duplicate_risk,why,title,channel_html,article_html,facts.\n\n"+str(result.get("content",""))[:14000])
@@ -2718,7 +2769,7 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
     # فقط محتوای تکراری ابتدای خروجی حذف می‌شود؛ renderer و formatting فعلی بدون تغییر باقی می‌مانند.
     raw_ch=_dedupe_leading_semantics(raw_ch,title)
     raw_ar=_dedupe_leading_semantics(raw_ar,title)
-    category=str(obj.get("category") or source.get("category") or "tech")
+    category=str(obj.get("category") or source.get("category") or "general")
     content_type=classify_content_type(title, raw_ch, category, str(obj.get("content_type") or ""))
     obj["content_type"]=content_type
     obj["has_more_details"]=bool(obj.get("has_more_details"))
@@ -2731,7 +2782,18 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
     resource_links=sanitize_resource_links(obj.get("resource_links"))
     ar=append_resource_links(ar, resource_links, item.get("url") or "")
     obj["title"]=title; obj["channel_html"]=ch; obj["article_html"]=ar; obj["resource_links"]=resource_links; obj["content_type"]=content_type; obj["has_more_details"]=should_attach_bot_link(ch, ar, content_type)
-    # امتیاز نهایی را خود ربات از وزن‌های مدیر محاسبه می‌کند؛ بنابراین تغییر وزن واقعاً اثر دارد.
+    # امتیاز نهایی از معیارهای مدیر محاسبه می‌شود. قوانین ثابت پلتفرم در این مرحله قابل override نیستند.
+    if source.get('_manager_mode') and source.get('_manager_metrics',{}).get('metrics'):
+        metric_rows=source.get('_manager_metrics',{}).get('metrics',[])
+        raw_scores=obj.get('metric_scores') or {}
+        total_weight=sum(max(0,float(m.get('weight',0))) for m in metric_rows)
+        weighted=0.0
+        for m in metric_rows:
+            key=str(m.get('key') or '')
+            val=float(raw_scores.get(key,5) or 0)
+            weighted += max(0,min(10,val))*max(0,float(m.get('weight',0)))
+        obj['score']=round((weighted/(total_weight*10))*100,1) if total_weight else round(float(obj.get('score',0) or 0),1)
+        return {**obj,'ai':result}
     dims={
         "global":float(obj.get("global_relevance",5) or 0),
         "technology":float(obj.get("technology_relevance",5) or 0),
@@ -2745,18 +2807,111 @@ async def ai_editorial_process(ai: AIProviderManager,item:Dict[str,Any],source:D
     global_score=dims["global"]; major_score=max(dims["technology"],dims["ai"],dims["cyber"],dims["education"]); iran_score=dims["iran"]
     if global_score < 4 and major_score < 6 and iran_score < 4:
         obj["score"]=0
-        obj["why"]=(str(obj.get("why") or "").strip()+" | رد: اهمیت جهانی/فناوری کافی برای کانال ندارد").strip(" |")
-        return {**obj,"ai":result,"hard_reject":True,"hard_reject_reason":"low_global_or_technical_relevance"}
+        obj["why"]=(str(obj.get("why") or "").strip()+" | رد: اهمیت کافی برای کانال فعلی ندارد").strip(" |")
+        return {**obj,"ai":result,"hard_reject":True,"hard_reject_reason":"low_relevance"}
     total_weight=sum(max(0,float(weights.get(k,0))) for k in dims)
     weighted=sum(max(0,min(10,v))*max(0,float(weights.get(k,0))) for k,v in dims.items())
     obj["score"]=round((weighted/(total_weight*10))*100,1) if total_weight else round(float(obj.get("score",0) or 0),1)
     return {**obj,"ai":result}
 
-async def get_manager_editorial_prompts(db: D1Database) -> Dict[str,str]:
+async def get_manager_editorial_prompts(db: D1Database, workspace_id: int = 0) -> Dict[str,str]:
+    if workspace_id:
+        rows=await db.execute("SELECT channel_prompt,article_prompt FROM manager_prompts WHERE workspace_id=?",[workspace_id])
+        if rows:
+            return {"channel": str(rows[0].get("channel_prompt") or ""), "article": str(rows[0].get("article_prompt") or "")}
     return {
-        "channel": await get_setting(db, "editorial_prompt_channel", "فقط محتوای فنی و واقعاً ارزشمند برای مخاطب فناوری و هوش مصنوعی را پوشش بده."),
-        "article": await get_setting(db, "editorial_prompt_article", "نسخه کامل باید فنی، غنی و مبتنی بر واقعیت‌های منبع باشد.")
+        "channel": await get_setting(db, "editorial_prompt_channel", "محتوا را متناسب با حوزه و مخاطب مدیر تولید کن."),
+        "article": await get_setting(db, "editorial_prompt_article", "نسخه کامل را فقط بر اساس اطلاعات واقعی منبع و متناسب با حوزه مدیر تولید کن.")
     }
+
+FORBIDDEN_MANAGER_PROMPT_PATTERNS = [
+    r"لغو.*(قانون|فیلتر|امنیت|تبلیغ|ایمنی)", r"نادیده.*(قانون|فیلتر|امنیت|تبلیغ|ایمنی)",
+    r"خاموش.*(فیلتر|امنیت|تبلیغ|ایمنی)", r"دور.*زدن.*(فیلتر|قانون|امنیت)",
+    r"ساختن.*(اطلاعات|عدد|منبع|واقعیت)", r"جعل.*(اطلاعات|منبع|واقعیت)",
+]
+
+async def manager_workspace(db: D1Database, user_id: int) -> Optional[dict]:
+    rows=await db.execute("SELECT * FROM manager_workspaces WHERE manager_id=? LIMIT 1",[int(user_id)])
+    return rows[0] if rows else None
+
+async def manager_plan(db: D1Database, workspace_id: int) -> Optional[dict]:
+    rows=await db.execute("SELECT p.* FROM manager_subscriptions s JOIN subscription_plans p ON p.id=s.plan_id WHERE s.workspace_id=? AND s.status='active' AND s.expires_at>? ORDER BY s.expires_at DESC LIMIT 1",[workspace_id,datetime.now(timezone.utc).isoformat()])
+    return rows[0] if rows else None
+
+async def manager_subscription_text(db: D1Database, workspace_id: int) -> str:
+    ws=(await db.execute("SELECT * FROM manager_workspaces WHERE id=?",[workspace_id]))
+    if not ws: return "❌ فضای مدیریتی پیدا نشد."
+    plan=await manager_plan(db,workspace_id)
+    if not plan: return "⚠️ اشتراک فعال نیست."
+    exp=str((await db.execute("SELECT expires_at FROM manager_subscriptions WHERE workspace_id=? AND status='active' ORDER BY expires_at DESC LIMIT 1",[workspace_id]))[0].get('expires_at') or '')
+    src=(await db.execute("SELECT COUNT(*) c FROM sources WHERE manager_id=?",[int(ws[0]['manager_id'])]))[0].get('c',0)
+    ch=(await db.execute("SELECT COUNT(*) c FROM manager_channels WHERE workspace_id=? AND enabled=1",[workspace_id]))[0].get('c',0)
+    return f"💳 <b>اشتراک</b>\n\n📦 پلن: <b>{html.escape(str(plan['name']))}</b>\n⏳ اعتبار تا: <b>{html.escape(exp[:19].replace('T',' '))}</b>\n🌐 منابع: <b>{src}/{plan['max_sources']}</b>\n📢 کانال‌ها: <b>{ch}/{plan['max_channels']}</b>\n🔢 انتشار روزانه: <b>{plan['max_daily_posts']}</b>"
+
+async def create_manager_workspace(db: D1Database, user_id: int, name: str = "") -> dict:
+    existing=await manager_workspace(db,user_id)
+    if existing: return existing
+    now=datetime.now(timezone.utc); expires=now+timedelta(days=30)
+    contact=secrets.token_urlsafe(18) if 'secrets' in globals() else hashlib.sha256(f"contact:{user_id}:{now.timestamp()}".encode()).hexdigest()[:28]
+    help_token=secrets.token_urlsafe(18) if 'secrets' in globals() else hashlib.sha256(f"help:{user_id}:{now.timestamp()}".encode()).hexdigest()[:28]
+    res=await db.execute("INSERT INTO manager_workspaces(manager_id,name,status,created_at,trial_started_at,trial_expires_at,contact_token,help_token,current_plan_id) VALUES(?,?,?,?,?,?,?,?,1) RETURNING id",[user_id,name[:120],"trial",now.isoformat(),now.isoformat(),expires.isoformat(),contact,help_token])
+    wid=int(res[0]['id'])
+    await db.execute("UPDATE users SET role='manager' WHERE id=?",[user_id])
+    await db.execute("INSERT INTO manager_subscriptions(workspace_id,plan_id,status,started_at,expires_at,created_at) VALUES(?,1,'active',?,?,?)",[wid,now.isoformat(),expires.isoformat(),now.isoformat()])
+    await db.execute("INSERT OR REPLACE INTO manager_prompts(workspace_id,channel_prompt,article_prompt,updated_at) VALUES(?,?,?,?)",[wid,"محتوا را دقیقاً متناسب با حوزه، مخاطب و لحن تعریف‌شده توسط مدیر تولید کن.","نسخه کامل را بر اساس اطلاعات واقعی منبع و معیارهای مدیر تولید کن.",now.isoformat()])
+    for mk,label,w in [("relevance","ارتباط با حوزه مدیر",35),("freshness","تازگی",20),("reliability","اعتبار منبع",25),("novelty","منحصربه‌فرد بودن",20)]:
+        await db.execute("INSERT OR IGNORE INTO manager_metrics(workspace_id,metric_key,label,weight,enabled) VALUES(?,?,?,?,1)",[wid,mk,label,w])
+    await db.execute("INSERT OR REPLACE INTO manager_settings(workspace_id,key,value,updated_at) VALUES(?,?,?,?)",[wid,"min_content_score",str(DEFAULT_MIN_CONTENT_SCORE),now.isoformat()])
+    return (await manager_workspace(db,user_id))
+
+async def manager_prompt_validation(text: str) -> Tuple[bool,str]:
+    t=(text or '').strip()
+    if not t: return False,"پرامپت نمی‌تواند خالی باشد."
+    if len(t)>5000: return False,"پرامپت حداکثر ۵۰۰۰ کاراکتر است."
+    for pat in FORBIDDEN_MANAGER_PROMPT_PATTERNS:
+        if re.search(pat,t,re.I):
+            return False,"این بخش تلاش می‌کند قوانین ثابت پلتفرم را تغییر دهد یا دور بزند و قابل ذخیره نیست."
+    return True,""
+
+async def manager_channels(db:D1Database, workspace_id:int):
+    return await db.execute("SELECT * FROM manager_channels WHERE workspace_id=? AND enabled=1 ORDER BY id",[workspace_id])
+
+async def manager_source_count(db:D1Database, manager_id:int) -> int:
+    r=await db.execute("SELECT COUNT(*) c FROM sources WHERE manager_id=?",[manager_id]); return int(r[0].get('c',0) if r else 0)
+
+async def manager_daily_published(db:D1Database, manager_id:int) -> int:
+    day=datetime.now(pytz.timezone('Asia/Tehran')).replace(hour=0,minute=0,second=0,microsecond=0).astimezone(timezone.utc).isoformat()
+    r=await db.execute("SELECT COUNT(*) c FROM articles WHERE manager_id=? AND status='published' AND COALESCE(published_at,created_at)>=?",[manager_id,day]); return int(r[0].get('c',0) if r else 0)
+
+async def manager_source_add(db:D1Database, manager_id:int, workspace_id:int, channel_id:str, url:str, category:str='general') -> int:
+    plan=await manager_plan(db,workspace_id)
+    if not plan: raise ValueError('اشتراک فعال نیست.')
+    if await manager_source_count(db,manager_id) >= int(plan.get('max_sources') or 0): raise ValueError(f"سقف منابع پلن شما ({plan['max_sources']}) تکمیل شده است.")
+    clean=normalize_url(url)
+    if not clean: raise ValueError('URL معتبر نیست.')
+    interval=int(await get_setting(db,'default_source_interval',str(DEFAULT_SOURCE_INTERVAL_MINUTES)))
+    now=datetime.now(timezone.utc)
+    parsed=urllib.parse.urlsplit(clean); name=parsed.netloc or clean
+    res=await db.execute("INSERT INTO sources(name,url,category,enabled,interval_minutes,priority,next_check_at,created_at,manager_id,channel_id) VALUES(?,?,?,?,?,?,?,?,?,?) RETURNING id",[name,clean,category or 'general',1,interval,5,now.isoformat(),now.isoformat(),manager_id,str(channel_id)])
+    return int(res[0]['id'])
+
+async def manager_metrics(db:D1Database, workspace_id:int):
+    rows=await db.execute("SELECT * FROM manager_metrics WHERE workspace_id=? AND enabled=1 ORDER BY id",[workspace_id])
+    return rows
+
+async def manager_metric_payload(db:D1Database, workspace_id:int)->Dict[str,Any]:
+    rows=await manager_metrics(db,workspace_id)
+    return {"metrics":[{"key":str(r.get("metric_key")),"label":str(r.get("label")),"weight":float(r.get("weight") or 0)} for r in rows]}
+
+async def manager_dashboard(db:D1Database,user_id:int)->str:
+    ws=await manager_workspace(db,user_id)
+    if not ws: return ""
+    wid=int(ws['id']); plan=await manager_plan(db,wid)
+    src=await manager_source_count(db,user_id); ch=len(await manager_channels(db,wid)); daily=await manager_daily_published(db,user_id)
+    arts=(await db.execute("SELECT COUNT(*) c FROM articles WHERE manager_id=?",[user_id]))[0].get('c',0)
+    likes=(await db.execute("SELECT COUNT(*) c FROM user_content_votes v JOIN articles a ON a.id=v.content_id WHERE v.content_type='article' AND v.vote_type='like' AND a.manager_id=?",[user_id]))[0].get('c',0)
+    views=(await db.execute("SELECT COALESCE(SUM(deep_views),0) c FROM articles WHERE manager_id=?",[user_id]))[0].get('c',0)
+    return f"👨‍💼 <b>پنل مدیریت شما</b>\n\n📦 پلن: <b>{html.escape(str(plan['name']) if plan else 'بدون اشتراک')}</b>\n🌐 منابع: <b>{src}/{plan['max_sources'] if plan else 0}</b>\n📢 کانال‌ها: <b>{ch}/{plan['max_channels'] if plan else 0}</b>\n📝 محتوا: <b>{arts}</b>\n👁 بازدید ربات: <b>{views}</b>\n👍 لایک: <b>{likes}</b>\n📅 انتشار امروز: <b>{daily}/{plan['max_daily_posts'] if plan else 0}</b>"
 
 async def add_source(db: D1Database, url: str, category: str = "tech", interval_minutes: Optional[int] = None, priority: int = 5) -> int:
     clean = normalize_url(url)
@@ -2767,7 +2922,7 @@ async def add_source(db: D1Database, url: str, category: str = "tech", interval_
     interval = interval_minutes or int(await get_setting(db, "default_source_interval", str(DEFAULT_SOURCE_INTERVAL_MINUTES)))
     now = datetime.now(timezone.utc)
     next_check = now.isoformat()
-    res = await db.execute("INSERT INTO sources(name, url, category, enabled, interval_minutes, priority, next_check_at, created_at) VALUES(?, ?, ?, 1, ?, ?, ?, ?) RETURNING id", [name, clean, category, interval, priority, next_check, now.isoformat()])
+    res = await db.execute("INSERT INTO sources(name, url, category, enabled, interval_minutes, priority, next_check_at, created_at, manager_id, channel_id) VALUES(?, ?, ?, 1, ?, ?, ?, ?, 0, '') RETURNING id", [name, clean, category, interval, priority, next_check, now.isoformat()])
     source_id = res[0].get("id") if res else 0
     if not source_id:
         source_id = (await db.execute("SELECT id FROM sources WHERE url = ?", [clean]))[0].get("id")
@@ -2778,7 +2933,7 @@ async def add_source(db: D1Database, url: str, category: str = "tech", interval_
 # MODIFIED fetch_source_cycle with paywall detection and placeholder rejection
 # ============================================================
 async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProviderManager, progress=None, allow_old_test=False):
-    source_id=source['id']; now=datetime.now(timezone.utc)
+    source_id=source['id']; now=datetime.now(timezone.utc); manager_id=int(source.get('manager_id') or 0)
     stats={'source':source.get('name') or source.get('url'), 'found':0,'seen':0,'candidates':0,'processed':0,'accepted':0,'rejected':0,'errors':0,'queued':0,'method':'','diagnostics':[]}
     try:
         if progress: await progress('discover',f"🔎 {source.get('name')}: در حال بررسی مستقیم سایت و منابع آن…")
@@ -2792,7 +2947,10 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
             next_check=(now+timedelta(minutes=int(source.get('interval_minutes') or DEFAULT_SOURCE_INTERVAL_MINUTES))).isoformat()
             await db.execute('UPDATE sources SET last_checked_at=?,next_check_at=?,last_error=? WHERE id=?',[now.isoformat(),next_check,'; '.join(stats['diagnostics'][-4:])[:1200],source_id])
             return stats
-        recent_rows=await db.execute("SELECT title,source_url,body FROM articles WHERE status IN ('published','ready','test') AND COALESCE(published_at,created_at) >= ? ORDER BY id DESC LIMIT 80",[(now-timedelta(hours=24)).isoformat()])
+        if manager_id:
+            recent_rows=await db.execute("SELECT title,source_url,body FROM articles WHERE manager_id=? AND status IN ('published','ready','test') AND COALESCE(published_at,created_at) >= ? ORDER BY id DESC LIMIT 80",[manager_id,(now-timedelta(hours=24)).isoformat()])
+        else:
+            recent_rows=await db.execute("SELECT title,source_url,body FROM articles WHERE manager_id=0 AND status IN ('published','ready','test') AND COALESCE(published_at,created_at) >= ? ORDER BY id DESC LIMIT 80",[(now-timedelta(hours=24)).isoformat()])
         recent_titles=[r.get('title','') for r in recent_rows]
         recent_urls={normalize_url(r.get('source_url') or '') for r in recent_rows if r.get('source_url')}
         recent_hashes={text_hash(str(r.get('title') or '')+' '+str(r.get('body') or '')) for r in recent_rows}
@@ -2807,8 +2965,23 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
             existing_item_map={normalize_url(r.get('canonical_url') or ''):r for r in erows}
 
         weight_keys=['global','technology','ai','cyber','education','iran','freshness','novelty']
-        weights={k:float(await get_setting(db,f'weight_{k}','10')) for k in weight_keys}
-        sem=asyncio.Semaphore(max(1,min(4,int(await get_setting(db,'max_ai_workers',str(DEFAULT_MAX_AI_WORKERS))))))
+        if manager_id:
+            _wsrows=await db.execute("SELECT id FROM manager_workspaces WHERE manager_id=?",[manager_id])
+            _wid=int(_wsrows[0]['id']) if _wsrows else 0
+            _mset=await db.execute("SELECT key,value FROM manager_settings WHERE workspace_id=?",[_wid]) if _wid else []
+            _mset_map={str(r.get('key')):str(r.get('value')) for r in _mset}
+            weights={k:float(_mset_map.get(f'weight_{k}','10') or 10) for k in weight_keys}
+            mp=await get_manager_editorial_prompts(db,_wid)
+            source['_manager_mode']=True
+            source['_manager_metrics']=await manager_metric_payload(db,_wid) if _wid else {"metrics":[]}
+            max_ai_workers=int(_mset_map.get('max_ai_workers',DEFAULT_MAX_AI_WORKERS) or DEFAULT_MAX_AI_WORKERS)
+            min_score=float(_mset_map.get('min_content_score',DEFAULT_MIN_CONTENT_SCORE) or DEFAULT_MIN_CONTENT_SCORE)
+        else:
+            weights={k:float(await get_setting(db,f'weight_{k}','10')) for k in weight_keys}
+            mp=await get_manager_editorial_prompts(db)
+            max_ai_workers=int(await get_setting(db,'max_ai_workers',str(DEFAULT_MAX_AI_WORKERS)))
+            min_score=float(await get_setting(db,'min_content_score',str(DEFAULT_MIN_CONTENT_SCORE)))
+        sem=asyncio.Semaphore(max(1,min(4,max_ai_workers)))
         async def process_one(raw):
             try:
                 raw_title=strip_html_text(raw.get('title',''))[:500]; raw_desc=strip_html_text(raw.get('description',''))[:2000]; raw_url=normalize_url(raw.get('url'))
@@ -2891,11 +3064,11 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                         ins=await db.execute("INSERT INTO source_items(source_id,canonical_url,title,description,content,image_url,published_at,discovered_at,content_hash,status,category) VALUES(?,?,?,?,?,?,?,?,?,'analyzing',?) RETURNING id",
                             [source_id,url,title,item.get('description','')[:2000],body[:14000],str(item.get('image_url') or '')[:1000],item.get('published_at','')[:100],now.isoformat(),content_hash,source.get('category','tech')])
                         item_id=ins[0].get('id') if ins else 0
-                    out=await ai_editorial_process(ai,item,source,recent_titles,weights,await get_manager_editorial_prompts(db))
+                    out=await ai_editorial_process(ai,item,source,recent_titles,weights,mp)
                     if out.get('error'):
                         if item_id: await db.execute("UPDATE source_items SET status='error',last_error=?,retry_after=? WHERE id=?",[out['error'][:1200],(now+timedelta(minutes=15)).isoformat(),item_id])
                         return {'processed':1,'errors':1,'reason':out['error'][:220]}
-                    score=float(out.get('score',0) or 0); min_score=float(await get_setting(db,'min_content_score',str(DEFAULT_MIN_CONTENT_SCORE)))
+                    score=float(out.get('score',0) or 0)
                     # Manager controls the gate. Special low-threshold mode is intentional: when the
                     # manager sets the minimum to 0/1, every fresh, non-duplicate item is eligible.
                     # The AI is still used for extraction/formatting; it is not a hidden veto.
@@ -2928,12 +3101,12 @@ async def fetch_source_cycle(db: D1Database, source: Dict[str,Any], ai: AIProvid
                     if plain_len(article_text)<80:
                         if item_id: await db.execute("UPDATE source_items SET status='error',last_error=?,retry_after=? WHERE id=?",['generation produced no usable text',(now+timedelta(minutes=15)).isoformat(),item_id])
                         return {'processed':1,'errors':1,'reason':'generation empty'}
-                    art=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at,source_published_at) VALUES(?,?,?,?,?,?,?,?,'ready',?,?) RETURNING id",
-                        [item_id,title_out,channel_text,article_text[:18000],url,str(item.get('image_url') or '')[:1000],out.get('category') or source.get('category','tech'),score,now.isoformat(),item.get('published_at','')[:100]])
+                    art=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at,source_published_at,manager_id,channel_id) VALUES(?,?,?,?,?,?,?,?,'ready',?,?,?,?,?) RETURNING id",
+                        [item_id,title_out,channel_text,article_text[:18000],url,str(item.get('image_url') or '')[:1000],out.get('category') or source.get('category','general'),score,now.isoformat(),item.get('published_at','')[:100],manager_id,str(source.get('channel_id') or '')])
                     aid=art[0].get('id') if art else 0
                     token=make_deep_token(int(aid)); await db.execute('UPDATE articles SET deep_token=? WHERE id=?',[token,aid])
                     if item_id: await db.execute("UPDATE source_items SET status='ready',article_id=?,score=?,retry_after=NULL WHERE id=?",[aid,score,item_id])
-                    await db.execute("INSERT OR IGNORE INTO publication_queue(article_id,scheduled_at,status,attempts,created_at) VALUES(?,?, 'queued',0,?)",[aid,now.isoformat(),now.isoformat()])
+                    await db.execute("INSERT OR IGNORE INTO publication_queue(article_id,scheduled_at,status,attempts,created_at,manager_id,channel_id) VALUES(?,?, 'queued',0,?,?,?)",[aid,now.isoformat(),now.isoformat(),manager_id,str(source.get('channel_id') or '')])
                     return {'processed':1,'accepted':1,'queued':1,'score':score,'reason':'queued'}
             except Exception as e:
                 return {'processed':1,'errors':1,'reason':f"{type(e).__name__}: {str(e)[:220]}"}
@@ -3132,7 +3305,7 @@ async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> b
         tehran=datetime.now(pytz.timezone("Asia/Tehran"))
         count_rows=await db.execute("SELECT COUNT(*) c FROM articles WHERE status='published' AND COALESCE(published_at,created_at) >= ?",[tehran.replace(hour=0,minute=0,second=0,microsecond=0).astimezone(timezone.utc).isoformat()])
         if (count_rows[0].get("c",0) if count_rows else 0)>=max_daily: return False
-    elif not await can_publish_now(db):
+    elif await get_setting(db,"automation_enabled","0") != "1":
         return False
     now_iso=datetime.now(timezone.utc).isoformat()
     schedule_filter="" if force else " AND (q.scheduled_at IS NULL OR q.scheduled_at <= ?)"
@@ -3141,6 +3314,29 @@ async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> b
     if not rows:
         return False
     row=rows[0]; queue_id=row["queue_id"]; article_id=row["article_id"]
+    manager_id=int(row.get('manager_id') or row.get('manager_id') or 0)
+    if manager_id:
+        wsrows=await db.execute("SELECT id FROM manager_workspaces WHERE manager_id=?",[manager_id])
+        if wsrows:
+            plan=await manager_plan(db,int(wsrows[0]['id']))
+            if not plan:
+                await db.execute("UPDATE publication_queue SET status='failed',last_error=? WHERE id=?",['manager subscription inactive',queue_id]); return False
+            daily=await manager_daily_published(db,manager_id)
+            if daily>=int(plan.get('max_daily_posts') or 0):
+                return False
+        channel_id=str(row.get('channel_id') or '')
+    else:
+        channel_id=await get_channel_id(db)
+    if manager_id:
+        tehran=datetime.now(pytz.timezone("Asia/Tehran"))
+        _wsm=await db.execute("SELECT id FROM manager_workspaces WHERE manager_id=?",[manager_id])
+        _wid=int(_wsm[0]['id']) if _wsm else 0
+        _sm=await db.execute("SELECT key,value FROM manager_settings WHERE workspace_id=? AND key IN ('publish_start_hour','publish_end_hour','max_daily_posts','min_post_gap_minutes')",[_wid]) if _wid else []
+        _smap={str(r['key']):str(r.get('value') or '') for r in _sm}
+        start_h=int(_smap.get('publish_start_hour',DEFAULT_PUBLISH_START_HOUR) or DEFAULT_PUBLISH_START_HOUR)
+        end_h=int(_smap.get('publish_end_hour',DEFAULT_PUBLISH_END_HOUR) or DEFAULT_PUBLISH_END_HOUR)
+        if not (start_h <= tehran.hour <= end_h):
+            return False
     if not row.get("image_url") and row.get("recovered_image_url"):
         row["image_url"]=row.get("recovered_image_url")
     await db.execute("UPDATE publication_queue SET status='publishing',attempts=attempts+1 WHERE id=?",[queue_id])
@@ -3149,7 +3345,8 @@ async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> b
         bot_username=await get_runtime_bot_username(bot)
         if not token or not bot_username: raise RuntimeError("deep link token یا نام کاربری ربات تنظیم نشده است")
         deep_link=f"https://t.me/{bot_username}?start=article_{token}"
-        channel_id=await get_channel_id(db)
+        channel_id=str(row.get('channel_id') or '') or await get_channel_id(db)
+        if not channel_id: raise RuntimeError("کانال انتشار برای این محتوا تنظیم نشده است")
         title_out=str(row.get("title") or "مطلب")
         category_out=str(row.get("category") or "tech")
         article_body=sanitize_telegram_html(row.get("body") or "")
@@ -3160,10 +3357,20 @@ async def publish_next_article(db: D1Database, bot: Bot, force: bool=False) -> b
         # extra material. Every channel post still gets the mandatory branded footer.
         attach_bot=should_attach_bot_link(channel_text, article_body, content_type)
         navigation_link=deep_link if attach_bot else None
-        image_url=await resolve_article_image(db,row)
+        image_url='' if row.get('manual_file_id') else await resolve_article_image(db,row)
         final_text=publication_caption(title_out,channel_text,navigation_link)
         sent=None
-        if image_url:
+        manual_file=row.get('manual_file_id')
+        manual_type=row.get('manual_media_type')
+        if manual_file and manual_type:
+            try:
+                if manual_type=='photo': sent=await bot.send_photo(chat_id=channel_id,photo=manual_file,caption=final_text,parse_mode='HTML')
+                elif manual_type=='video': sent=await bot.send_video(chat_id=channel_id,video=manual_file,caption=final_text,parse_mode='HTML')
+                elif manual_type=='document': sent=await bot.send_document(chat_id=channel_id,document=manual_file,caption=final_text,parse_mode='HTML')
+                elif manual_type=='audio': sent=await bot.send_audio(chat_id=channel_id,audio=manual_file,caption=final_text,parse_mode='HTML')
+            except Exception as media_error:
+                await log_automation(db,'WARN','manager_manual_media_failed',f'article={article_id} {media_error}')
+        if sent is None and image_url:
             try:
                 sent=await bot.send_photo(chat_id=channel_id,photo=image_url,caption=final_text,parse_mode="HTML")
             except Exception as img_error:
@@ -3478,6 +3685,13 @@ class BotStates(StatesGroup):
     admin_channel_input = State()
     admin_automation_setting = State()
     automation_article_edit = State()
+    manager_channel_input = State()
+    manager_source_input = State()
+    manager_prompt_input = State()
+    manager_manual_content = State()
+    super_help_input = State()
+    manager_metric_input = State()
+    manager_schedule_input = State()
 
 # ============================================================
 # بخش کیبوردهای ربات (Keyboards)
@@ -3503,6 +3717,8 @@ def get_admin_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📢 ارسال همگانی", callback_data="admin_broadcast"),
          InlineKeyboardButton(text="➕ افزودن پست", callback_data="admin_add_post")],
         [InlineKeyboardButton(text="📊 آمار کلی", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="👥 مدیران و اشتراک‌ها", callback_data="super_managers")],
+        [InlineKeyboardButton(text="❓ متن /help", callback_data="super_help")],
         [InlineKeyboardButton(text="👤 حالت کاربری", callback_data="admin_user_mode")]
     ])
 
@@ -3863,9 +4079,7 @@ async def cmd_about(message: Message, db: D1Database):
 
 @router.message(Command("help"))
 async def cmd_help(message: Message, db: D1Database):
-    help_text=("❓ <b>راهنمای دستورات</b>\n\n"
-               "📞 /man • ➜ <b>ارتباط</b>\n"
-               "🔑 /about • ➜ <b>این ربات چیست ؟</b>")
+    help_text=await get_setting(db,"bot_help_text","❓ <b>راهنمای دستورات</b>\n\n📞 /man • ➜ <b>ارتباط با مدیریت کلان</b>\n🔑 /about • ➜ <b>این ربات چیست ؟</b>")
     await message.answer(help_text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی",callback_data="user_home")]]))
 
 @router.message(Command("man"))
@@ -3875,6 +4089,22 @@ async def cmd_man(message: Message, state: FSMContext):
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, db: D1Database, bot: Bot):
+    raw=(message.text or '').strip()
+    if ' ' in raw:
+        payload=raw.split(' ',1)[1].strip()
+        if payload.startswith('contact_'):
+            token=payload[len('contact_'):]
+            rows=await db.execute("SELECT manager_id,name FROM manager_workspaces WHERE contact_token=? LIMIT 1",[token])
+            if rows:
+                mid=int(rows[0]['manager_id'])
+                if mid==message.from_user.id:
+                    await message.answer('ℹ️ این لینک ارتباطی متعلق به خودت است.')
+                else:
+                    await state.set_state(BotStates.user_chat_admin); await state.update_data(contact_manager_id=mid)
+                    await message.answer(f"📞 گفت‌وگو با مدیریت <b>{html.escape(str(rows[0].get('name') or ''))}</b> آغاز شد.\n\nپیامت را بفرست.",parse_mode='HTML',reply_markup=get_exit_menu())
+                return
+            await message.answer('❌ لینک ارتباطی معتبر نیست یا منقضی شده است.')
+            return
     user_id = message.from_user.id
     await register_user_if_not_exists(db, user_id)
     await state.set_state(BotStates.idle)
@@ -4051,20 +4281,21 @@ async def process_user_chat_admin(message: Message, state: FSMContext, bot: Bot)
     user_id = message.from_user.id
     if user_id == ADMIN_ID:
         return
-        
+    _contact_data=await state.get_data()
+    _target_manager=int(_contact_data.get('contact_manager_id') or ADMIN_ID)
     hashtag = f"#User_{user_id}"
     caption = message.caption or ""
     
     if message.photo:
-        await bot.send_photo(chat_id=ADMIN_ID, photo=message.photo[-1].file_id, caption=f"پیام جدید:\n{hashtag}\n\n{caption}")
+        await bot.send_photo(chat_id=_target_manager, photo=message.photo[-1].file_id, caption=f"پیام جدید:\n{hashtag}\n\n{caption}")
     elif message.document:
-        await bot.send_document(chat_id=ADMIN_ID, document=message.document.file_id, caption=f"فایل جدید:\n{hashtag}\n\n{caption}")
+        await bot.send_document(chat_id=_target_manager, document=message.document.file_id, caption=f"فایل جدید:\n{hashtag}\n\n{caption}")
     elif message.video:
-        await bot.send_video(chat_id=ADMIN_ID, video=message.video.file_id, caption=f"ویدیو جدید:\n{hashtag}\n\n{caption}")
+        await bot.send_video(chat_id=_target_manager, video=message.video.file_id, caption=f"ویدیو جدید:\n{hashtag}\n\n{caption}")
     elif message.audio:
-        await bot.send_audio(chat_id=ADMIN_ID, audio=message.audio.file_id, caption=f"صوت جدید:\n{hashtag}\n\n{caption}")
+        await bot.send_audio(chat_id=_target_manager, audio=message.audio.file_id, caption=f"صوت جدید:\n{hashtag}\n\n{caption}")
     elif message.text:
-        await bot.send_message(chat_id=ADMIN_ID, text=f"پیام جدید:\n{hashtag}\n\n{message.text}")
+        await bot.send_message(chat_id=_target_manager, text=f"پیام جدید:\n{hashtag}\n\n{message.text}")
 
 @router.message(StateFilter(BotStates.waiting_post_content))
 async def process_add_post_content(message: Message, state: FSMContext, bot: Bot):
@@ -4376,6 +4607,24 @@ async def admin_add_source_input(message: Message, state: FSMContext, db: D1Data
 @router.message(F.chat.id == ADMIN_ID, StateFilter(BotStates.admin_automation_setting))
 async def admin_automation_setting_input(message:Message,state:FSMContext,db:D1Database,bot:Bot):
     data=await state.get_data(); key=data.get("automation_setting_key")
+    if data.get('manager_schedule_key') and message.from_user.id != ADMIN_ID:
+        ws=await manager_workspace(db,message.from_user.id)
+        if not ws: await state.set_state(BotStates.idle); return
+        sk=data.get('manager_schedule_key'); value=(message.text or '').strip()
+        if sk=='max_daily_posts':
+            plan=await manager_plan(db,int(ws['id'])); val=max(1,int(value));
+            if plan and val>int(plan['max_daily_posts']): raise ValueError('سقف عمومی نمی‌تواند از سقف پلن بیشتر باشد.')
+            await db.execute("INSERT OR REPLACE INTO manager_settings(workspace_id,key,value,updated_at) VALUES(?,?,?,?)",[int(ws['id']),sk,str(val),datetime.now(timezone.utc).isoformat()])
+        elif sk=='min_post_gap_minutes':
+            val=max(1,int(value)); await db.execute("INSERT OR REPLACE INTO manager_settings(workspace_id,key,value,updated_at) VALUES(?,?,?,?)",[int(ws['id']),sk,str(val),datetime.now(timezone.utc).isoformat()])
+        elif sk=='publish_hours':
+            m=re.fullmatch(r'\s*(?:[01]?\d|2[0-3])\s*[-:]\s*(?:[01]?\d|2[0-3])\s*',value)
+            if not m: raise ValueError('فرمت درست: 08-23')
+            parts=re.findall(r'(?:[01]?\d|2[0-3])',value)
+            if int(parts[0])==int(parts[1]): raise ValueError('ساعت شروع و پایان یکسان نباشد.')
+            for k,v in [('publish_start_hour',parts[0]),('publish_end_hour',parts[1])]:
+                await db.execute("INSERT OR REPLACE INTO manager_settings(workspace_id,key,value,updated_at) VALUES(?,?,?,?)",[int(ws['id']),k,v,datetime.now(timezone.utc).isoformat()])
+        await state.set_state(BotStates.idle); await message.answer('✅ تنظیمات انتشار ذخیره شد.',reply_markup=manager_menu_kb()); return
     # For the About field, preserve Telegram's native formatting/links when the admin
     # sends rich text from the Telegram composer. Other settings remain plain text.
     if key == "bot_about_text":
@@ -4808,9 +5057,7 @@ async def user_profile(call: CallbackQuery, db: D1Database):
 
 @router.callback_query(F.data == "user_help")
 async def user_help(call: CallbackQuery, db: D1Database):
-    help_text=("❓ <b>راهنمای دستورات</b>\n\n"
-               "📞 /man • ➜ <b>ارتباط</b>\n"
-               "🔑 /about • ➜ <b>این ربات چیست ؟</b>")
+    help_text=await get_setting(db,"bot_help_text","❓ <b>راهنمای دستورات</b>\n\n📞 /man • ➜ <b>ارتباط با مدیریت کلان</b>\n🔑 /about • ➜ <b>این ربات چیست ؟</b>")
     await call.message.edit_text(help_text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 منوی اصلی",callback_data="user_home")]]))
     await call.answer()
 
@@ -6724,6 +6971,377 @@ async def callback_confirm_broadcast_no(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "noop")
 async def callback_noop_dummy(call: CallbackQuery):
     await call.answer()
+
+# ============================================================
+# پلتفرم چندمدیره / Multi-Tenant Manager Platform
+# ============================================================
+def manager_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 کانال‌های من", callback_data="mgr_channels"), InlineKeyboardButton(text="🌐 منابع من", callback_data="mgr_sources")],
+        [InlineKeyboardButton(text="✍️ Prompt و معیارها", callback_data="mgr_prompts"), InlineKeyboardButton(text="📊 تحلیل محتوا", callback_data="mgr_analytics")],
+        [InlineKeyboardButton(text="⏰ انتشار و زمان‌بندی", callback_data="mgr_schedule")],
+        [InlineKeyboardButton(text="📝 افزودن محتوای دستی", callback_data="mgr_manual"), InlineKeyboardButton(text="💳 اشتراک من", callback_data="mgr_subscription")],
+        [InlineKeyboardButton(text="🔗 لینک ارتباط با من", callback_data="mgr_contact_link")],
+        [InlineKeyboardButton(text="🏠 منوی کاربر", callback_data="user_home")]
+    ])
+
+def super_manager_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 فهرست مدیران", callback_data="super_manager_list")],
+        [InlineKeyboardButton(text="💳 پلن‌ها و اشتراک‌ها", callback_data="super_plans")],
+        [InlineKeyboardButton(text="📈 آمار تفکیکی مدیران", callback_data="super_manager_stats")],
+        [InlineKeyboardButton(text="👤 کاربران ربات", callback_data="super_users")],
+        [InlineKeyboardButton(text="🔙 پنل اصلی", callback_data="admin_home")]
+    ])
+
+@router.message(Command("create"))
+async def cmd_create_manager(message: Message, state: FSMContext, db: D1Database):
+    if message.from_user.id == ADMIN_ID:
+        await message.answer("ℹ️ شما Super Admin هستید؛ پنل اصلی مدیریت برای شما فعال است.",reply_markup=get_admin_menu()); return
+    ws=await create_manager_workspace(db,message.from_user.id,(message.from_user.full_name or '')[:120])
+    await state.update_data(manager_mode=True)
+    await message.answer(await manager_dashboard(db,message.from_user.id)+"\n\n🎉 دوره آزمایشی شما فعال شد.",parse_mode='HTML',reply_markup=manager_menu_kb())
+
+@router.callback_query(F.data == "manager_home")
+async def manager_home(call: CallbackQuery, db: D1Database):
+    ws=await manager_workspace(db,call.from_user.id)
+    if not ws: await call.answer("ابتدا /create را اجرا کن.",show_alert=True); return
+    await call.message.edit_text(await manager_dashboard(db,call.from_user.id),parse_mode='HTML',reply_markup=manager_menu_kb()); await call.answer()
+
+@router.callback_query(F.data == "mgr_subscription")
+async def mgr_subscription(call: CallbackQuery, db: D1Database):
+    ws=await manager_workspace(db,call.from_user.id)
+    if not ws: return
+    await call.message.edit_text(await manager_subscription_text(db,int(ws['id']))+"\n\nبرای ارتقا، درخواستت را از طریق مدیریت پلتفرم ارسال کن.",parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📩 درخواست ارتقا",callback_data="mgr_upgrade_request")],[InlineKeyboardButton(text="🔙 پنل مدیریت",callback_data="manager_home")]])); await call.answer()
+
+@router.callback_query(F.data == "mgr_upgrade_request")
+async def mgr_upgrade_request(call: CallbackQuery, db: D1Database, bot: Bot):
+    ws=await manager_workspace(db,call.from_user.id)
+    if ws:
+        await bot.send_message(ADMIN_ID,f"📩 درخواست ارتقای اشتراک\nمدیر: <code>{call.from_user.id}</code>\nWorkspace: <code>{ws['id']}</code>",parse_mode='HTML')
+    await call.answer("درخواست برای مدیریت کلان ارسال شد.",show_alert=True)
+
+@router.callback_query(F.data == "mgr_contact_link")
+async def mgr_contact_link(call: CallbackQuery, db: D1Database, bot: Bot):
+    ws=await manager_workspace(db,call.from_user.id)
+    if not ws: return
+    username=await get_runtime_bot_username(bot)
+    link=f"https://t.me/{username}?start=contact_{ws['contact_token']}" if username and ws.get('contact_token') else ''
+    await call.message.edit_text(f"📞 <b>لینک اختصاصی ارتباط با مدیریت</b>\n\n{html.escape(link)}\n\nاین لینک را خودت در هر کانال یا صفحه‌ای که خواستی قرار بده. در راهنمای عمومی ربات نمایش داده نمی‌شود.",parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 پنل مدیریت",callback_data="manager_home")]])); await call.answer()
+
+@router.callback_query(F.data == "mgr_channels")
+async def mgr_channels(call: CallbackQuery, db: D1Database):
+    ws=await manager_workspace(db,call.from_user.id)
+    if not ws: return
+    rows=await manager_channels(db,int(ws['id']))
+    text="📢 <b>کانال‌های من</b>\n\n"+("\n".join([f"• {html.escape(str(r.get('title') or r.get('username') or r.get('chat_id')))} — <code>{html.escape(str(r.get('chat_id')))}</code>" for r in rows]) if rows else "هنوز کانالی متصل نشده است.")
+    kb=[[InlineKeyboardButton(text="➕ افزودن کانال",callback_data="mgr_add_channel")],[InlineKeyboardButton(text="🔙 پنل مدیریت",callback_data="manager_home")]]
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)); await call.answer()
+
+@router.callback_query(F.data == "mgr_add_channel")
+async def mgr_add_channel(call: CallbackQuery,state:FSMContext):
+    await state.set_state(BotStates.manager_channel_input); await state.update_data(manager_channel_mode=True,parent_callback='manager_home')
+    await call.message.edit_text("📢 شناسه یا @username کانال را بفرست.\n\nربات باید داخل کانال دسترسی مدیریت برای انتشار داشته باشد.",reply_markup=get_exit_menu()); await call.answer()
+
+@router.message(StateFilter(BotStates.manager_channel_input))
+async def manager_channel_input(message: Message,state:FSMContext,db:D1Database,bot:Bot):
+    data=await state.get_data()
+    if not data.get('manager_channel_mode'): return
+    ws=await manager_workspace(db,message.from_user.id)
+    if not ws: await state.set_state(BotStates.idle); return
+    plan=await manager_plan(db,int(ws['id']))
+    if not plan: await message.answer("⚠️ اشتراک فعال نیست."); return
+    existing=await manager_channels(db,int(ws['id']))
+    if len(existing)>=int(plan['max_channels']): await message.answer(f"❌ سقف کانال‌های پلن شما ({plan['max_channels']}) تکمیل است.",reply_markup=manager_menu_kb()); await state.set_state(BotStates.idle); return
+    target=(message.text or '').strip()
+    if not target: return
+    try:
+        chat=await bot.get_chat(target)
+        me=await bot.get_me(); member=await bot.get_chat_member(chat.id,me.id)
+        if str(getattr(member,'status','')) not in {'administrator','creator'}: raise ValueError('ربات در این کانال مدیر نیست.')
+        await db.execute("INSERT OR IGNORE INTO manager_channels(workspace_id,chat_id,title,username,enabled,created_at) VALUES(?,?,?,?,1,?)",[int(ws['id']),str(chat.id),str(chat.title or ''),str(chat.username or ''),datetime.now(timezone.utc).isoformat()])
+        await state.set_state(BotStates.idle); await message.answer("✅ کانال با موفقیت متصل شد.",reply_markup=manager_menu_kb())
+    except Exception as exc:
+        await message.answer(f"❌ اتصال کانال انجام نشد: {html.escape(str(exc))}",parse_mode='HTML',reply_markup=get_exit_menu())
+
+@router.callback_query(F.data == "mgr_sources")
+async def mgr_sources(call: CallbackQuery, db:D1Database):
+    ws=await manager_workspace(db,call.from_user.id)
+    if not ws: return
+    rows=await db.execute("SELECT s.*,mc.title channel_title FROM sources s LEFT JOIN manager_channels mc ON mc.chat_id=s.channel_id AND mc.workspace_id=? WHERE s.manager_id=? ORDER BY s.id DESC",[int(ws['id']),call.from_user.id])
+    text="🌐 <b>منابع من</b>\n\n"+("\n".join([f"• {html.escape(str(r.get('name') or r.get('url')))} → {html.escape(str(r.get('channel_title') or 'بدون کانال'))}" for r in rows]) if rows else "هنوز منبع اضافه نشده است.")
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➕ افزودن منبع",callback_data="mgr_add_source")],[InlineKeyboardButton(text="🔙 پنل مدیریت",callback_data="manager_home")]])); await call.answer()
+
+@router.callback_query(F.data == "mgr_add_source")
+async def mgr_add_source(call:CallbackQuery,state:FSMContext,db:D1Database):
+    ws=await manager_workspace(db,call.from_user.id)
+    if not ws: return
+    channels=await manager_channels(db,int(ws['id']))
+    if not channels: await call.answer("ابتدا حداقل یک کانال اضافه کن.",show_alert=True); return
+    buttons=[[InlineKeyboardButton(text=str(c.get('title') or c.get('username') or c.get('chat_id')),callback_data=f"mgr_source_channel_{c['id']}")] for c in channels]
+    buttons.append([InlineKeyboardButton(text="🔙 بازگشت",callback_data="mgr_sources")])
+    await call.message.edit_text("📢 منبع جدید به کدام کانال وصل شود؟",reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)); await call.answer()
+
+@router.callback_query(F.data.startswith("mgr_source_channel_"))
+async def mgr_source_channel(call:CallbackQuery,state:FSMContext):
+    cid=int(call.data.rsplit('_',1)[1]); await state.set_state(BotStates.manager_source_input); await state.update_data(manager_source_mode=True,manager_channel_db_id=cid); await call.message.edit_text("🌐 URL منبع را بفرست:",reply_markup=get_exit_menu()); await call.answer()
+
+@router.message(StateFilter(BotStates.manager_source_input))
+async def manager_source_input(message:Message,state:FSMContext,db:D1Database):
+    data=await state.get_data()
+    if not data.get('manager_source_mode'): return
+    ws=await manager_workspace(db,message.from_user.id)
+    if not ws: return
+    url=(message.text or '').strip()
+    if not re.match(r'^https?://',url,re.I): await message.answer('❌ URL معتبر نیست.'); return
+    ch=await db.execute("SELECT chat_id FROM manager_channels WHERE id=? AND workspace_id=? AND enabled=1",[int(data['manager_channel_db_id']),int(ws['id'])])
+    if not ch: await message.answer('❌ کانال انتخاب‌شده دیگر در دسترس نیست.'); return
+    try:
+        sid=await manager_source_add(db,message.from_user.id,int(ws['id']),str(ch[0]['chat_id']),url,'general')
+        await state.set_state(BotStates.idle); await message.answer(f"✅ منبع #{sid} اضافه شد.",reply_markup=manager_menu_kb())
+    except Exception as exc: await message.answer(f"❌ افزودن منبع ناموفق بود: {html.escape(str(exc))}",parse_mode='HTML',reply_markup=get_exit_menu())
+
+@router.callback_query(F.data == "mgr_prompts")
+async def mgr_prompts(call:CallbackQuery,db:D1Database):
+    ws=await manager_workspace(db,call.from_user.id)
+    if not ws: return
+    rows=await db.execute("SELECT channel_prompt,article_prompt FROM manager_prompts WHERE workspace_id=?",[int(ws['id'])])
+    ch=str(rows[0].get('channel_prompt') or '') if rows else ''; ar=str(rows[0].get('article_prompt') or '') if rows else ''
+    text=f"✍️ <b>Prompt مدیر</b>\n\n📌 کوتاه:\n<code>{html.escape(ch[:800])}</code>\n\n📝 کامل:\n<code>{html.escape(ar[:800])}</code>\n\n🔒 قوانین ثابت پلتفرم جدا و غیرقابل‌تغییرند؛ Prompt شما فقط در قلمرو محتوایی خودش اعمال می‌شود."
+    kb=[[InlineKeyboardButton(text="✍️ ویرایش کوتاه",callback_data="mgr_prompt_channel")],[InlineKeyboardButton(text="📝 ویرایش کامل",callback_data="mgr_prompt_article")],[InlineKeyboardButton(text="🎯 معیارهای انتخاب محتوا",callback_data="mgr_metrics")],[InlineKeyboardButton(text="🔙 پنل مدیریت",callback_data="manager_home")]]
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)); await call.answer()
+
+@router.callback_query(F.data.in_({"mgr_prompt_channel","mgr_prompt_article"}))
+async def mgr_prompt_start(call:CallbackQuery,state:FSMContext):
+    key='channel' if call.data.endswith('channel') else 'article'; await state.set_state(BotStates.manager_prompt_input); await state.update_data(manager_prompt_mode=key); await call.message.edit_text("✍️ Prompt را بفرست.\n\nسیستم قبل از ذخیره، تلاش برای تغییر قوانین ثابت پلتفرم را بررسی می‌کند.",reply_markup=get_exit_menu()); await call.answer()
+
+@router.message(StateFilter(BotStates.manager_prompt_input))
+async def manager_prompt_input(message:Message,state:FSMContext,db:D1Database):
+    data=await state.get_data()
+    if not data.get('manager_prompt_mode'): return
+    ws=await manager_workspace(db,message.from_user.id)
+    if not ws: return
+    key=data['manager_prompt_mode']; value=(message.text or '').strip()
+    ok,reason=await manager_prompt_validation(value)
+    if not ok: await message.answer('⚠️ '+reason,reply_markup=get_exit_menu()); return
+    rows=await db.execute("SELECT channel_prompt,article_prompt FROM manager_prompts WHERE workspace_id=?",[int(ws['id'])])
+    ch=str(rows[0].get('channel_prompt') or '') if rows else ''; ar=str(rows[0].get('article_prompt') or '') if rows else ''
+    if key=='channel': ch=value
+    else: ar=value
+    await db.execute("INSERT OR REPLACE INTO manager_prompts(workspace_id,channel_prompt,article_prompt,updated_at) VALUES(?,?,?,?)",[int(ws['id']),ch,ar,datetime.now(timezone.utc).isoformat()])
+    await state.set_state(BotStates.idle); await message.answer('✅ Prompt ذخیره شد.',reply_markup=manager_menu_kb())
+
+@router.callback_query(F.data == "mgr_metrics")
+async def mgr_metrics(call:CallbackQuery,db:D1Database):
+    ws=await manager_workspace(db,call.from_user.id)
+    if not ws: return
+    rows=await manager_metrics(db,int(ws['id']))
+    text="🎯 <b>معیارهای انتخاب محتوا</b>\n\n"+('\n'.join([f"• {html.escape(str(r['label']))}: <b>{r['weight']}</b>" for r in rows]) if rows else 'معیاری تعریف نشده.')+"\n\nبرای تغییر یک معیار، نام دقیق آن را همراه وزن بفرست؛ نمونه: <code>تازگی=40</code>"
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✏️ تغییر وزن',callback_data='mgr_metric_edit')],[InlineKeyboardButton(text='➕ افزودن معیار',callback_data='mgr_metric_add')],[InlineKeyboardButton(text='🔙 Prompt',callback_data='mgr_prompts')]])); await call.answer()
+
+@router.callback_query(F.data.in_({'mgr_metric_edit','mgr_metric_add'}))
+async def mgr_metric_start(call:CallbackQuery,state:FSMContext):
+    await state.set_state(BotStates.manager_metric_input); await state.update_data(manager_metric_mode='add' if call.data.endswith('add') else 'edit'); await call.message.edit_text('🎯 فرمت: <code>نام معیار=وزن</code>\n\nوزن بین ۰ تا ۱۰۰. برای معیار موجود وزن آن تغییر می‌کند؛ برای نام جدید یک معیار جدید ساخته می‌شود.',parse_mode='HTML',reply_markup=get_exit_menu()); await call.answer()
+
+@router.message(StateFilter(BotStates.manager_metric_input))
+async def mgr_metric_input(message:Message,state:FSMContext,db:D1Database):
+    ws=await manager_workspace(db,message.from_user.id)
+    if not ws: return
+    raw=(message.text or '').strip()
+    if '=' not in raw: await message.answer('❌ فرمت صحیح: نام معیار=وزن'); return
+    label,wraw=raw.rsplit('=',1); label=label.strip();
+    try: weight=max(0,min(100,float(wraw.strip())))
+    except: await message.answer('❌ وزن عددی نیست.'); return
+    if not label or len(label)>80: await message.answer('❌ نام معیار نامعتبر است.'); return
+    key=re.sub(r'[^a-zA-Z0-9_]+','_',label.lower()).strip('_') or ('custom_'+hashlib.sha1(label.encode()).hexdigest()[:10])
+    await db.execute("INSERT INTO manager_metrics(workspace_id,metric_key,label,weight,enabled) VALUES(?,?,?,?,1) ON CONFLICT(workspace_id,metric_key) DO UPDATE SET label=excluded.label,weight=excluded.weight,enabled=1",[int(ws['id']),key,label,weight])
+    await state.set_state(BotStates.idle); await message.answer('✅ معیار ذخیره شد.',reply_markup=manager_menu_kb())
+
+@router.callback_query(F.data == "mgr_schedule")
+async def mgr_schedule(call:CallbackQuery,db:D1Database):
+    ws=await manager_workspace(db,call.from_user.id)
+    if not ws: return
+    rows=await db.execute("SELECT key,value FROM manager_settings WHERE workspace_id=? AND key IN ('max_daily_posts','publish_start_hour','publish_end_hour','min_post_gap_minutes')",[int(ws['id'])])
+    m={str(r['key']):str(r.get('value') or '') for r in rows}
+    plan=await manager_plan(db,int(ws['id']))
+    max_plan=int(plan['max_daily_posts']) if plan else 0
+    text=f"⏰ <b>انتشار و زمان‌بندی</b>\n\n🔢 سقف عمومی روزانه: <b>{m.get('max_daily_posts',max_plan)}</b> (حداکثر پلن {max_plan})\n🕐 بازه: <b>{m.get('publish_start_hour',DEFAULT_PUBLISH_START_HOUR)}-{m.get('publish_end_hour',DEFAULT_PUBLISH_END_HOUR)}</b>\n⏱ فاصله عمومی: <b>{m.get('min_post_gap_minutes',DEFAULT_MIN_POST_GAP_MINUTES)} دقیقه</b>\n\nاین تنظیمات عمومی‌اند؛ محدودیت پلن همیشه سقف نهایی است."
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔢 سقف روزانه',callback_data='mgr_set_max_daily')],[InlineKeyboardButton(text='🕐 ساعت انتشار',callback_data='mgr_set_hours')],[InlineKeyboardButton(text='⏱ فاصله انتشار',callback_data='mgr_set_gap')],[InlineKeyboardButton(text='🔙 پنل مدیریت',callback_data='manager_home')]])); await call.answer()
+
+@router.callback_query(F.data.in_({'mgr_set_max_daily','mgr_set_hours','mgr_set_gap'}))
+async def mgr_schedule_start(call:CallbackQuery,state:FSMContext):
+    key={'mgr_set_max_daily':'max_daily_posts','mgr_set_hours':'publish_hours','mgr_set_gap':'min_post_gap_minutes'}[call.data]
+    await state.set_state(BotStates.manager_schedule_input); await state.update_data(manager_schedule_key=key)
+    prompt={'max_daily_posts':'عدد سقف روزانه را بفرست.','publish_hours':'بازه را مثل 08-23 بفرست.','min_post_gap_minutes':'فاصله را بر حسب دقیقه بفرست.'}[key]
+    await call.message.edit_text('⏰ '+prompt,reply_markup=get_exit_menu()); await call.answer()
+
+@router.message(StateFilter(BotStates.manager_schedule_input))
+async def manager_schedule_input(message:Message,state:FSMContext,db:D1Database):
+    ws=await manager_workspace(db,message.from_user.id)
+    if not ws: return
+    sk=(await state.get_data()).get('manager_schedule_key'); value=(message.text or '').strip()
+    try:
+        if sk=='max_daily_posts':
+            val=max(1,int(value)); plan=await manager_plan(db,int(ws['id']))
+            if plan and val>int(plan['max_daily_posts']): raise ValueError('سقف عمومی نمی‌تواند از سقف پلن بیشتر باشد.')
+            await db.execute("INSERT OR REPLACE INTO manager_settings(workspace_id,key,value,updated_at) VALUES(?,?,?,?)",[int(ws['id']),sk,str(val),datetime.now(timezone.utc).isoformat()])
+        elif sk=='min_post_gap_minutes':
+            val=max(1,int(value)); await db.execute("INSERT OR REPLACE INTO manager_settings(workspace_id,key,value,updated_at) VALUES(?,?,?,?)",[int(ws['id']),sk,str(val),datetime.now(timezone.utc).isoformat()])
+        elif sk=='publish_hours':
+            m=re.fullmatch(r'\s*(?:[01]?\d|2[0-3])\s*[-:]\s*(?:[01]?\d|2[0-3])\s*',value)
+            if not m: raise ValueError('فرمت درست: 08-23')
+            parts=re.findall(r'(?:[01]?\d|2[0-3])',value)
+            if int(parts[0])==int(parts[1]): raise ValueError('ساعت شروع و پایان یکسان نباشد.')
+            for k,v in [('publish_start_hour',parts[0]),('publish_end_hour',parts[1])]:
+                await db.execute("INSERT OR REPLACE INTO manager_settings(workspace_id,key,value,updated_at) VALUES(?,?,?,?)",[int(ws['id']),k,v,datetime.now(timezone.utc).isoformat()])
+        else: raise ValueError('تنظیم نامعتبر است.')
+    except Exception as exc:
+        await message.answer(f'❌ {html.escape(str(exc))}',parse_mode='HTML',reply_markup=get_exit_menu()); return
+    await state.set_state(BotStates.idle); await message.answer('✅ تنظیمات انتشار ذخیره شد.',reply_markup=manager_menu_kb())
+
+@router.callback_query(F.data == "mgr_analytics")
+async def mgr_analytics(call:CallbackQuery,db:D1Database):
+    uid=call.from_user.id; ws=await manager_workspace(db,uid)
+    if not ws: return
+    rows=await db.execute("SELECT a.id,a.title,a.deep_views,COALESCE(SUM(CASE WHEN v.vote_type='like' THEN 1 ELSE 0 END),0) likes,COALESCE(SUM(CASE WHEN v.vote_type='dislike' THEN 1 ELSE 0 END),0) dislikes FROM articles a LEFT JOIN user_content_votes v ON v.content_type='article' AND v.content_id=a.id WHERE a.manager_id=? GROUP BY a.id ORDER BY likes DESC, a.deep_views DESC LIMIT 10",[uid])
+    text="📊 <b>تحلیل محتوای من</b>\n\n"+("\n".join([f"#{r['id']} {html.escape(str(r.get('title') or '')[:70])}\n👁 {r.get('deep_views',0)} · 👍 {r.get('likes',0)} · 👎 {r.get('dislikes',0)}" for r in rows]) if rows else 'هنوز محتوایی برای تحلیل وجود ندارد.')
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 پنل مدیریت",callback_data="manager_home")]])); await call.answer()
+
+@router.callback_query(F.data == "mgr_manual")
+async def mgr_manual(call:CallbackQuery,state:FSMContext,db:D1Database):
+    ws=await manager_workspace(db,call.from_user.id)
+    if not ws: return
+    ch=await manager_channels(db,int(ws['id']))
+    if not ch: await call.answer('ابتدا کانال اضافه کن.',show_alert=True); return
+    buttons=[[InlineKeyboardButton(text=str(c.get('title') or c.get('username') or c.get('chat_id')),callback_data=f'mgr_manual_channel_{c["id"]}')] for c in ch]
+    buttons.append([InlineKeyboardButton(text='🔙 پنل مدیریت',callback_data='manager_home')])
+    await call.message.edit_text('📢 محتوای دستی برای کدام کانال؟',reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)); await call.answer()
+
+@router.callback_query(F.data.startswith('mgr_manual_channel_'))
+async def mgr_manual_channel(call:CallbackQuery,state:FSMContext,db:D1Database):
+    ws=await manager_workspace(db,call.from_user.id)
+    if not ws: return
+    cid=int(call.data.rsplit('_',1)[1]); rows=await db.execute("SELECT chat_id FROM manager_channels WHERE id=? AND workspace_id=? AND enabled=1",[cid,int(ws['id'])])
+    if not rows: await call.answer('کانال معتبر نیست.',show_alert=True); return
+    await state.set_state(BotStates.manager_manual_content); await state.update_data(manager_manual_mode=True,manager_workspace_id=int(ws['id']),manager_channel_id=str(rows[0]['chat_id']))
+    await call.message.edit_text('📝 محتوای دستی را بفرست؛ متن، تصویر، ویدیو یا سند. این قابلیت مستقل از اتوماسیون منابع باقی می‌ماند.',reply_markup=get_exit_menu()); await call.answer()
+
+@router.message(StateFilter(BotStates.manager_manual_content))
+async def manager_manual_input(message:Message,state:FSMContext,db:D1Database,bot:Bot):
+    data=await state.get_data()
+    if not data.get('manager_manual_mode'): return
+    uid=message.from_user.id; ws=await manager_workspace(db,uid)
+    if not ws: return
+    file_id=None; media_type=None; caption=message.text or message.caption or ''
+    if message.photo: file_id=message.photo[-1].file_id; media_type='photo'
+    elif message.document: file_id=message.document.file_id; media_type='document'
+    elif message.video: file_id=message.video.file_id; media_type='video'
+    elif message.audio: file_id=message.audio.file_id; media_type='audio'
+    if not file_id and not caption.strip(): await message.answer('❌ متن یا فایل معتبر بفرست.'); return
+    # Store as a normal article so deep-link, saves, votes and analytics remain unified.
+    title=strip_html_text(caption.splitlines()[0] if caption else 'محتوای دستی')[:500]
+    body=sanitize_telegram_html(caption or 'محتوای دستی')
+    now=datetime.now(timezone.utc)
+    art=await db.execute("INSERT INTO articles(source_item_id,title,channel_text,body,source_url,image_url,category,score,status,created_at,manager_id,channel_id,manual_file_id,manual_media_type) VALUES(NULL,?,?,?,?,?,?,?,'ready',?,?,?,?,?) RETURNING id",[title,body,body,'','','general',100,now.isoformat(),uid,str(data.get('manager_channel_id') or ''),file_id,media_type])
+    aid=int(art[0]['id']); token=make_deep_token(aid); await db.execute("UPDATE articles SET deep_token=? WHERE id=?",[token,aid])
+    await db.execute("INSERT INTO publication_queue(article_id,scheduled_at,status,attempts,created_at,manager_id,channel_id) VALUES(?,?, 'queued',0,?,?,?)",[aid,now.isoformat(),now.isoformat(),uid,str(data.get('manager_channel_id') or '')])
+    await state.set_state(BotStates.idle); await message.answer(f'✅ محتوای دستی #{aid} وارد صف انتشار شد.',reply_markup=manager_menu_kb())
+
+@router.callback_query(F.data == "super_managers")
+async def super_managers(call:CallbackQuery,db:D1Database):
+    if call.from_user.id!=ADMIN_ID: await call.answer('دسترسی ندارید',show_alert=True); return
+    await call.message.edit_text('👥 <b>مرکز مدیریت مدیران و اشتراک‌ها</b>\n\nاز این بخش می‌توانی مدیران، وضعیت اشتراک و آمار تفکیکی را کنترل کنی.',parse_mode='HTML',reply_markup=super_manager_kb()); await call.answer()
+
+@router.callback_query(F.data == "super_manager_list")
+async def super_manager_list(call:CallbackQuery,db:D1Database):
+    if call.from_user.id!=ADMIN_ID: return
+    rows=await db.execute("SELECT w.*,u.joined_at FROM manager_workspaces w LEFT JOIN users u ON u.id=w.manager_id ORDER BY w.id DESC LIMIT 50")
+    lines=[]
+    for r in rows:
+        plan=await manager_plan(db,int(r['id'])); lines.append(f"👤 <code>{r['manager_id']}</code> · {html.escape(str(r.get('name') or ''))}\n📦 {html.escape(str(plan['name']) if plan else 'بدون پلن')} · وضعیت: {html.escape(str(r.get('status') or ''))}")
+    rows_kb=[]
+    for r in rows[:20]:
+        rows_kb.append([InlineKeyboardButton(text=f"👤 {r['manager_id']} → Trial",callback_data=f"super_assign_1_{r['id']}"),InlineKeyboardButton(text="Basic",callback_data=f"super_assign_2_{r['id']}"),InlineKeyboardButton(text="Pro",callback_data=f"super_assign_3_{r['id']}")])
+    rows_kb.append([InlineKeyboardButton(text='🔙 مدیریت کلان',callback_data='super_managers')])
+    await call.message.edit_text('👥 <b>مدیران</b>\n\n'+('\n\n'.join(lines) if lines else 'هنوز مدیری ثبت نشده.'),parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows_kb)); await call.answer()
+
+@router.callback_query(F.data == "super_plans")
+async def super_plans(call:CallbackQuery,db:D1Database):
+    if call.from_user.id!=ADMIN_ID: return
+    rows=await db.execute("SELECT * FROM subscription_plans ORDER BY id")
+    text='💳 <b>پلن‌های اشتراک</b>\n\n'+'\n'.join([f"#{r['id']} {html.escape(str(r['name']))}: {r['duration_days']} روز · منابع {r['max_sources']} · کانال {r['max_channels']} · روزانه {r['max_daily_posts']} · قیمت {r['price']}" for r in rows])
+    await call.message.edit_text(text,parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔙 مدیریت کلان',callback_data='super_managers')]])); await call.answer()
+
+@router.callback_query(F.data.regexp(r'^super_assign_(\d+)_(\d+)$'))
+async def super_assign_plan(call:CallbackQuery,db:D1Database):
+    if call.from_user.id!=ADMIN_ID: return
+    parts=call.data.split('_'); plan_id=int(parts[2]); wid=int(parts[3])
+    plan_rows=await db.execute("SELECT * FROM subscription_plans WHERE id=? AND active=1",[plan_id])
+    if not plan_rows: await call.answer('پلن معتبر نیست',show_alert=True); return
+    now=datetime.now(timezone.utc); exp=now+timedelta(days=int(plan_rows[0]['duration_days']))
+    await db.execute("UPDATE manager_subscriptions SET status='replaced' WHERE workspace_id=? AND status='active'",[wid])
+    await db.execute("INSERT INTO manager_subscriptions(workspace_id,plan_id,status,started_at,expires_at,created_at) VALUES(?,?, 'active',?,?,?)",[wid,plan_id,now.isoformat(),exp.isoformat(),now.isoformat()])
+    await db.execute("UPDATE manager_workspaces SET status='active',current_plan_id=? WHERE id=?",[plan_id,wid])
+    await call.answer('اشتراک اعمال شد.')
+    await super_manager_list(call,db)
+
+@router.callback_query(F.data == "super_manager_stats")
+async def super_manager_stats(call:CallbackQuery,db:D1Database):
+    if call.from_user.id!=ADMIN_ID: return
+    rows=await db.execute("SELECT w.manager_id,w.name,COUNT(DISTINCT a.id) articles,COALESCE((SELECT SUM(a2.deep_views) FROM articles a2 WHERE a2.manager_id=w.manager_id),0) views,COALESCE((SELECT COUNT(*) FROM user_content_votes v2 JOIN articles a3 ON a3.id=v2.content_id WHERE v2.content_type='article' AND v2.vote_type='like' AND a3.manager_id=w.manager_id),0) likes FROM manager_workspaces w LEFT JOIN articles a ON a.manager_id=w.manager_id GROUP BY w.id ORDER BY views DESC LIMIT 30")
+    text='📈 <b>آمار تفکیکی مدیران</b>\n\n'+'\n'.join([f"👤 {r['manager_id']} · {html.escape(str(r.get('name') or ''))}\n📝 {r.get('articles',0)} · 👁 {r.get('views',0)} · 👍 {r.get('likes',0)}" for r in rows])
+    await call.message.edit_text(text or 'داده‌ای نیست.',parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔙 مدیریت کلان',callback_data='super_managers')]])); await call.answer()
+
+@router.callback_query(F.data == "super_users")
+async def super_users(call:CallbackQuery,db:D1Database):
+    if call.from_user.id!=ADMIN_ID: return
+    total=(await db.execute("SELECT COUNT(*) c FROM users"))[0].get('c',0)
+    managers=(await db.execute("SELECT COUNT(*) c FROM manager_workspaces"))[0].get('c',0)
+    active=(await db.execute("SELECT COUNT(*) c FROM manager_subscriptions WHERE status='active' AND expires_at>?",[datetime.now(timezone.utc).isoformat()]))[0].get('c',0)
+    rows=await db.execute("SELECT id,joined_at,role FROM users ORDER BY joined_at DESC LIMIT 30")
+    lines=[f"👤 <b>کاربران</b>\n\nکل: <b>{total}</b> · مدیران: <b>{managers}</b> · اشتراک فعال: <b>{active}</b>",""]
+    lines.extend([f"• <code>{r.get('id')}</code> · {html.escape(str(r.get('role') or 'user'))} · {html.escape(str(r.get('joined_at') or '')[:19])}" for r in rows])
+    await call.message.edit_text('\n'.join(lines),parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔄 بروزرسانی',callback_data='super_users')],[InlineKeyboardButton(text='🔙 مدیریت کلان',callback_data='super_managers')]])); await call.answer()
+
+@router.callback_query(F.data == "super_help")
+async def super_help(call:CallbackQuery,state:FSMContext,db:D1Database):
+    if call.from_user.id!=ADMIN_ID: return
+    current=await get_setting(db,'bot_help_text','')
+    await state.set_state(BotStates.super_help_input); await state.update_data(super_help_mode=True)
+    await call.message.edit_text('❓ <b>متن فعلی /help</b>\n\n'+html.escape(strip_html_text(current))+'\n\nمتن جدید را بفرست. این محتوا فقط توسط Super Admin کنترل می‌شود.',parse_mode='HTML',reply_markup=get_exit_menu()); await call.answer()
+
+@router.message(StateFilter(BotStates.super_help_input))
+async def super_help_input(message:Message,state:FSMContext,db:D1Database):
+    data=await state.get_data()
+    if not data.get('super_help_mode') or message.from_user.id!=ADMIN_ID: return
+    value=getattr(message,'html_text',None) or (message.text or '')
+    value=sanitize_telegram_html(value.strip())
+    if not strip_html_text(value): await message.answer('❌ متن خالی است.'); return
+    await set_setting(db,'bot_help_text',value[:3500]); await state.set_state(BotStates.idle); await message.answer('✅ متن /help ذخیره شد.',reply_markup=get_admin_menu())
+
+
+# Manager reply bridge: a manager can reply to a forwarded user message and the bot routes it back.
+@router.message(F.reply_to_message)
+async def manager_reply_to_user(message:Message,db:D1Database,bot:Bot):
+    if message.from_user.id==ADMIN_ID: return
+    ws=await manager_workspace(db,message.from_user.id)
+    if not ws: return
+    src=message.reply_to_message.text or message.reply_to_message.caption or ''
+    m=re.search(r'#User_(\d+)',src)
+    if not m: return
+    uid=int(m.group(1))
+    try:
+        if message.photo:
+            await bot.send_photo(uid,message.photo[-1].file_id,caption=f"📩 پاسخ مدیریت:\n\n{message.caption or ''}")
+        elif message.document:
+            await bot.send_document(uid,message.document.file_id,caption=f"📩 پاسخ مدیریت:\n\n{message.caption or ''}")
+        elif message.video:
+            await bot.send_video(uid,message.video.file_id,caption=f"📩 پاسخ مدیریت:\n\n{message.caption or ''}")
+        elif message.text:
+            await bot.send_message(uid,f"📩 <b>پاسخ مدیریت</b>\n\n{html.escape(message.text)}",parse_mode='HTML')
+        await message.answer('✅ پاسخ برای کاربر ارسال شد.')
+    except Exception as exc:
+        await message.answer(f'❌ ارسال پاسخ ناموفق بود: {html.escape(str(exc)[:500])}',parse_mode='HTML')
 
 # ============================================================
 # متد اجرایی اصلی ربات (Startup & Main Polling)
