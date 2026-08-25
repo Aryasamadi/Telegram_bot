@@ -3690,6 +3690,7 @@ class BotStates(StatesGroup):
     manager_prompt_input = State()
     manager_manual_content = State()
     super_help_input = State()
+    super_manager_assign_input = State()
     manager_metric_input = State()
     manager_schedule_input = State()
 
@@ -3711,15 +3712,24 @@ def get_main_menu() -> InlineKeyboardMarkup:
 
 
 def get_admin_menu() -> InlineKeyboardMarkup:
+    """Super Admin top-level UI: exactly three isolated domains."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📰 اتوماسیون محتوا", callback_data="admin_automation")],
+        [InlineKeyboardButton(text="🧩 هسته ربات", callback_data="admin_core")],
+        [InlineKeyboardButton(text="👑 مدیریت پلتفرم", callback_data="super_managers")]
+    ])
+
+
+def get_admin_core_menu() -> InlineKeyboardMarkup:
+    """Legacy/core infrastructure UI, deliberately isolated from platform management."""
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📁 مدیریت محتوای هسته", callback_data="admin_content")],
-        [InlineKeyboardButton(text="📢 ارسال همگانی", callback_data="admin_broadcast"),
-         InlineKeyboardButton(text="➕ افزودن پست", callback_data="admin_add_post")],
-        [InlineKeyboardButton(text="📊 آمار کلی", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="👥 مدیران و اشتراک‌ها", callback_data="super_managers")],
-        [InlineKeyboardButton(text="❓ متن /help", callback_data="super_help")],
-        [InlineKeyboardButton(text="👤 حالت کاربری", callback_data="admin_user_mode")]
+        [InlineKeyboardButton(text="➕ افزودن پست دستی", callback_data="admin_add_post"),
+         InlineKeyboardButton(text="📢 ارسال همگانی", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="📊 آمار هسته", callback_data="admin_stats"),
+         InlineKeyboardButton(text="📈 مانیتور هسته", callback_data="admin_monitor")],
+        [InlineKeyboardButton(text="ℹ️ درباره ربات", callback_data="bot_about_admin")],
+        [InlineKeyboardButton(text="🔙 پنل مدیر کلان", callback_data="admin_home")]
     ])
 
 
@@ -4451,6 +4461,34 @@ async def process_admin_replies(message: Message, state: FSMContext, bot: Bot):
         except Exception as e:
             await message.answer(f"❌ خطا در ارسال پیام به کاربر: {e}")
 
+@router.message(Command("create"))
+async def cmd_create_manager(message: Message, state: FSMContext, db: D1Database):
+    """Create/resume the independent middle-manager workspace.
+
+    This handler must be registered before the generic idle catch-all so /create
+    can never be swallowed as an unknown command. Super Admin is deliberately
+    kept out of this manager layer.
+    """
+    user_id = int(message.from_user.id)
+    if user_id == ADMIN_ID:
+        await message.answer(
+            "ℹ️ شما مدیر کلان هستید؛ برای مدیریت پلتفرم از پنل مدیریت کلان استفاده کنید.",
+            reply_markup=get_admin_menu(),
+        )
+        return
+    await register_user_if_not_exists(db, user_id)
+    ws = await create_manager_workspace(db, user_id, (message.from_user.full_name or "")[:120])
+    await state.set_state(BotStates.idle)
+    await state.update_data(manager_mode=True, admin_mode="user", manager_workspace_id=int(ws["id"]))
+    existing = bool(ws.get("created_at"))
+    dashboard = await manager_dashboard(db, user_id)
+    if str(ws.get("status") or "") == "trial":
+        notice = "🎉 فضای مدیریتی شما فعال است. دوره آزمایشی از همین حالا قابل استفاده است."
+    else:
+        notice = "✅ فضای مدیریتی شما آماده است."
+    await message.answer(dashboard + "\n\n" + notice, parse_mode="HTML", reply_markup=manager_menu_kb())
+
+
 COMMANDS_LIST = [
     "کاربر", "مدیریت", "💾 ذخیره‌های من", "❓ راهنما", "👤 پروفایل", "➕ افزودن پست",
     "📁 مدیریت محتوا", "📊 آمار", "📢 ارسال همگانی", "⚙️ اتوماسیون محتوا"
@@ -4468,8 +4506,8 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
         
     elif text == "مدیریت":
         if user_id == ADMIN_ID:
-            await state.update_data(admin_mode="admin")
-            await message.answer("✅ پنل مدیریت فعال شد.", reply_markup=get_admin_menu())
+            await state.update_data(admin_mode="admin", manager_mode=False, manager_workspace_id=None)
+            await message.answer("✅ پنل مدیریت کلان فعال شد.", reply_markup=get_admin_menu())
         else:
             await message.answer("⛔ شما دسترسی مدیریت ندارید.")
             
@@ -4570,10 +4608,14 @@ async def intercept_global_commands(message: Message, state: FSMContext, db: D1D
 @router.message(StateFilter(None, BotStates.idle))
 async def process_unknown_commands(message: Message, state: FSMContext):
     data=await state.get_data()
-    if message.from_user.id==ADMIN_ID and data.get("admin_mode")=="admin":
-        await message.answer("❌ دستور نامعتبر است. از منوی همین بخش استفاده کن.",reply_markup=get_admin_menu())
-    else:
-        await message.answer("❌ دستور نامعتبر است. از منوی همین بخش استفاده کن.",reply_markup=get_main_menu())
+    uid=int(message.from_user.id)
+    if uid==ADMIN_ID and data.get("admin_mode")=="admin":
+        await message.answer("❌ دستور نامعتبر است. از منوی پنل مدیر کلان استفاده کن.",reply_markup=get_admin_menu())
+        return
+    if data.get("manager_mode"):
+        await message.answer("❌ دستور نامعتبر است. از منوی پنل مدیر میانی استفاده کن.",reply_markup=manager_menu_kb())
+        return
+    await message.answer("❌ دستور نامعتبر است. از منوی همین بخش استفاده کن.",reply_markup=get_main_menu())
 
 
 # ============================================================
@@ -4739,8 +4781,8 @@ async def admin_automation_setting_input(message:Message,state:FSMContext,db:D1D
 
 
 async def render_admin_home(call: CallbackQuery, db: D1Database):
-    text=("🛠 <b>پنل مدیریت</b>\n<code>Build: "+BUILD_VERSION+"</code>\n\n"
-          "اینجا بخش موردنظر را انتخاب کن.\nبرای سلامت، گزارش و انتشار وارد «اتوماسیون محتوا» شو.")
+    text=("👑 <b>پنل مدیریت کلان</b>\n<code>Build: "+BUILD_VERSION+"</code>\n\n"
+          "سه حوزه کاملاً تفکیک‌شده در این پنل فعال است: اتوماسیون، هسته ربات و مدیریت پلتفرم.")
     await call.message.edit_text(text,parse_mode='HTML',reply_markup=get_admin_menu()); await call.answer()
 
 
@@ -4749,6 +4791,19 @@ async def admin_home(call: CallbackQuery, db: D1Database):
     if call.from_user.id != ADMIN_ID:
         await call.answer("دسترسی ندارید", show_alert=True); return
     await render_admin_home(call, db)
+
+
+@router.callback_query(F.data == "admin_core")
+async def admin_core(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("دسترسی ندارید", show_alert=True)
+        return
+    await call.message.edit_text(
+        "🧩 <b>هسته ربات</b>\n\nابزارهای زیرساختی و مدیریتی قدیمی ربات در این بخش متمرکز شده‌اند.\nاین بخش از مدیریت مدیران و اشتراک‌ها کاملاً جداست.",
+        parse_mode="HTML",
+        reply_markup=get_admin_core_menu(),
+    )
+    await call.answer()
 
 
 @router.callback_query(F.data == "admin_automation")
@@ -6987,20 +7042,14 @@ def manager_menu_kb() -> InlineKeyboardMarkup:
 
 def super_manager_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👥 فهرست مدیران", callback_data="super_manager_list")],
+        [InlineKeyboardButton(text="👥 مدیران میانی", callback_data="super_manager_list")],
         [InlineKeyboardButton(text="💳 پلن‌ها و اشتراک‌ها", callback_data="super_plans")],
+        [InlineKeyboardButton(text="🪪 اعمال اشتراک با آیدی عددی", callback_data="super_assign_by_id")],
         [InlineKeyboardButton(text="📈 آمار تفکیکی مدیران", callback_data="super_manager_stats")],
-        [InlineKeyboardButton(text="👤 کاربران ربات", callback_data="super_users")],
-        [InlineKeyboardButton(text="🔙 پنل اصلی", callback_data="admin_home")]
+        [InlineKeyboardButton(text="👤 همه کاربران", callback_data="super_users")],
+        [InlineKeyboardButton(text="❓ مدیریت متن /help", callback_data="super_help")],
+        [InlineKeyboardButton(text="🔙 پنل مدیر کلان", callback_data="admin_home")]
     ])
-
-@router.message(Command("create"))
-async def cmd_create_manager(message: Message, state: FSMContext, db: D1Database):
-    if message.from_user.id == ADMIN_ID:
-        await message.answer("ℹ️ شما Super Admin هستید؛ پنل اصلی مدیریت برای شما فعال است.",reply_markup=get_admin_menu()); return
-    ws=await create_manager_workspace(db,message.from_user.id,(message.from_user.full_name or '')[:120])
-    await state.update_data(manager_mode=True)
-    await message.answer(await manager_dashboard(db,message.from_user.id)+"\n\n🎉 دوره آزمایشی شما فعال شد.",parse_mode='HTML',reply_markup=manager_menu_kb())
 
 @router.callback_query(F.data == "manager_home")
 async def manager_home(call: CallbackQuery, db: D1Database):
@@ -7302,6 +7351,73 @@ async def super_users(call:CallbackQuery,db:D1Database):
     lines=[f"👤 <b>کاربران</b>\n\nکل: <b>{total}</b> · مدیران: <b>{managers}</b> · اشتراک فعال: <b>{active}</b>",""]
     lines.extend([f"• <code>{r.get('id')}</code> · {html.escape(str(r.get('role') or 'user'))} · {html.escape(str(r.get('joined_at') or '')[:19])}" for r in rows])
     await call.message.edit_text('\n'.join(lines),parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔄 بروزرسانی',callback_data='super_users')],[InlineKeyboardButton(text='🔙 مدیریت کلان',callback_data='super_managers')]])); await call.answer()
+
+@router.callback_query(F.data == "super_assign_by_id")
+async def super_assign_by_id(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("دسترسی ندارید", show_alert=True)
+        return
+    await state.set_state(BotStates.super_manager_assign_input)
+    await state.update_data(super_assign_input_mode=True)
+    await call.message.edit_text(
+        "🪪 <b>اعمال اشتراک با آیدی عددی</b>\n\n"
+        "آیدی عددی کاربر را بفرست. سپس پلن مناسب را برای همان مدیر اعمال می‌کنیم.\n"
+        "فقط آیدی عددی مجاز است.",
+        parse_mode="HTML",
+        reply_markup=get_exit_menu(),
+    )
+    await call.answer()
+
+
+@router.message(StateFilter(BotStates.super_manager_assign_input))
+async def super_manager_assign_input(message: Message, state: FSMContext, db: D1Database):
+    if message.from_user.id != ADMIN_ID:
+        return
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        await message.answer("❌ فقط آیدی عددی معتبر بفرست.", reply_markup=get_exit_menu())
+        return
+    uid = int(raw)
+    ws = await manager_workspace(db, uid)
+    if not ws:
+        await message.answer(
+            "ℹ️ برای این آیدی هنوز فضای مدیریتی ساخته نشده است. کاربر ابتدا باید /create را اجرا کند.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 مدیریت پلتفرم", callback_data="super_managers")]]),
+        )
+        await state.set_state(BotStates.idle)
+        return
+    plans = await db.execute("SELECT id,name,duration_days,max_sources,max_channels,max_daily_posts,price FROM subscription_plans WHERE active=1 ORDER BY id")
+    rows = [[InlineKeyboardButton(text=f"{r['name']} · {r['duration_days']}روز · {r['max_sources']}منبع · {r['max_daily_posts']}روزانه", callback_data=f"super_assign_uid_{uid}_{r['id']}")] for r in plans]
+    rows.append([InlineKeyboardButton(text="🔙 مدیریت پلتفرم", callback_data="super_managers")])
+    await state.set_state(BotStates.idle)
+    await message.answer(f"👤 مدیر: <code>{uid}</code>\nیک پلن را انتخاب کن:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.regexp(r'^super_assign_uid_(\d+)_(\d+)$'))
+async def super_assign_uid_plan(call: CallbackQuery, db: D1Database):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("دسترسی ندارید", show_alert=True)
+        return
+    parts = call.data.split('_')
+    uid = int(parts[3]); plan_id = int(parts[4])
+    ws = await manager_workspace(db, uid)
+    plan_rows = await db.execute("SELECT * FROM subscription_plans WHERE id=? AND active=1", [plan_id])
+    if not ws or not plan_rows:
+        await call.answer("مدیر یا پلن معتبر نیست.", show_alert=True)
+        return
+    plan = plan_rows[0]
+    now = datetime.now(timezone.utc)
+    exp = now + timedelta(days=max(1, int(plan.get('duration_days') or 30)))
+    await db.execute("UPDATE manager_subscriptions SET status='replaced' WHERE workspace_id=? AND status='active'", [int(ws['id'])])
+    await db.execute("INSERT INTO manager_subscriptions(workspace_id,plan_id,status,started_at,expires_at,created_at) VALUES(?,?, 'active',?,?,?)", [int(ws['id']), plan_id, now.isoformat(), exp.isoformat(), now.isoformat()])
+    await db.execute("UPDATE manager_workspaces SET status='active',current_plan_id=? WHERE id=?", [plan_id, int(ws['id'])])
+    await call.answer("✅ اشتراک روی این آیدی اعمال شد.", show_alert=True)
+    await call.message.edit_text(
+        f"✅ <b>اشتراک اعمال شد</b>\n\n👤 آیدی: <code>{uid}</code>\n📦 پلن: <b>{html.escape(str(plan['name']))}</b>\n⏳ تا: <b>{exp.strftime('%Y-%m-%d %H:%M')}</b>",
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔙 مدیریت پلتفرم', callback_data='super_managers')]])
+    )
+
 
 @router.callback_query(F.data == "super_help")
 async def super_help(call:CallbackQuery,state:FSMContext,db:D1Database):
