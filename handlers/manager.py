@@ -185,7 +185,8 @@ class ManagerSurface:
             detail=f"enabled={new_value}",
         )
         await self._channel(ctx, inbound, channel_id)
-          async def _queue(self, ctx: RequestContext, inbound: Inbound) -> None:
+
+    async def _queue(self, ctx: RequestContext, inbound: Inbound) -> None:
         scope = ctx.effective_scope
         if scope is None:
             await self._panel(ctx, inbound)
