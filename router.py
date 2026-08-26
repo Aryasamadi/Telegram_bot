@@ -127,7 +127,8 @@ class Router:
             await self._route_callback(ctx, inbound)
         else:
             await self._route_command(ctx, inbound)
-              async def _bootstrap_owner(
+
+    async def _bootstrap_owner(
         self, ctx: RequestContext, inbound: Inbound
     ) -> RequestContext:
         """Promote the configured ADMIN_ID to owner on first contact.
