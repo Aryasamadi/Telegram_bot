@@ -9,6 +9,12 @@ small, synchronous-feeling async surface the services rely on:
     execute(sql, params)        -> int          (rows affected)
     fetchone(sql, params)       -> dict | None
     insert_returning_id(sql, params) -> int
+    aclose()                    -> None         (release the connection)
+
+One HTTP connection is kept open and reused for every statement. Opening a new
+one per query would mean a fresh TLS handshake to Cloudflare every time, which
+is the dominant cost when a single screen runs several small queries. Whoever
+creates this client is responsible for calling `aclose()` on shutdown.
 
 All methods raise D1Error on transport or API failure so callers can fail
 cleanly rather than acting on partial data.
@@ -48,13 +54,19 @@ class D1Client:
             "Content-Type": "application/json",
         }
         self._timeout = timeout
+        self._client = httpx.AsyncClient(timeout=timeout)
+
+    async def aclose(self) -> None:
+        """Release the underlying HTTP connection. Safe to call more than once."""
+        await self._client.aclose()
 
     async def _raw_query(self, sql: str, params: Optional[list] = None) -> dict:
         """Send one SQL statement to D1 and return the first result block."""
         payload = {"sql": sql, "params": list(params or [])}
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.post(self._url, headers=self._headers, json=payload)
+            resp = await self._client.post(
+                self._url, headers=self._headers, json=payload
+            )
         except httpx.HTTPError as exc:
             raise D1Error(f"transport error: {exc}") from exc
 
@@ -75,7 +87,7 @@ class D1Client:
             return {"results": [], "meta": {}}
         # D1 returns a list of result blocks (one per statement); we send one.
         return result[0]
-      
+
     async def query(self, sql: str, params: Optional[list] = None) -> list:
         """Run a SELECT and return all rows as a list of dicts."""
         block = await self._raw_query(sql, params)
