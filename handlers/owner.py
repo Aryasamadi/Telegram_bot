@@ -151,7 +151,8 @@ class OwnerSurface:
             "<b>Managers</b>\n\nSelect a manager.",
             markup=keyboard(*buttons),
         )
-          async def _manager(
+
+    async def _manager(
         self, ctx: RequestContext, inbound: Inbound, manager_id: int
     ) -> None:
         _require_owner(ctx)
